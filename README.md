@@ -114,7 +114,39 @@ zig-out/bin/nullclaw migrate openclaw --dry-run
 zig-out/bin/nullclaw migrate openclaw
 ```
 
-> **Optional:** add `zig-out/bin` to your `PATH` using your shell's native setup if you prefer running `nullclaw` without the prefix.
+### Install `nullclaw` Command (Cross-Platform)
+
+Install into a user prefix (puts binary into `<prefix>/bin`):
+
+```bash
+zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
+```
+
+macOS/Linux (zsh/bash) add to `PATH` once:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+# or ~/.bashrc
+```
+
+Windows (PowerShell) install + add to `PATH` once:
+
+```powershell
+zig build -Doptimize=ReleaseSmall -p "$HOME\.local"
+
+$bin = "$HOME\.local\bin"
+$user_path = [Environment]::GetEnvironmentVariable("Path", "User")
+if (-not ($user_path -split ";" | Where-Object { $_ -eq $bin })) {
+  [Environment]::SetEnvironmentVariable("Path", "$user_path;$bin", "User")
+}
+$env:Path = "$env:Path;$bin"
+```
+
+After that, use:
+
+```bash
+nullclaw --help
+```
 
 ## Edge MVP (Hybrid Host + WASM Logic)
 

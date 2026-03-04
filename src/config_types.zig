@@ -1359,6 +1359,7 @@ test "security defaults stay least-privilege" {
     try std.testing.expectEqual(@as(u32, 20), autonomy.max_actions_per_hour);
     try std.testing.expect(autonomy.require_approval_for_medium_risk);
     try std.testing.expect(autonomy.block_high_risk_commands);
+    try std.testing.expect(!autonomy.allow_raw_url_chars);
 
     const http_request = HttpRequestConfig{};
     try std.testing.expect(!http_request.enabled);

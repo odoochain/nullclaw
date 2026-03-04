@@ -313,7 +313,20 @@ fn containsSingleAmpersand(s: []const u8) bool {
     if (s.len == 0) return false;
     var in_single_quote = false;
     var in_double_quote = false;
+    var escaped = false;
     for (s, 0..) |b, i| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        // In shell parsing, backslash escapes the next character everywhere
+        // except inside single quotes.
+        if (b == '\\' and !in_single_quote) {
+            escaped = true;
+            continue;
+        }
+
         if (b == '\'' and !in_double_quote) {
             in_single_quote = !in_single_quote;
             continue;
@@ -1109,6 +1122,10 @@ test "containsSingleAmpersand_skips_quoted_ampersands" {
     try std.testing.expect(containsSingleAmpersand("curl \"https://example.com?a=1&b=2\" & echo done"));
     // Fully quoted URL with multiple & is safe
     try std.testing.expect(!containsSingleAmpersand("curl \"https://api.example.com/search?q=test&page=1&limit=10\""));
+    // Escaped quote outside quotes must not start a quoted region.
+    try std.testing.expect(containsSingleAmpersand("echo \\\" & echo done"));
+    // Escaped ampersand is a literal character and must not be treated as operator.
+    try std.testing.expect(!containsSingleAmpersand("echo \\& literal"));
 }
 
 // ── Argument safety tests ───────────────────────────────────
@@ -1308,6 +1325,15 @@ test "unquoted_url_with_ampersand_blocked_by_default" {
         .block_high_risk_commands = false,
     };
     try std.testing.expect(!p.isCommandAllowed("curl https://example.com?a=1&b=2"));
+}
+
+test "escaped_quote_does_not_mask_background_ampersand" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(!p.isCommandAllowed("echo \\\" & touch /tmp/pwned"));
 }
 
 test "allow_raw_url_chars_permits_bare_ampersand" {

@@ -2493,6 +2493,16 @@ test "json parse autonomy allowed_paths" {
     allocator.free(cfg.autonomy.allowed_paths);
 }
 
+test "json parse autonomy allow_raw_url_chars" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"allow_raw_url_chars": true}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.autonomy.allow_raw_url_chars);
+}
+
 test "json parse gateway paired tokens" {
     const allocator = std.testing.allocator;
     const json =

@@ -55,6 +55,7 @@ pub const serializeMessageContent = helpers.serializeMessageContent;
 pub const serializeContentPart = helpers.serializeContentPart;
 pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const curlPostTimed = helpers.curlPostTimed;
+pub const curlPostFormTimed = helpers.curlPostFormTimed;
 pub const extractContent = helpers.extractContent;
 
 // Direct re-exports from utility modules

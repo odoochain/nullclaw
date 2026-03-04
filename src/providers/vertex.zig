@@ -676,11 +676,10 @@ fn requestServiceAccountAccessToken(
     try appendFormField(&form, allocator, "grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
     try appendFormField(&form, allocator, "assertion", assertion);
 
-    const response = root.curlPostTimed(
+    const response = root.curlPostFormTimed(
         allocator,
         creds.token_uri,
         form.items,
-        &[_][]const u8{"Content-Type: application/x-www-form-urlencoded"},
         VertexProvider.SERVICE_ACCOUNT_TOKEN_TIMEOUT_SECS,
     ) catch return error.VertexApiError;
     defer allocator.free(response);

@@ -300,6 +300,21 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
     return http_util.curlPostWithProxy(allocator, url, body, headers, proxy, null);
 }
 
+/// HTTP POST (application/x-www-form-urlencoded) with optional timeout.
+/// Automatically reads proxy from HTTPS_PROXY, HTTP_PROXY, or ALL_PROXY environment variables.
+pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, timeout_secs: u64) ![]u8 {
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+
+    if (timeout_secs > 0) {
+        var timeout_buf: [32]u8 = undefined;
+        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch
+            return http_util.curlPostFormWithProxy(allocator, url, body, proxy, null);
+        return http_util.curlPostFormWithProxy(allocator, url, body, proxy, timeout_str);
+    }
+    return http_util.curlPostFormWithProxy(allocator, url, body, proxy, null);
+}
+
 /// Extract text content from a provider JSON response.
 pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});

@@ -275,13 +275,11 @@ pub fn refreshOAuthToken(allocator: std.mem.Allocator, refresh_token: []const u8
     defer allocator.free(body);
 
     const url = "https://oauth2.googleapis.com/token";
-    const headers = &[_][]const u8{"Content-Type: application/x-www-form-urlencoded"};
 
-    const resp_body = root.curlPostTimed(
+    const resp_body = root.curlPostFormTimed(
         allocator,
         url,
         body,
-        headers,
         OAUTH_REFRESH_TIMEOUT_SECS,
     ) catch return error.RefreshFailed;
     defer allocator.free(resp_body);

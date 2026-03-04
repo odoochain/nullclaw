@@ -75,6 +75,9 @@ pub const OpenAiCompatibleProvider = struct {
     user_agent: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
+    const think_open_tag = "<think>";
+    const think_close_tag = "</think>";
+
     pub fn init(
         allocator: std.mem.Allocator,
         name: []const u8,
@@ -343,11 +346,108 @@ pub const OpenAiCompatibleProvider = struct {
         needs_free: bool,
     };
 
-    fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-        const open_tag = "<think>";
-        const close_tag = "</think>";
+    const ThinkStripStreamCtx = struct {
+        downstream: root.StreamCallback,
+        downstream_ctx: *anyopaque,
+        state: ThinkStripStreamState = .{},
+    };
 
-        if (std.mem.indexOf(u8, text, open_tag) == null and std.mem.indexOf(u8, text, close_tag) == null) {
+    const ThinkStripStreamState = struct {
+        depth: usize = 0,
+        pending: [think_close_tag.len]u8 = undefined,
+        pending_len: usize = 0,
+
+        fn feed(self: *ThinkStripStreamState, delta: []const u8, downstream: root.StreamCallback, downstream_ctx: *anyopaque) void {
+            var out_buf: [256]u8 = undefined;
+            var out_len: usize = 0;
+
+            for (delta) |byte| {
+                if (self.pending_len == self.pending.len) {
+                    self.processPending(false, &out_buf, &out_len, downstream, downstream_ctx);
+                }
+                self.pending[self.pending_len] = byte;
+                self.pending_len += 1;
+                self.processPending(false, &out_buf, &out_len, downstream, downstream_ctx);
+            }
+
+            if (out_len > 0) {
+                downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len]));
+            }
+        }
+
+        fn finish(self: *ThinkStripStreamState, downstream: root.StreamCallback, downstream_ctx: *anyopaque) void {
+            var out_buf: [256]u8 = undefined;
+            var out_len: usize = 0;
+            self.processPending(true, &out_buf, &out_len, downstream, downstream_ctx);
+            if (out_len > 0) {
+                downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len]));
+            }
+        }
+
+        fn processPending(
+            self: *ThinkStripStreamState,
+            final: bool,
+            out_buf: *[256]u8,
+            out_len: *usize,
+            downstream: root.StreamCallback,
+            downstream_ctx: *anyopaque,
+        ) void {
+            while (self.pending_len > 0) {
+                const pending = self.pending[0..self.pending_len];
+
+                if (pending.len >= think_open_tag.len and std.mem.eql(u8, pending[0..think_open_tag.len], think_open_tag)) {
+                    self.consumePrefix(think_open_tag.len);
+                    self.depth += 1;
+                    continue;
+                }
+
+                if (pending.len >= think_close_tag.len and std.mem.eql(u8, pending[0..think_close_tag.len], think_close_tag)) {
+                    self.consumePrefix(think_close_tag.len);
+                    if (self.depth > 0) self.depth -= 1;
+                    continue;
+                }
+
+                const maybe_tag_prefix = std.mem.startsWith(u8, think_open_tag, pending) or std.mem.startsWith(u8, think_close_tag, pending);
+                if (!final and maybe_tag_prefix and pending.len < think_close_tag.len) {
+                    break;
+                }
+
+                if (self.depth == 0) {
+                    out_buf[out_len.*] = pending[0];
+                    out_len.* += 1;
+                    if (out_len.* == out_buf.len) {
+                        downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len.*]));
+                        out_len.* = 0;
+                    }
+                }
+                self.consumePrefix(1);
+            }
+        }
+
+        fn consumePrefix(self: *ThinkStripStreamState, n: usize) void {
+            std.debug.assert(n <= self.pending_len);
+            if (n == self.pending_len) {
+                self.pending_len = 0;
+                return;
+            }
+            const remaining = self.pending_len - n;
+            std.mem.copyForwards(u8, self.pending[0..remaining], self.pending[n..self.pending_len]);
+            self.pending_len = remaining;
+        }
+    };
+
+    fn streamThinkSanitizeCallback(ctx_ptr: *anyopaque, chunk: root.StreamChunk) void {
+        const ctx: *ThinkStripStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (chunk.is_final) {
+            ctx.state.finish(ctx.downstream, ctx.downstream_ctx);
+            ctx.downstream(ctx.downstream_ctx, root.StreamChunk.finalChunk());
+            return;
+        }
+        ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
+    }
+
+    fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+        if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
             return allocator.dupe(u8, text);
         }
 
@@ -357,14 +457,14 @@ pub const OpenAiCompatibleProvider = struct {
         var i: usize = 0;
         var depth: usize = 0;
         while (i < text.len) {
-            if (std.mem.startsWith(u8, text[i..], open_tag)) {
+            if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
                 depth += 1;
-                i += open_tag.len;
+                i += think_open_tag.len;
                 continue;
             }
-            if (std.mem.startsWith(u8, text[i..], close_tag)) {
+            if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
                 if (depth > 0) depth -= 1;
-                i += close_tag.len;
+                i += think_close_tag.len;
                 continue;
             }
             if (depth == 0) try out.append(allocator, text[i]);
@@ -535,7 +635,35 @@ pub const OpenAiCompatibleProvider = struct {
             extra_header_count += 1;
         }
 
-        return sse.curlStream(allocator, url, body, auth_hdr, extra_headers[0..extra_header_count], request.timeout_secs, callback, callback_ctx);
+        var sanitize_ctx = ThinkStripStreamCtx{
+            .downstream = callback,
+            .downstream_ctx = callback_ctx,
+        };
+
+        var result = try sse.curlStream(
+            allocator,
+            url,
+            body,
+            auth_hdr,
+            extra_headers[0..extra_header_count],
+            request.timeout_secs,
+            streamThinkSanitizeCallback,
+            @ptrCast(&sanitize_ctx),
+        );
+
+        if (result.content) |raw| {
+            const cleaned = try stripThinkBlocks(allocator, raw);
+            allocator.free(raw);
+            if (cleaned.len == 0) {
+                result.content = null;
+                result.usage.completion_tokens = 0;
+            } else {
+                result.content = cleaned;
+                result.usage.completion_tokens = @intCast((cleaned.len + 3) / 4);
+            }
+        }
+
+        return result;
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
@@ -903,6 +1031,78 @@ test "parseNativeResponse strips think blocks from content" {
     }
     try std.testing.expect(result.content != null);
     try std.testing.expectEqualStrings("Visible answer", result.content.?);
+}
+
+test "streamThinkSanitizeCallback strips think blocks across chunk boundaries" {
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        saw_final: bool = false,
+
+        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+                return;
+            }
+            self.buf.appendSlice(self.allocator, chunk.delta) catch unreachable;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(self.allocator);
+        }
+    };
+
+    var collector = Collector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var sanitize_ctx = OpenAiCompatibleProvider.ThinkStripStreamCtx{
+        .downstream = Collector.callback,
+        .downstream_ctx = @ptrCast(&collector),
+    };
+
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("<thi"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("nk>private reasoning"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("</think>\nVisible answer"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.finalChunk());
+
+    try std.testing.expect(collector.saw_final);
+    try std.testing.expectEqualStrings("\nVisible answer", collector.buf.items);
+}
+
+test "streamThinkSanitizeCallback preserves incomplete think tag literals" {
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        saw_final: bool = false,
+
+        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+                return;
+            }
+            self.buf.appendSlice(self.allocator, chunk.delta) catch unreachable;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(self.allocator);
+        }
+    };
+
+    var collector = Collector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var sanitize_ctx = OpenAiCompatibleProvider.ThinkStripStreamCtx{
+        .downstream = Collector.callback,
+        .downstream_ctx = @ptrCast(&collector),
+    };
+
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("literal <thi"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.finalChunk());
+
+    try std.testing.expect(collector.saw_final);
+    try std.testing.expectEqualStrings("literal <thi", collector.buf.items);
 }
 
 test "parseTextResponse empty choices" {

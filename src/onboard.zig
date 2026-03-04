@@ -3073,6 +3073,9 @@ test "agentsTemplate contains guidelines" {
     const tmpl = agentsTemplate();
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "AGENTS.md - Your Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "Every Session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory.backend") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory_list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory_recall") != null);
 }
 
 test "toolsTemplate contains tool docs" {

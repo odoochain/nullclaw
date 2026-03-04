@@ -142,7 +142,10 @@ pub fn isReasoningModel(model: []const u8) bool {
 /// - non-reasoning: `temperature` + optional `max_tokens`
 /// - reasoning + reasoning_effort=="none": `temperature` + `max_completion_tokens`
 /// - reasoning (otherwise): `max_completion_tokens` only (no temperature)
-/// Always emits `reasoning_effort` when set on a reasoning model.
+/// Always emits normalized `reasoning_effort` when set on a reasoning model.
+/// OpenAI-compatible reasoning values are normalized as:
+/// - `minimal` -> `low`
+/// - `xhigh` -> `high`
 pub fn appendGenerationFields(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -167,8 +170,10 @@ pub fn appendGenerationFields(
         return;
     }
 
+    const normalized_effort = normalizeOpenAiReasoningEffort(reasoning_effort);
+
     // Reasoning model: temperature only if reasoning_effort == "none"
-    const effort_is_none = if (reasoning_effort) |re| std.mem.eql(u8, re, "none") else false;
+    const effort_is_none = if (normalized_effort) |re| std.mem.eql(u8, re, "none") else false;
     if (effort_is_none) {
         try buf.appendSlice(allocator, ",\"temperature\":");
         var temp_buf: [16]u8 = undefined;
@@ -185,10 +190,20 @@ pub fn appendGenerationFields(
     }
 
     // Emit reasoning_effort when set (JSON-escaped for safety)
-    if (reasoning_effort) |re| {
+    if (normalized_effort) |re| {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":");
         try json_util.appendJsonString(buf, allocator, re);
     }
+}
+
+fn normalizeOpenAiReasoningEffort(reasoning_effort: ?[]const u8) ?[]const u8 {
+    const raw = reasoning_effort orelse return null;
+    if (std.ascii.eqlIgnoreCase(raw, "none")) return "none";
+    if (std.ascii.eqlIgnoreCase(raw, "minimal")) return "low";
+    if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
+    if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
+    if (std.ascii.eqlIgnoreCase(raw, "high") or std.ascii.eqlIgnoreCase(raw, "xhigh")) return "high";
+    return raw;
 }
 
 const GeminiReasoningEffort = enum {
@@ -713,6 +728,40 @@ test "serializeMessageContent with image_url part" {
     const img_obj = arr.items[0].object.get("image_url").?.object;
     try std.testing.expectEqualStrings("https://example.com/cat.jpg", img_obj.get("url").?.string);
     try std.testing.expectEqualStrings("auto", img_obj.get("detail").?.string);
+}
+
+test "appendGenerationFields normalizes minimal reasoning effort for gpt-5" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"model\":\"gpt-5\"");
+    try appendGenerationFields(&buf, alloc, "gpt-5", 0.2, 4096, "minimal");
+    try buf.append(alloc, '}');
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("low", obj.get("reasoning_effort").?.string);
+    try std.testing.expect(obj.get("temperature") == null);
+    try std.testing.expectEqual(@as(i64, 4096), obj.get("max_completion_tokens").?.integer);
+}
+
+test "appendGenerationFields normalizes xhigh reasoning effort for gpt-5" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"model\":\"gpt-5\"");
+    try appendGenerationFields(&buf, alloc, "gpt-5", 0.2, 2048, "xhigh");
+    try buf.append(alloc, '}');
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("high", obj.get("reasoning_effort").?.string);
+    try std.testing.expect(obj.get("temperature") == null);
+    try std.testing.expectEqual(@as(i64, 2048), obj.get("max_completion_tokens").?.integer);
 }
 
 test "appendGeminiThinkingConfig uses thinkingLevel for gemini-3 flash" {

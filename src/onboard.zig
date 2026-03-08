@@ -1496,7 +1496,6 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         // Store in providers section (preserve base_url if already set for custom provider)
         const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
         var base_url: ?[]const u8 = null;
-        
         if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
             base_url = cfg.providers[0].base_url;
         }

@@ -36,6 +36,19 @@ fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bo
     return .{ .slice = text[0..MESSAGE_LOG_MAX_BYTES], .truncated = true };
 }
 
+fn estimateTextTokens(text: []const u8) u32 {
+    return @intCast((text.len + 3) / 4);
+}
+
+fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
+    var total: u64 = 0;
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.role, "assistant")) continue;
+        total += estimateTextTokens(entry.content);
+    }
+    return total;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
 // ═══════════════════════════════════════════════════════════════════════════
@@ -171,6 +184,7 @@ pub const SessionManager = struct {
             const entries = store.loadMessages(self.allocator, session_key) catch &.{};
             if (entries.len > 0) {
                 session.agent.loadHistory(entries) catch {};
+                session.agent.total_tokens = estimateRestoredSessionTokens(entries);
                 for (entries) |entry| {
                     self.allocator.free(entry.role);
                     self.allocator.free(entry.content);
@@ -1224,6 +1238,55 @@ test "processMessage preserves session across calls" {
 
     // History should have grown (user msg + assistant response added)
     try testing.expect(session.agent.historyLen() > history_before);
+}
+
+test "restored session reconstructs token count from persisted assistant replies" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-1";
+    const reply = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(reply);
+
+    const expected_tokens = estimateTextTokens("assistant reply");
+    const first_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), first_session.agent.total_tokens);
+
+    first_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+
+    const status = try restored_session.agent.handleSlashCommand("/status");
+    defer {
+        if (status) |resp| testing.allocator.free(resp);
+    }
+    try testing.expect(status != null);
+
+    var expected_line_buf: [64]u8 = undefined;
+    const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
+    try testing.expect(std.mem.indexOf(u8, status.?, expected_line) != null);
 }
 
 test "processMessage different keys — independent sessions" {

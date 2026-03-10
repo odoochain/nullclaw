@@ -4,11 +4,9 @@ const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
 
 const Provider = root.Provider;
-const ChatMessage = root.ChatMessage;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const ToolCall = root.ToolCall;
-const ToolSpec = root.ToolSpec;
 const TokenUsage = root.TokenUsage;
 
 /// Azure OpenAI API provider.
@@ -16,11 +14,11 @@ const TokenUsage = root.TokenUsage;
 /// Endpoints:
 /// - POST https://{endpoint}/openai/deployments/{model}/chat/completions?api-version={api-version}
 /// - api-key: <key>
-/// 
+///
 /// Key differences from OpenAI:
 /// - Model name used as deployment name in URL path instead of model in request body
 /// - Uses `api-key` header instead of `Authorization: Bearer`
-/// - Uses `max_completion_tokens` instead of `max_tokens` in all cases
+/// - Reuses the shared OpenAI generation-field rules for reasoning models
 pub const AzureOpenAiProvider = struct {
     api_key: ?[]const u8,
     base_url: []const u8,
@@ -29,6 +27,7 @@ pub const AzureOpenAiProvider = struct {
     user_agent: ?[]const u8 = null,
 
     const API_VERSION = "2024-10-21";
+    pub const DEFAULT_BASE_URL = "https://your-resource.openai.azure.com";
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -49,13 +48,28 @@ pub const AzureOpenAiProvider = struct {
         return std.mem.indexOfAny(u8, user_agent, "\r\n") == null;
     }
 
+    fn trimTrailingSlash(value: []const u8) []const u8 {
+        if (std.mem.endsWith(u8, value, "/")) {
+            return value[0 .. value.len - 1];
+        }
+        return value;
+    }
+
+    fn normalizeBaseUrl(value: []const u8) []const u8 {
+        const trimmed = trimTrailingSlash(value);
+        if (std.mem.endsWith(u8, trimmed, "/openai/v1")) {
+            return trimmed[0 .. trimmed.len - "/openai/v1".len];
+        }
+        if (std.mem.endsWith(u8, trimmed, "/openai")) {
+            return trimmed[0 .. trimmed.len - "/openai".len];
+        }
+        return trimmed;
+    }
+
     /// Build Azure-specific chat completions URL with model as deployment name.
     fn buildChatUrl(self: *const AzureOpenAiProvider, allocator: std.mem.Allocator, model: []const u8) ![]const u8 {
-        // Strip trailing slash from base_url if present
-        const base = if (std.mem.endsWith(u8, self.base_url, "/"))
-            self.base_url[0..self.base_url.len - 1]
-        else
-            self.base_url;
+        const base = normalizeBaseUrl(self.base_url);
+        if (base.len == 0 or std.mem.eql(u8, base, DEFAULT_BASE_URL)) return error.InvalidBaseUrl;
 
         return std.fmt.allocPrint(
             allocator,
@@ -69,6 +83,7 @@ pub const AzureOpenAiProvider = struct {
         allocator: std.mem.Allocator,
         system_prompt: ?[]const u8,
         message: []const u8,
+        model: []const u8,
         temperature: f64,
         max_tokens: ?u32,
     ) ![]const u8 {
@@ -88,20 +103,7 @@ pub const AzureOpenAiProvider = struct {
         try buf.append(allocator, '}');
 
         try buf.append(allocator, ']');
-
-        // Azure always uses max_completion_tokens
-        try buf.appendSlice(allocator, ",\"temperature\":");
-        var temp_buf: [16]u8 = undefined;
-        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
-        try buf.appendSlice(allocator, temp_str);
-
-        if (max_tokens) |max_tok| {
-            try buf.appendSlice(allocator, ",\"max_completion_tokens\":");
-            var max_buf: [16]u8 = undefined;
-            const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.FormatError;
-            try buf.appendSlice(allocator, max_str);
-        }
-
+        try root.appendGenerationFields(&buf, allocator, model, temperature, max_tokens, null);
         try buf.append(allocator, '}');
         return try buf.toOwnedSlice(allocator);
     }
@@ -254,7 +256,7 @@ pub const AzureOpenAiProvider = struct {
         const chat_url = try self.buildChatUrl(allocator, model);
         defer allocator.free(chat_url);
 
-        const body = try buildStreamingChatRequestBody(allocator, request, temperature);
+        const body = try buildStreamingChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         var auth_hdr_buf: [512]u8 = undefined;
@@ -294,7 +296,7 @@ pub const AzureOpenAiProvider = struct {
         const chat_url = try self.buildChatUrl(allocator, model);
         defer allocator.free(chat_url);
 
-        const body = try buildRequestBody(allocator, system_prompt, message, temperature, null);
+        const body = try buildRequestBody(allocator, system_prompt, message, model, temperature, null);
         defer allocator.free(body);
 
         // Build headers (auth + optional User-Agent)
@@ -332,7 +334,7 @@ pub const AzureOpenAiProvider = struct {
         const chat_url = try self.buildChatUrl(allocator, model);
         defer allocator.free(chat_url);
 
-        const body = try buildChatRequestBody(allocator, request, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         // Build headers (auth + optional User-Agent)
@@ -376,6 +378,7 @@ pub const AzureOpenAiProvider = struct {
     fn buildStreamingChatRequestBody(
         allocator: std.mem.Allocator,
         request: ChatRequest,
+        model: []const u8,
         temperature: f64,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -397,19 +400,7 @@ pub const AzureOpenAiProvider = struct {
         }
 
         try buf.append(allocator, ']');
-
-        // Azure always uses max_completion_tokens, and temperature for all models
-        try buf.appendSlice(allocator, ",\"temperature\":");
-        var temp_buf: [16]u8 = undefined;
-        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
-        try buf.appendSlice(allocator, temp_str);
-
-        if (request.max_tokens) |max_tok| {
-            try buf.appendSlice(allocator, ",\"max_completion_tokens\":");
-            var max_buf: [16]u8 = undefined;
-            const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.FormatError;
-            try buf.appendSlice(allocator, max_str);
-        }
+        try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
 
         if (request.tools) |tools| {
             if (tools.len > 0) {
@@ -427,6 +418,7 @@ pub const AzureOpenAiProvider = struct {
     fn buildChatRequestBody(
         allocator: std.mem.Allocator,
         request: ChatRequest,
+        model: []const u8,
         temperature: f64,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -448,19 +440,7 @@ pub const AzureOpenAiProvider = struct {
         }
 
         try buf.append(allocator, ']');
-
-        // Azure always uses max_completion_tokens, and temperature for all models
-        try buf.appendSlice(allocator, ",\"temperature\":");
-        var temp_buf: [16]u8 = undefined;
-        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
-        try buf.appendSlice(allocator, temp_str);
-
-        if (request.max_tokens) |max_tok| {
-            try buf.appendSlice(allocator, ",\"max_completion_tokens\":");
-            var max_buf: [16]u8 = undefined;
-            const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.FormatError;
-            try buf.appendSlice(allocator, max_str);
-        }
+        try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
 
         if (request.tools) |tools| {
             if (tools.len > 0) {
@@ -480,12 +460,12 @@ pub const AzureOpenAiProvider = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "buildRequestBody with system prompt" {
-    const body = try AzureOpenAiProvider.buildRequestBody(std.testing.allocator, "You are helpful", "hello", 0.7, 4096);
+    const body = try AzureOpenAiProvider.buildRequestBody(std.testing.allocator, "You are helpful", "hello", "gpt-4.1", 0.7, 4096);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "You are helpful") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":4096") != null);
     // Azure doesn't include model in request body
     try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":") == null);
 }
@@ -518,6 +498,31 @@ test "buildChatUrl handles trailing slash" {
         "https://myresource.openai.azure.com/openai/deployments/gpt-35-turbo/chat/completions?api-version=2024-10-21",
         url,
     );
+}
+
+test "buildChatUrl accepts v1-style base URL" {
+    const provider = AzureOpenAiProvider.init(
+        std.testing.allocator,
+        "test-key",
+        "https://myresource.openai.azure.com/openai/v1/",
+        null,
+    );
+    const url = try provider.buildChatUrl(std.testing.allocator, "gpt-5.2-chat");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://myresource.openai.azure.com/openai/deployments/gpt-5.2-chat/chat/completions?api-version=2024-10-21",
+        url,
+    );
+}
+
+test "buildChatUrl rejects placeholder base URL" {
+    const provider = AzureOpenAiProvider.init(
+        std.testing.allocator,
+        "test-key",
+        AzureOpenAiProvider.DEFAULT_BASE_URL,
+        null,
+    );
+    try std.testing.expectError(error.InvalidBaseUrl, provider.buildChatUrl(std.testing.allocator, "gpt-5.2-chat"));
 }
 
 test "parseTextResponse single choice" {
@@ -587,18 +592,38 @@ test "buildChatUrl API version is hardcoded" {
 }
 
 test "buildRequestBody without system prompt" {
-    const body = try AzureOpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", 0.7, 4096);
+    const body = try AzureOpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-4.1", 0.7, 4096);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "role\":\"system\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":4096") != null);
 }
 
 test "buildRequestBody without max_tokens omits it" {
-    const body = try AzureOpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", 0.7, null);
+    const body = try AzureOpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-4.1", 0.7, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
+}
+
+test "buildChatRequestBody preserves reasoning fields for gpt-5" {
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "gpt-5.2-chat",
+        .max_tokens = 42,
+        .reasoning_effort = "high",
+    };
+
+    const body = try AzureOpenAiProvider.buildChatRequestBody(std.testing.allocator, req, req.model, 0.3);
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
 }
 
 test "parseTextResponse empty choices fails" {
@@ -651,11 +676,11 @@ test "timeout enforcement ensures minimum 60 seconds" {
     const min_timeout: u32 = 60;
     const low_timeout: u32 = 30;
     const high_timeout: u32 = 120;
-    
+
     // Verify timeout logic
     const adjusted_low = if (low_timeout < 60) 60 else low_timeout;
     const adjusted_high = if (high_timeout < 60) 60 else high_timeout;
-    
+
     try std.testing.expect(adjusted_low == min_timeout);
     try std.testing.expect(adjusted_high == high_timeout);
 }

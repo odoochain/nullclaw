@@ -1484,6 +1484,37 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.print("  -> Custom: {s}\n\n", .{custom_url});
     }
 
+    const is_azure_provider = provider_idx < known_providers.len and
+        std.mem.eql(u8, known_providers[provider_idx].key, "azure");
+
+    var provider_base_url: ?[]const u8 = null;
+    if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
+        provider_base_url = cfg.providers[0].base_url;
+    }
+
+    if (is_azure_provider) {
+        var azure_endpoint_buf: [512]u8 = undefined;
+        const default_endpoint = provider_base_url orelse "";
+        if (default_endpoint.len > 0) {
+            try out.print("  Azure OpenAI endpoint [{s}]: ", .{default_endpoint});
+        } else {
+            try out.writeAll("  Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com): ");
+        }
+        const azure_endpoint = prompt(out, &azure_endpoint_buf, "", default_endpoint) orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (azure_endpoint.len == 0) {
+            try out.writeAll("\n  Error: Azure OpenAI endpoint is required\n");
+            try out.flush();
+            return;
+        }
+        provider_base_url = try cfg.allocator.dupe(u8, azure_endpoint);
+        try out.writeAll("  Note: Azure OpenAI uses your model name as the deployment name in URLs.\n");
+        try out.writeAll("  Configure your Azure deployment with the same name as your model (e.g., gpt-5.2-chat).\n");
+    }
+
     // ── Step 2: API key ──
     const env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
     try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
@@ -1495,37 +1526,22 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     if (api_key_input.len > 0) {
         // Store in providers section (preserve base_url if already set for custom provider)
         const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        var base_url: ?[]const u8 = null;
-        if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
-            base_url = cfg.providers[0].base_url;
-        }
-        
-        // Azure-specific configuration
-        if (provider_idx < known_providers.len and std.mem.eql(u8, known_providers[provider_idx].key, "azure")) {
-            // Prompt for Azure endpoint
-            var azure_endpoint_buf: [512]u8 = undefined;
-            try out.writeAll("  Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com): ");
-            const azure_endpoint = prompt(out, &azure_endpoint_buf, "", "") orelse {
-                try out.writeAll("\n  Aborted.\n");
-                try out.flush();
-                return;
-            };
-            if (azure_endpoint.len > 0) {
-                base_url = try cfg.allocator.dupe(u8, azure_endpoint);
-            }
-            
-            try out.writeAll("  Note: Azure OpenAI uses your model name as the deployment name in URLs.\n");
-            try out.writeAll("  Configure your Azure deployment with the same name as your model (e.g., gpt-5.2-chat).\n");
-        }
-        
         entries[0] = .{
             .name = try cfg.allocator.dupe(u8, cfg.default_provider),
             .api_key = try cfg.allocator.dupe(u8, api_key_input),
-            .base_url = base_url,
+            .base_url = provider_base_url,
         };
         cfg.providers = entries;
         try out.writeAll("  -> API key set\n\n");
     } else {
+        if (is_azure_provider) {
+            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+            entries[0] = .{
+                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+                .base_url = provider_base_url,
+            };
+            cfg.providers = entries;
+        }
         try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
     }
 

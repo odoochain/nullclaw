@@ -64,6 +64,8 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "openrouter", .{ "OPENROUTER_API_KEY", "", "" } },
         .{ "openai", .{ "OPENAI_API_KEY", "", "" } },
         .{ "azure", .{ "AZURE_OPENAI_API_KEY", "", "" } },
+        .{ "azure-openai", .{ "AZURE_OPENAI_API_KEY", "", "" } },
+        .{ "azure_openai", .{ "AZURE_OPENAI_API_KEY", "", "" } },
         .{ "gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
         .{ "google", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
         .{ "google-gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
@@ -161,6 +163,12 @@ test "astrai env candidate is ASTRAI_API_KEY" {
 test "vertex env candidate is VERTEX_API_KEY" {
     const candidates = providerEnvCandidates("vertex");
     try std.testing.expectEqualStrings("VERTEX_API_KEY", candidates[0]);
+}
+
+test "azure aliases share Azure env candidate" {
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure")[0]);
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure-openai")[0]);
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure_openai")[0]);
 }
 
 test "providerEnvCandidates includes onboarding env hints" {

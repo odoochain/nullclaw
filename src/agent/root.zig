@@ -272,7 +272,9 @@ pub const Agent = struct {
     reasoning_mode: ReasoningMode = .off,
     usage_mode: UsageMode = .off,
     exec_host: ExecHost = .gateway,
+    default_exec_security: ExecSecurity = .allowlist,
     exec_security: ExecSecurity = .allowlist,
+    default_exec_ask: ExecAsk = .on_miss,
     exec_ask: ExecAsk = .on_miss,
     exec_node_id: ?[]const u8 = null,
     exec_node_id_owned: bool = false,
@@ -377,6 +379,15 @@ pub const Agent = struct {
         const resolved_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, default_model);
         const token_limit_cap: u32 = @intCast(@min(resolved_token_limit, @as(u64, std.math.maxInt(u32))));
         const resolved_max_tokens = @min(resolved_max_tokens_raw, token_limit_cap);
+        const resolved_exec_security: ExecSecurity = switch (cfg.autonomy.level) {
+            .full, .yolo => .full,
+            .read_only => .deny,
+            .supervised => .allowlist,
+        };
+        const resolved_exec_ask: ExecAsk = switch (cfg.autonomy.level) {
+            .full, .read_only, .yolo => .off,
+            .supervised => .on_miss,
+        };
 
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
@@ -431,15 +442,10 @@ pub const Agent = struct {
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
-            .exec_security = switch (cfg.autonomy.level) {
-                .full, .yolo => .full,
-                .read_only => .deny,
-                .supervised => .allowlist,
-            },
-            .exec_ask = switch (cfg.autonomy.level) {
-                .full, .read_only, .yolo => .off,
-                .supervised => .on_miss,
-            },
+            .default_exec_security = resolved_exec_security,
+            .exec_security = resolved_exec_security,
+            .default_exec_ask = resolved_exec_ask,
+            .exec_ask = resolved_exec_ask,
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -5588,6 +5594,35 @@ test "Agent.fromConfig sets multimodal_unrestricted for yolo" {
     defer agent.deinit();
 
     try std.testing.expect(agent.multimodal_unrestricted == true);
+    try std.testing.expect(agent.exec_security == .full);
+    try std.testing.expect(agent.exec_ask == .off);
+    try std.testing.expect(agent.default_exec_security == .full);
+    try std.testing.expect(agent.default_exec_ask == .off);
+}
+
+test "slash /restart restores config-derived exec policy for yolo" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .yolo;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .on_miss;
+
+    const response = (try agent.handleSlashCommand("/restart")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("Session restarted.", response);
+    try std.testing.expect(agent.exec_security == .full);
+    try std.testing.expect(agent.exec_ask == .off);
 }
 
 test "Agent.fromConfig does not set multimodal_unrestricted for full" {

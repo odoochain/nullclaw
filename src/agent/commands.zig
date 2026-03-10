@@ -966,8 +966,8 @@ fn resetRuntimeCommandState(self: anytype) void {
     self.reasoning_mode = .off;
     self.usage_mode = .off;
     self.exec_host = .gateway;
-    self.exec_security = .allowlist;
-    self.exec_ask = .on_miss;
+    self.exec_security = self.default_exec_security;
+    self.exec_ask = self.default_exec_ask;
     if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
     self.exec_node_id = null;
     self.exec_node_id_owned = false;

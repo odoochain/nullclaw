@@ -1900,7 +1900,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
-    _ = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4");
+    _ = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4", .{});
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
 

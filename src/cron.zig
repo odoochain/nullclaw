@@ -514,7 +514,7 @@ pub const CronScheduler = struct {
     }
 
     /// Add a recurring agent job.
-    pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8) !*CronJob {
+    pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         _ = try normalizeExpression(expression);
@@ -532,6 +532,16 @@ pub const CronScheduler = struct {
             .job_type = .agent,
             .prompt = try self.allocator.dupe(u8, prompt),
             .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
+                .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
+                .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .channel_owned = delivery.channel != null,
+                .account_id_owned = delivery.account_id != null,
+                .to_owned = delivery.to != null,
+                .best_effort = delivery.best_effort,
+            },
         });
 
         return &self.jobs.items[self.jobs.items.len - 1];
@@ -1581,12 +1591,12 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
 }
 
 /// CLI: add a recurring agent job.
-pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8) !void {
+pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentJob(expression, prompt, model);
+    const job = try scheduler.addAgentJob(expression, prompt, model, delivery);
     try saveJobs(&scheduler);
 
     log.info("Added agent cron job {s}", .{job.id});
@@ -2167,7 +2177,12 @@ test "save and load roundtrip keeps agent fields" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4");
+    _ = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat-42",
+    });
     try saveJobs(&scheduler);
 
     var loaded = CronScheduler.init(std.testing.allocator, 10, true);
@@ -2181,6 +2196,13 @@ test "save and load roundtrip keeps agent fields" {
     try std.testing.expectEqualStrings("Summarize release status", job.prompt.?);
     try std.testing.expect(job.model != null);
     try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expect(job.delivery.channel != null);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expect(job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("backup", job.delivery.account_id.?);
+    try std.testing.expect(job.delivery.to != null);
+    try std.testing.expectEqualStrings("chat-42", job.delivery.to.?);
 }
 
 test "JobType parse and asStr" {
@@ -2248,7 +2270,7 @@ test "updateJob keeps agent command and prompt in sync" {
     var scheduler = CronScheduler.init(allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a");
+    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a", .{});
     const id = scheduler.listJobs()[0].id;
 
     // Back-compat: updating command should update agent prompt.
@@ -2275,7 +2297,7 @@ test "CronScheduler remove frees agent job fields" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free");
+    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free", .{});
     try std.testing.expect(scheduler.removeJob(job.id));
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
@@ -2619,20 +2641,12 @@ test "agent job delivers result via bus" {
     var test_bus = bus.Bus.init();
     defer test_bus.close();
 
-    // Create an agent-type job with a prompt
-    try scheduler.jobs.append(allocator, .{
-        .id = try allocator.dupe(u8, "agent-1"),
-        .expression = try allocator.dupe(u8, "* * * * *"),
-        .command = try allocator.dupe(u8, "summarize"),
-        .job_type = .agent,
-        .prompt = try allocator.dupe(u8, "Summarize today's news"),
-        .next_run_secs = 0,
-        .delivery = .{
-            .mode = .always,
-            .channel = "discord",
-            .to = "general",
-        },
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize today's news", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .to = "general",
     });
+    job.next_run_secs = 0;
 
     _ = scheduler.tick(std.time.timestamp(), &test_bus);
 

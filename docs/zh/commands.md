@@ -88,7 +88,7 @@
 |---|---|
 | `nullclaw cron list` | 查看所有计划任务 |
 | `nullclaw cron add "0 * * * *" "command"` | 新增周期性 shell 任务 |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model>` | 新增周期性 agent 任务 |
+| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--to <id>]` | 新增周期性 agent 任务 |
 | `nullclaw cron once 10m "command"` | 新增一次性延迟任务 |
 | `nullclaw cron once-agent 10m "prompt" --model <model>` | 新增一次性 agent 延迟任务 |
 | `nullclaw cron run <id>` | 立即执行指定任务 |

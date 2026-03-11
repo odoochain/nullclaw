@@ -463,6 +463,9 @@ fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("## Channel Choices\n\n");
     try w.writeAll("- On supported channels (for example Telegram when enabled), append `<nc_choices>...</nc_choices>` at the end of the final reply to render short button choices when you are asking the user to choose among short options.\n");
     try w.writeAll("- Always keep the normal visible question text before the choices block.\n");
+    try w.writeAll("- One choices block must correspond to one concrete unanswered question.\n");
+    try w.writeAll("- Do not ask two or more separate questions in the same message when only one choices block is provided.\n");
+    try w.writeAll("- For multi-step data collection, ask one question, wait for the answer, then ask the next question in a new message.\n");
     try w.writeAll("- Use choices only for short mutually exclusive branches (for example yes/no or A/B).\n");
     try w.writeAll("- Do not use choices for long lists, open-ended prompts, or complex multi-step forms.\n");
     try w.writeAll("- If you ask the user to pick one of 2-4 short explicit options (for example yes/no/cancel, A/B, or quoted command replies), you MUST append a choices block unless the user explicitly asked for plain text only.\n");
@@ -964,6 +967,7 @@ test "buildSystemPrompt includes channel attachment marker guidance" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not claim attachment sending is unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Choices") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "One choices block must correspond to one concrete unanswered question.") != null);
 }
 
 test "buildSystemPrompt omits telegram-only group marker guidance for non-telegram groups" {

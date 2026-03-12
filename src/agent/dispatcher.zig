@@ -650,7 +650,20 @@ fn isPlausibleToolName(name: []const u8) bool {
 }
 
 fn hasMalformedQuotedColonToolName(raw_json: []const u8) bool {
-    return std.mem.indexOf(u8, raw_json, "\"name\":\":") != null;
+    const name_key = "\"name\"";
+    const name_idx = std.mem.indexOf(u8, raw_json, name_key) orelse return false;
+
+    var remaining = std.mem.trimLeft(u8, raw_json[name_idx + name_key.len ..], " \t\r\n");
+    if (remaining.len == 0 or remaining[0] != ':') return false;
+
+    remaining = std.mem.trimLeft(u8, remaining[1..], " \t\r\n");
+    if (remaining.len < 2 or remaining[0] != '"') return false;
+
+    remaining = remaining[1..];
+    if (remaining.len == 0 or remaining[0] != ':') return false;
+
+    remaining = std.mem.trimLeft(u8, remaining[1..], " \t\r\n");
+    return remaining.len > 0 and remaining[0] == '"';
 }
 
 fn recoverToolNameFromRawJson(raw_json: []const u8) ?[]const u8 {
@@ -694,14 +707,30 @@ fn extractRawArgumentsJson(raw_json: []const u8) ?[]const u8 {
     return extractJsonObject(after_args[colon_idx + 1 ..]);
 }
 
+fn normalizeSalvagedArgumentsJson(allocator: std.mem.Allocator, raw_json: []const u8) ![]u8 {
+    const args_src = extractRawArgumentsJson(raw_json) orelse return allocator.dupe(u8, "{}");
+    var parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args_src, .{}) catch blk: {
+        const repaired = repairJson(allocator, args_src) catch return allocator.dupe(u8, "{}");
+        defer allocator.free(repaired);
+        break :blk std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch return allocator.dupe(u8, "{}");
+    };
+    defer parsed_args.deinit();
+
+    return try std.json.Stringify.valueAlloc(allocator, parsed_args.value, .{});
+}
+
 fn salvageMalformedToolCallJson(allocator: std.mem.Allocator, raw_json: []const u8) !?ParsedToolCall {
+    if (!hasMalformedQuotedColonToolName(raw_json)) return null;
+
     const recovered_name = recoverToolNameFromRawJson(raw_json) orelse return null;
     if (!isPlausibleToolName(recovered_name)) return null;
 
-    const args_src = extractRawArgumentsJson(raw_json) orelse "{}";
+    const args_json = try normalizeSalvagedArgumentsJson(allocator, raw_json);
+    errdefer allocator.free(args_json);
+
     return .{
         .name = try allocator.dupe(u8, recovered_name),
-        .arguments_json = try allocator.dupe(u8, args_src),
+        .arguments_json = args_json,
     };
 }
 
@@ -710,7 +739,9 @@ fn repairMalformedParsedToolName(
     raw_json: []const u8,
     call: *ParsedToolCall,
 ) !void {
+    if (!hasMalformedQuotedColonToolName(raw_json)) return;
     if (isPlausibleToolName(call.name)) return;
+
     const recovered_name = recoverToolNameFromRawJson(raw_json) orelse return;
     if (!isPlausibleToolName(recovered_name)) return;
 
@@ -719,14 +750,15 @@ fn repairMalformedParsedToolName(
 }
 
 fn parseInnerToolCall(allocator: std.mem.Allocator, inner: []const u8) !?ParsedToolCall {
-    if (hasMalformedQuotedColonToolName(inner)) {
+    const malformed_quoted_colon_name = hasMalformedQuotedColonToolName(inner);
+    if (malformed_quoted_colon_name) {
         if (try salvageMalformedToolCallJson(allocator, inner)) |recovered| {
             return recovered;
         }
     }
     if (extractJsonObject(inner)) |json_slice| {
         if (parseToolCallJson(allocator, json_slice)) |call| {
-            if (!isPlausibleToolName(call.name)) {
+            if (malformed_quoted_colon_name and !isPlausibleToolName(call.name)) {
                 if (try salvageMalformedToolCallJson(allocator, inner)) |recovered| {
                     allocator.free(call.name);
                     allocator.free(call.arguments_json);
@@ -935,23 +967,22 @@ pub fn repairJson(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 /// Parse a JSON tool call object: {"name": "...", "arguments": {...}}
 /// Tries to parse as-is first, then applies JSON repair as fallback.
 fn parseToolCallJson(allocator: std.mem.Allocator, json_str: []const u8) !ParsedToolCall {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch blk: {
         // JSON parse failed — try repair
         const repaired = repairJson(allocator, json_str) catch return error.InvalidToolCallFormat;
         defer allocator.free(repaired);
-        const reparsed = std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch {
+        break :blk std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch {
             if (try salvageMalformedToolCallJson(allocator, json_str)) |call| return call;
             return error.InvalidToolCallFormat;
         };
-        var call = try parseToolCallJsonInner(allocator, reparsed);
-        errdefer {
-            allocator.free(call.name);
-            allocator.free(call.arguments_json);
-        }
-        try repairMalformedParsedToolName(allocator, json_str, &call);
-        return call;
     };
-    return parseToolCallJsonInner(allocator, parsed);
+    var call = try parseToolCallJsonInner(allocator, parsed);
+    errdefer {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+    try repairMalformedParsedToolName(allocator, json_str, &call);
+    return call;
 }
 
 fn parseToolCallJsonInner(allocator: std.mem.Allocator, parsed: std.json.Parsed(std.json.Value)) !ParsedToolCall {
@@ -2618,6 +2649,23 @@ test "parseToolCallJson salvages malformed quoted colon tool name" {
     try std.testing.expectEqualStrings("Traumforschung kulturwissenschaftlich", parsed_args.value.object.get("query").?.string);
 }
 
+test "parseToolCallJson salvages malformed quoted colon tool name with repaired arguments" {
+    const allocator = std.testing.allocator;
+    const raw = "{\"name\" : \": \"memory_recall\", \"arguments\" : {\"query\": \"hello\",}}";
+
+    const result = try parseToolCallJson(allocator, raw);
+    defer {
+        allocator.free(result.name);
+        allocator.free(result.arguments_json);
+    }
+
+    try std.testing.expectEqualStrings("memory_recall", result.name);
+
+    const parsed_args = try std.json.parseFromSlice(std.json.Value, allocator, result.arguments_json, .{});
+    defer parsed_args.deinit();
+    try std.testing.expectEqualStrings("hello", parsed_args.value.object.get("query").?.string);
+}
+
 test "parseToolCalls salvages malformed quoted colon tool name" {
     const allocator = std.testing.allocator;
     const response =
@@ -2640,6 +2688,28 @@ test "parseToolCalls salvages malformed quoted colon tool name" {
     try std.testing.expectEqualStrings("Ich suche erst im Langzeitgedaechtnis.", result.text);
     try std.testing.expectEqual(@as(usize, 1), result.calls.len);
     try std.testing.expectEqualStrings("memory_recall", result.calls[0].name);
+}
+
+test "parseToolCalls does not salvage unrelated invalid tool name" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_call>
+        \\{"name": "shell tool", "arguments": {"command": "echo hi"}}
+        \\</tool_call>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell tool", result.calls[0].name);
 }
 
 test "parseXmlToolCalls minimax format" {

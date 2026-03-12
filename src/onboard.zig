@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const fs_compat = @import("fs_compat.zig");
 const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
@@ -2667,12 +2668,12 @@ test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
     try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
     try std.testing.expectEqual(@as(usize, 0), report.removed_files);
 
-    const agents_content = try tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 64 * 1024);
+    const agents_content = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "AGENTS.md", 64 * 1024);
     defer std.testing.allocator.free(agents_content);
     try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents_content, "custom-agents-content") == null);
 
-    const user_content = try tmp.dir.readFileAlloc(std.testing.allocator, "USER.md", 64 * 1024);
+    const user_content = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "USER.md", 64 * 1024);
     defer std.testing.allocator.free(user_content);
     try std.testing.expect(std.mem.indexOf(u8, user_content, "USER.md - About Your Human") != null);
     try std.testing.expect(std.mem.indexOf(u8, user_content, "custom-user-content") == null);

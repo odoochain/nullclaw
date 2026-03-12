@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const tools_mod = @import("../tools/root.zig");
 const path_prefix = @import("../path_prefix.zig");
@@ -87,7 +88,7 @@ fn openWorkspaceFileWithGuards(
         },
     };
 
-    const stat = file.stat() catch {
+    const stat = fs_compat.stat(file) catch {
         file.close();
         allocator.free(canonical_path);
         return null;

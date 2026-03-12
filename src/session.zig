@@ -11,6 +11,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
+const fs_compat = @import("fs_compat.zig");
 const agent_mod = @import("agent/root.zig");
 const Agent = agent_mod.Agent;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -308,7 +309,7 @@ pub const SessionManager = struct {
         defer if (file_needs_close) file.close();
 
         const now_ts = std.time.timestamp();
-        const stat = file.stat() catch return;
+        const stat = fs_compat.stat(file) catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
 
         const record_line = std.fmt.allocPrint(

@@ -1,5 +1,6 @@
 const std = @import("std");
 const zig_builtin = @import("builtin");
+const fs_compat = @import("fs_compat.zig");
 const platform = @import("platform.zig");
 const json_miniparse = @import("json_miniparse.zig");
 
@@ -253,7 +254,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
     const instructions_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{skill_dir_path});
     defer allocator.free(instructions_path);
 
-    const toml_bytes = std.fs.cwd().readFileAlloc(allocator, toml_path, 128 * 1024) catch |err| switch (err) {
+    const toml_bytes = fs_compat.readFileAlloc(std.fs.cwd(), allocator, toml_path, 128 * 1024) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return error.ManifestNotFound,
     };
@@ -275,7 +276,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         errdefer allocator.free(author);
         const path = try allocator.dupe(u8, skill_dir_path);
         errdefer allocator.free(path);
-        const instructions = std.fs.cwd().readFileAlloc(allocator, instructions_path, 256 * 1024) catch
+        const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
             try allocator.dupe(u8, "");
 
         return Skill{
@@ -292,7 +293,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         };
     }
 
-    const manifest_bytes = std.fs.cwd().readFileAlloc(allocator, manifest_path, 64 * 1024) catch |err| switch (err) {
+    const manifest_bytes = fs_compat.readFileAlloc(std.fs.cwd(), allocator, manifest_path, 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return error.ManifestNotFound,
     };
@@ -314,7 +315,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         const path = try allocator.dupe(u8, skill_dir_path);
         errdefer allocator.free(path);
 
-        const instructions = std.fs.cwd().readFileAlloc(allocator, instructions_path, 256 * 1024) catch
+        const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
             try allocator.dupe(u8, "");
 
         return Skill{
@@ -331,7 +332,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         };
     }
 
-    const instructions = std.fs.cwd().readFileAlloc(allocator, instructions_path, 256 * 1024) catch
+    const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
         return error.ManifestNotFound;
     errdefer allocator.free(instructions);
 
@@ -1025,7 +1026,7 @@ fn auditSkillFileContent(
     const toml = isTomlFile(file_path);
     if (!markdown and !toml) return;
 
-    const content = std.fs.cwd().readFileAlloc(allocator, file_path, SKILL_AUDIT_MAX_FILE_BYTES) catch |err| switch (err) {
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, file_path, SKILL_AUDIT_MAX_FILE_BYTES) catch |err| switch (err) {
         error.FileTooBig => return error.SkillSecurityAuditFailed,
         else => return error.SkillSecurityAuditFailed,
     };
@@ -1693,7 +1694,7 @@ pub fn loadCommunitySkills(allocator: std.mem.Allocator, community_dir: []const 
         const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ community_dir, name_slice });
         defer allocator.free(file_path);
 
-        const content = std.fs.cwd().readFileAlloc(allocator, file_path, 256 * 1024) catch continue;
+        const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, file_path, 256 * 1024) catch continue;
 
         const duped_name = try allocator.dupe(u8, skill_name);
         errdefer allocator.free(duped_name);
@@ -2841,7 +2842,7 @@ test "installSkillFromPath copies full source directory" {
 
     const installed_payload = try std.fs.path.join(allocator, &.{ workspace, "skills", "source", "assets", "payload.txt" });
     defer allocator.free(installed_payload);
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, installed_payload, 1024);
+    const bytes = try fs_compat.readFileAlloc(std.fs.cwd(), allocator, installed_payload, 1024);
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("asset-data", bytes);
 }
@@ -2870,7 +2871,7 @@ test "installSkillFromPath supports markdown-only source directory" {
 
     const installed_path = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-md", "SKILL.md" });
     defer allocator.free(installed_path);
-    const content = try std.fs.cwd().readFileAlloc(allocator, installed_path, 1024);
+    const content = try fs_compat.readFileAlloc(std.fs.cwd(), allocator, installed_path, 1024);
     defer allocator.free(content);
     try std.testing.expectEqualStrings("# Markdown only install", content);
 }
@@ -2931,7 +2932,7 @@ test "installSkillFromPath accepts direct manifest file paths" {
 
         const installed_path = try std.fs.path.join(allocator, &.{ workspace, "skills", case.source_dir_name, case.manifest_name });
         defer allocator.free(installed_path);
-        const content = try std.fs.cwd().readFileAlloc(allocator, installed_path, 1024);
+        const content = try fs_compat.readFileAlloc(std.fs.cwd(), allocator, installed_path, 1024);
         defer allocator.free(content);
         try std.testing.expectEqualStrings(case.manifest_body, content);
     }
@@ -2997,7 +2998,7 @@ test "installSkillFromPath supports relative source path" {
 
     const installed = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-rel", "SKILL.md" });
     defer allocator.free(installed);
-    const content = try std.fs.cwd().readFileAlloc(allocator, installed, 1024);
+    const content = try fs_compat.readFileAlloc(std.fs.cwd(), allocator, installed, 1024);
     defer allocator.free(content);
     try std.testing.expectEqualStrings("# Relative install skill", content);
 }
@@ -3270,7 +3271,7 @@ test "installSkillFromGit keeps clone directory name when manifest name differs"
     const payload_path = try std.fs.path.join(allocator, &.{ installed_skill_path, "assets", "payload.txt" });
     defer allocator.free(payload_path);
 
-    const payload = try std.fs.cwd().readFileAlloc(allocator, payload_path, 1024);
+    const payload = try fs_compat.readFileAlloc(std.fs.cwd(), allocator, payload_path, 1024);
     defer allocator.free(payload);
     try std.testing.expectEqualStrings("asset-data", payload);
 

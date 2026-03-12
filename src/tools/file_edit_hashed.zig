@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -134,7 +135,7 @@ pub const FileEditHashedTool = struct {
         };
         defer file.close();
 
-        const stat = file.stat() catch |err| {
+        const stat = fs_compat.stat(file) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to stat file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -237,7 +238,7 @@ test "file_edit_hashed replaces line when hash matches with shift" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "shifted from L2 to L3") != null);
 
-    const updated = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const updated = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(updated);
     try std.testing.expect(std.mem.indexOf(u8, updated, "NEW LINE") != null);
 }
@@ -280,7 +281,7 @@ test "file_edit_hashed preserves missing trailing newline at eof" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
 
-    const updated = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const updated = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(updated);
     try std.testing.expectEqualStrings("line one\ntail", updated);
 }
@@ -327,7 +328,7 @@ test "file_edit_hashed rejects absolute path outside allowed areas" {
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
 
-    const outside_after = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const outside_after = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(outside_after);
     try std.testing.expectEqualStrings("outside-before", outside_after);
 }

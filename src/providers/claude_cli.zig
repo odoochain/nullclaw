@@ -195,30 +195,22 @@ pub const ClaudeCliProvider = struct {
         defer allocator.free(current_hashes);
 
         const now_ns = std.time.nanoTimestamp();
-        var plan = ClaudeCliProvider.SessionPlan{
-            .use_resume = false,
-            .delta_start = 0,
-            .reset_state = false,
-        };
-        var resume_session_id: ?[]u8 = null;
-        defer if (resume_session_id) |sid| allocator.free(sid);
-
         self.mutex.lock();
-        {
-            defer self.mutex.unlock();
-            const state = try self.getOrCreateSessionStateLocked(session_key);
-            plan = buildSessionPlan(state, current_hashes, now_ns);
-            if (plan.reset_state) state.reset(self.allocator);
-            if (plan.use_resume) {
-                resume_session_id = try allocator.dupe(u8, state.cli_session_id.?);
-            }
-        }
+        defer self.mutex.unlock();
 
-        if (resume_session_id) |sid| {
+        const plan = blk: {
+            const state = try self.getOrCreateSessionStateLocked(session_key);
+            const planned = buildSessionPlan(state, messages, current_hashes, now_ns);
+            if (planned.reset_state) self.deleteSessionStateLocked(session_key);
+            break :blk planned;
+        };
+
+        if (plan.use_resume) {
+            const state = self.sessions.getPtr(session_key) orelse return error.SessionStateMissing;
             const resume_prompt = renderPromptMessages(allocator, messages, plan.delta_start) catch |err| switch (err) {
                 error.NoUserMessage => {
-                    self.resetSessionState(session_key);
-                    return try self.runFreshSessionChat(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
+                    self.deleteSessionStateLocked(session_key);
+                    return try self.runFreshSessionChatLocked(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
                 },
                 else => return err,
             };
@@ -227,25 +219,25 @@ pub const ClaudeCliProvider = struct {
             const resume_result = runClaudeCommand(allocator, .{
                 .prompt = resume_prompt,
                 .model = model,
-                .resume_session_id = sid,
+                .resume_session_id = state.cli_session_id.?,
             }) catch |err| switch (err) {
                 error.CliProcessFailed, error.NoResultInOutput => {
-                    self.resetSessionState(session_key);
-                    return try self.runFreshSessionChat(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
+                    self.deleteSessionStateLocked(session_key);
+                    return try self.runFreshSessionChatLocked(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
                 },
                 else => return err,
             };
             errdefer allocator.free(resume_result.result);
             defer if (resume_result.session_id) |new_sid| allocator.free(new_sid);
 
-            try self.recordSuccessfulTurn(session_key, current_hashes, resume_result.result, resume_result.session_id, now_ns);
+            try self.recordSuccessfulTurnLocked(session_key, current_hashes, resume_result.result, resume_result.session_id, now_ns);
             return resume_result.result;
         }
 
-        return try self.runFreshSessionChat(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
+        return try self.runFreshSessionChatLocked(allocator, session_key, messages, current_hashes, system_prompt, model, now_ns);
     }
 
-    fn runFreshSessionChat(
+    fn runFreshSessionChatLocked(
         self: *ClaudeCliProvider,
         allocator: std.mem.Allocator,
         session_key: []const u8,
@@ -266,11 +258,11 @@ pub const ClaudeCliProvider = struct {
         errdefer allocator.free(result.result);
         defer if (result.session_id) |sid| allocator.free(sid);
 
-        try self.recordSuccessfulTurn(session_key, current_hashes, result.result, result.session_id, now_ns);
+        try self.recordSuccessfulTurnLocked(session_key, current_hashes, result.result, result.session_id, now_ns);
         return result.result;
     }
 
-    fn recordSuccessfulTurn(
+    fn recordSuccessfulTurnLocked(
         self: *ClaudeCliProvider,
         session_key: []const u8,
         current_hashes: []const u64,
@@ -278,19 +270,15 @@ pub const ClaudeCliProvider = struct {
         session_id: ?[]const u8,
         now_ns: i128,
     ) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         const state = try self.getOrCreateSessionStateLocked(session_key);
         try state.updateTranscript(self.allocator, current_hashes, response_content, session_id, now_ns);
     }
 
-    fn resetSessionState(self: *ClaudeCliProvider, session_key: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.sessions.getPtr(session_key)) |state| {
-            state.reset(self.allocator);
+    fn deleteSessionStateLocked(self: *ClaudeCliProvider, session_key: []const u8) void {
+        if (self.sessions.fetchRemove(session_key)) |entry| {
+            self.allocator.free(entry.key);
+            var state = entry.value;
+            state.deinit(self.allocator);
         }
     }
 
@@ -309,26 +297,38 @@ pub const ClaudeCliProvider = struct {
     }
 };
 
-fn buildSessionPlan(state: *const ClaudeCliProvider.SessionState, current_hashes: []const u64, now_ns: i128) ClaudeCliProvider.SessionPlan {
+fn buildSessionPlan(
+    state: *const ClaudeCliProvider.SessionState,
+    messages: []const ChatMessage,
+    current_hashes: []const u64,
+    now_ns: i128,
+) ClaudeCliProvider.SessionPlan {
     if (state.cli_session_id == null) {
         return .{ .use_resume = false, .delta_start = 0, .reset_state = true };
     }
     if (state.last_active_ns != 0 and now_ns - state.last_active_ns > ClaudeCliProvider.IDLE_TIMEOUT_NS) {
         return .{ .use_resume = false, .delta_start = 0, .reset_state = true };
     }
-    if (!historyExtendsTranscript(state.transcript_hashes.items, current_hashes)) {
+
+    const delta_start = transcriptResumeDeltaStart(state.transcript_hashes.items, messages, current_hashes) orelse {
         return .{ .use_resume = false, .delta_start = 0, .reset_state = true };
-    }
+    };
     return .{
         .use_resume = true,
-        .delta_start = state.transcript_hashes.items.len,
+        .delta_start = delta_start,
         .reset_state = false,
     };
 }
 
-fn historyExtendsTranscript(existing: []const u64, current: []const u64) bool {
-    if (existing.len > current.len) return false;
-    return std.mem.eql(u64, existing, current[0..existing.len]);
+fn transcriptResumeDeltaStart(existing: []const u64, messages: []const ChatMessage, current: []const u64) ?usize {
+    if (existing.len > current.len) return null;
+    if (std.mem.eql(u64, existing, current[0..existing.len])) return existing.len;
+    if (existing.len == 0 or existing.len > messages.len) return null;
+    if (messages[existing.len - 1].role != .assistant) return null;
+    if (existing.len > 1 and !std.mem.eql(u64, existing[0 .. existing.len - 1], current[0 .. existing.len - 1])) {
+        return null;
+    }
+    return existing.len;
 }
 
 fn extractSystemPrompt(messages: []const ChatMessage) ?[]const u8 {
@@ -593,12 +593,17 @@ test "renderPromptMessages rejects all-system delta" {
 test "buildSessionPlan resumes only when transcript is still a prefix" {
     var state = ClaudeCliProvider.SessionState{};
     defer state.deinit(std.testing.allocator);
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("first"),
+        ChatMessage.assistant("second"),
+        ChatMessage.user("third"),
+    };
 
     try state.replaceSessionId(std.testing.allocator, "sess-1");
     try state.transcript_hashes.appendSlice(std.testing.allocator, &.{ 1, 2, 3 });
     state.last_active_ns = std.time.nanoTimestamp();
 
-    const plan = buildSessionPlan(&state, &.{ 1, 2, 3, 4 }, std.time.nanoTimestamp());
+    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3, 4 }, std.time.nanoTimestamp());
     try std.testing.expect(plan.use_resume);
     try std.testing.expectEqual(@as(usize, 3), plan.delta_start);
     try std.testing.expect(!plan.reset_state);
@@ -607,12 +612,17 @@ test "buildSessionPlan resumes only when transcript is still a prefix" {
 test "buildSessionPlan resets on diverged history" {
     var state = ClaudeCliProvider.SessionState{};
     defer state.deinit(std.testing.allocator);
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("first"),
+        ChatMessage.assistant("second"),
+        ChatMessage.user("third"),
+    };
 
     try state.replaceSessionId(std.testing.allocator, "sess-1");
-    try state.transcript_hashes.appendSlice(std.testing.allocator, &.{ 1, 9 });
+    try state.transcript_hashes.appendSlice(std.testing.allocator, &.{ 9, 2 });
     state.last_active_ns = std.time.nanoTimestamp();
 
-    const plan = buildSessionPlan(&state, &.{ 1, 2, 3 }, std.time.nanoTimestamp());
+    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3 }, std.time.nanoTimestamp());
     try std.testing.expect(!plan.use_resume);
     try std.testing.expect(plan.reset_state);
 }
@@ -620,14 +630,54 @@ test "buildSessionPlan resets on diverged history" {
 test "buildSessionPlan resets on idle timeout" {
     var state = ClaudeCliProvider.SessionState{};
     defer state.deinit(std.testing.allocator);
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("first"),
+        ChatMessage.assistant("second"),
+    };
 
     try state.replaceSessionId(std.testing.allocator, "sess-1");
     try state.transcript_hashes.appendSlice(std.testing.allocator, &.{1});
     state.last_active_ns = std.time.nanoTimestamp() - ClaudeCliProvider.IDLE_TIMEOUT_NS - std.time.ns_per_s;
 
-    const plan = buildSessionPlan(&state, &.{ 1, 2 }, std.time.nanoTimestamp());
+    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2 }, std.time.nanoTimestamp());
     try std.testing.expect(!plan.use_resume);
     try std.testing.expect(plan.reset_state);
+}
+
+test "buildSessionPlan tolerates normalized assistant history mismatch" {
+    var state = ClaudeCliProvider.SessionState{};
+    defer state.deinit(std.testing.allocator);
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("first"),
+        ChatMessage.assistant("normalized"),
+        ChatMessage.user("third"),
+    };
+
+    try state.replaceSessionId(std.testing.allocator, "sess-1");
+    try state.transcript_hashes.appendSlice(std.testing.allocator, &.{ 1, 99 });
+    state.last_active_ns = std.time.nanoTimestamp();
+
+    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3 }, std.time.nanoTimestamp());
+    try std.testing.expect(plan.use_resume);
+    try std.testing.expectEqual(@as(usize, 2), plan.delta_start);
+    try std.testing.expect(!plan.reset_state);
+}
+
+test "deleteSessionStateLocked removes stored session state" {
+    var provider = ClaudeCliProvider{
+        .allocator = std.testing.allocator,
+        .model = "test-model",
+    };
+    defer provider.provider().deinit();
+
+    provider.mutex.lock();
+    defer provider.mutex.unlock();
+
+    _ = try provider.getOrCreateSessionStateLocked("chat-1");
+    try std.testing.expect(provider.sessions.count() == 1);
+
+    provider.deleteSessionStateLocked("chat-1");
+    try std.testing.expect(provider.sessions.count() == 0);
 }
 
 test "SessionState updateTranscript appends assistant response hash" {

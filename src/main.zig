@@ -186,6 +186,12 @@ pub fn main() !void {
         try yc.from_json.run(allocator, args[2..]);
         return;
     }
+    if (comptime builtin.os.tag == .windows) {
+        if (yc.service.isWindowsServiceGatewayArg(args[1])) {
+            try yc.service.runWindowsServiceGateway(allocator);
+            return;
+        }
+    }
 
     const cmd = parseCommand(args[1]) orelse {
         std.debug.print("Unknown command: {s}\n\n", .{args[1]});

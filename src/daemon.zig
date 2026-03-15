@@ -161,22 +161,30 @@ pub fn isShutdownRequested() bool {
     return shutdown_requested.load(.acquire);
 }
 
+fn recordGatewayFailure(err: anyerror, state: *DaemonState) void {
+    requestShutdown();
+    state.markError("gateway", @errorName(err));
+    health.markComponentError("gateway", @errorName(err));
+}
+
+fn logGatewayFailure(err: anyerror, port: u16) void {
+    switch (err) {
+        error.AddressInUse => {
+            log.err("Gateway failed to start: port {d} is already in use. Is another nullclaw instance running?", .{port});
+        },
+        else => {
+            log.err("Gateway failed to start: {}", .{err});
+        },
+    }
+    log.err("Shutting down daemon due to fatal gateway error.", .{});
+}
+
 /// Gateway thread entry point.
 fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway = @import("gateway.zig");
     gateway.run(allocator, host, port, config, event_bus) catch |err| {
-        switch (err) {
-            error.AddressInUse => {
-                log.err("Gateway failed to start: port {d} is already in use. Is another nullclaw instance running?", .{port});
-                log.err("Shutting down daemon due to fatal gateway error.", .{});
-                requestShutdown();
-            },
-            else => {
-                log.err("Gateway failed to start: {}", .{err});
-            },
-        }
-        state.markError("gateway", @errorName(err));
-        health.markComponentError("gateway", @errorName(err));
+        logGatewayFailure(err, port);
+        recordGatewayFailure(err, state);
         return;
     };
 }
@@ -456,7 +464,7 @@ fn channelSupervisorThread(
     channel_rt: ?*channel_loop.ChannelRuntime,
     event_bus: *bus_mod.Bus,
 ) void {
-    // Early exit if shutdown was requested (e.g., gateway port conflict)
+    // Early exit if shutdown was requested before channel startup.
     if (isShutdownRequested()) {
         return;
     }
@@ -2214,6 +2222,27 @@ test "channelSupervisorThread respects shutdown" {
 
     // Channel component should have been marked running before the loop
     try std.testing.expect(state.components[0].?.running);
+}
+
+test "recordGatewayFailure requests shutdown for fatal gateway errors" {
+    shutdown_requested.store(false, .release);
+    defer shutdown_requested.store(false, .release);
+    health.reset();
+    defer health.reset();
+
+    var state = DaemonState{};
+    state.addComponent("gateway");
+
+    recordGatewayFailure(error.PermissionDenied, &state);
+
+    try std.testing.expect(isShutdownRequested());
+    try std.testing.expect(!state.components[0].?.running);
+    try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
+    try std.testing.expectEqualStrings("PermissionDenied", state.components[0].?.last_error.?);
+
+    const gateway_health = health.getComponentHealth("gateway") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("error", gateway_health.status);
+    try std.testing.expectEqualStrings("PermissionDenied", gateway_health.last_error.?);
 }
 
 test "DaemonState supports all supervised components" {

@@ -1548,10 +1548,45 @@ fn isRecoverableCronStoreError(err: anyerror) bool {
 // ── CLI entry points (called from main.zig) ──────────────────────
 
 /// CLI: list all cron jobs.
+/// Check if the cron scheduler daemon is running and enabled.
+fn checkSchedulerStatus(allocator: std.mem.Allocator) struct { daemon_running: bool, scheduler_enabled: bool, config_error: bool } {
+    // Check if daemon is running by looking for daemon_state.json
+    var config_opt = @import("config.zig").Config.load(allocator) catch {
+        return .{ .daemon_running = false, .scheduler_enabled = false, .config_error = true };
+    };
+    defer config_opt.deinit();
+    
+    const daemon_running = blk: {
+        const daemon_state_path = @import("daemon.zig").stateFilePath(allocator, &config_opt) catch break :blk false;
+        defer allocator.free(daemon_state_path);
+        const file = std.fs.openFileAbsolute(daemon_state_path, .{}) catch break :blk false;
+        file.close();
+        break :blk true;
+    };
+    
+    return .{
+        .daemon_running = daemon_running,
+        .scheduler_enabled = config_opt.scheduler.enabled,
+        .config_error = false,
+    };
+}
+
 pub fn cliListJobs(allocator: std.mem.Allocator) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
+
+    // Check scheduler status and warn user if needed
+    const sched_status = checkSchedulerStatus(allocator);
+    if (sched_status.config_error) {
+        log.warn("Cannot load config - run `nullclaw onboard` first", .{});
+    } else if (!sched_status.scheduler_enabled) {
+        log.warn("Cron scheduler is DISABLED in config. Jobs will not run automatically.", .{});
+        log.warn("Enable with: scheduler.enabled = true in config, then restart daemon.", .{});
+    } else if (!sched_status.daemon_running) {
+        log.warn("Daemon is not running. Jobs will not run automatically.", .{});
+        log.warn("Start with: nullclaw gateway or nullclaw service start", .{});
+    }
 
     const jobs = scheduler.listJobs();
     if (jobs.len == 0) {
@@ -1559,6 +1594,9 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
         log.info("Usage:", .{});
         log.info("  nullclaw cron add '*/10 * * * *' 'echo hello'", .{});
         log.info("  nullclaw cron once 30m 'echo reminder'", .{});
+        if (!sched_status.config_error and sched_status.scheduler_enabled and sched_status.daemon_running) {
+            log.info("Scheduler is running and ready for jobs.", .{});
+        }
         return;
     }
 
@@ -1580,6 +1618,51 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
             flags,
             job.command,
         });
+    }
+}
+
+/// CLI: show scheduler daemon status and diagnostics.
+pub fn cliStatus(allocator: std.mem.Allocator) !void {
+    const sched_status = checkSchedulerStatus(allocator);
+    
+    log.info("Cron Scheduler Status:", .{});
+    
+    if (sched_status.config_error) {
+        log.info("  Config: ❌ ERROR (run `nullclaw onboard` first)", .{});
+        return;
+    }
+    
+    log.info("  Scheduler enabled: {s}", .{if (sched_status.scheduler_enabled) "✅ YES" else "❌ NO"});
+    log.info("  Daemon running:    {s}", .{if (sched_status.daemon_running) "✅ YES" else "❌ NO"});
+    
+    if (sched_status.scheduler_enabled and sched_status.daemon_running) {
+        log.info("  Status: 🟢 HEALTHY - Cron jobs will run automatically", .{});
+    } else if (!sched_status.scheduler_enabled) {
+        log.info("  Status: 🔴 DISABLED - Enable scheduler in config and restart daemon", .{});
+        log.info("  Fix: Set scheduler.enabled = true in config, then restart", .{});
+    } else if (!sched_status.daemon_running) {
+        log.info("  Status: 🟡 STOPPED - Daemon not running", .{});
+        log.info("  Fix: Start daemon with `nullclaw gateway` or `nullclaw service start`", .{});
+    }
+    
+    // Show job count
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+    const jobs = scheduler.listJobs();
+    log.info("  Jobs loaded: {d} total", .{jobs.len});
+    
+    if (jobs.len > 0) {
+        var enabled_count: usize = 0;
+        var paused_count: usize = 0;
+        for (jobs) |job| {
+            if (job.paused) {
+                paused_count += 1;
+            } else {
+                enabled_count += 1;
+            }
+        }
+        log.info("    - {d} active, {d} paused", .{enabled_count, paused_count});
     }
 }
 

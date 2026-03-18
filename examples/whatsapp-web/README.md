@@ -11,6 +11,15 @@ This directory contains a reference adapter for `channels.external`:
   in `get_manifest`.
   `config.bridge_url` must be `https://...` or loopback `http://127.0.0.1/...`.
 
+Related out-of-tree repositories:
+
+- [nullclaw/nullclaw-channel-whatsmeow-bridge](https://github.com/nullclaw/nullclaw-channel-whatsmeow-bridge)
+  Production-oriented Go/whatsmeow bridge with QR, pairing-code, and deployment assets.
+- [nullclaw/nullclaw-channel-baileys](https://github.com/nullclaw/nullclaw-channel-baileys)
+  Direct Node/Baileys external channel plugin if you do not want an HTTP bridge at all.
+
+This in-tree directory remains a reference adapter and compatibility example.
+
 Typical config:
 
 ```json

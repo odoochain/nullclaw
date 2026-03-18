@@ -30,6 +30,10 @@ pub const ExternalChannel = struct {
     streaming_supported: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     send_rich_rpc_mode: std.atomic.Value(i8) = std.atomic.Value(i8).init(RPC_UNKNOWN),
     typing_rpc_mode: std.atomic.Value(i8) = std.atomic.Value(i8).init(RPC_UNKNOWN),
+    edit_rpc_mode: std.atomic.Value(i8) = std.atomic.Value(i8).init(RPC_UNKNOWN),
+    delete_rpc_mode: std.atomic.Value(i8) = std.atomic.Value(i8).init(RPC_UNKNOWN),
+    reactions_rpc_mode: std.atomic.Value(i8) = std.atomic.Value(i8).init(RPC_UNKNOWN),
+    read_receipts_rpc_mode: std.atomic.Value(i8) = std.atomic.Value(i8).init(RPC_UNKNOWN),
     last_health_probe_ns: i64 = 0,
     last_health_result: bool = false,
 
@@ -111,6 +115,30 @@ pub const ExternalChannel = struct {
         try self.typingRpcLocked("stop_typing", recipient);
     }
 
+    fn editMessage(self: *Self, edit: root.Channel.MessageEdit) !void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        try self.editMessageLocked(edit);
+    }
+
+    fn deleteMessage(self: *Self, message_ref: root.Channel.MessageRef) !void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        try self.deleteMessageLocked(message_ref);
+    }
+
+    fn setReaction(self: *Self, update: root.Channel.ReactionUpdate) !void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        try self.setReactionLocked(update);
+    }
+
+    fn markRead(self: *Self, message_ref: root.Channel.MessageRef) !void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        try self.markReadLocked(message_ref);
+    }
+
     fn startLocked(self: *Self) !void {
         if (self.running.load(.acquire)) return;
         if (!config_types.ExternalChannelConfig.isValidRuntimeName(self.config.runtime_name)) {
@@ -147,6 +175,10 @@ pub const ExternalChannel = struct {
         self.streaming_supported.store(false, .release);
         self.send_rich_rpc_mode.store(RPC_UNKNOWN, .release);
         self.typing_rpc_mode.store(RPC_UNKNOWN, .release);
+        self.edit_rpc_mode.store(RPC_UNKNOWN, .release);
+        self.delete_rpc_mode.store(RPC_UNKNOWN, .release);
+        self.reactions_rpc_mode.store(RPC_UNKNOWN, .release);
+        self.read_receipts_rpc_mode.store(RPC_UNKNOWN, .release);
         self.last_health_probe_ns = 0;
         self.last_health_result = false;
 
@@ -157,6 +189,10 @@ pub const ExternalChannel = struct {
         self.streaming_supported.store(manifest.streaming_supported orelse false, .release);
         self.send_rich_rpc_mode.store(if (manifest.send_rich_supported orelse false) RPC_SUPPORTED else RPC_UNSUPPORTED, .release);
         self.typing_rpc_mode.store(if (manifest.typing_supported orelse false) RPC_SUPPORTED else RPC_UNSUPPORTED, .release);
+        self.edit_rpc_mode.store(if (manifest.edit_supported orelse false) RPC_SUPPORTED else RPC_UNSUPPORTED, .release);
+        self.delete_rpc_mode.store(if (manifest.delete_supported orelse false) RPC_SUPPORTED else RPC_UNSUPPORTED, .release);
+        self.reactions_rpc_mode.store(if (manifest.reactions_supported orelse false) RPC_SUPPORTED else RPC_UNSUPPORTED, .release);
+        self.read_receipts_rpc_mode.store(if (manifest.read_receipts_supported orelse false) RPC_SUPPORTED else RPC_UNSUPPORTED, .release);
 
         const start_params = try external_protocol.buildStartParams(self.allocator, self.config);
         defer self.allocator.free(start_params);
@@ -179,6 +215,10 @@ pub const ExternalChannel = struct {
         self.streaming_supported.store(false, .release);
         self.send_rich_rpc_mode.store(RPC_UNKNOWN, .release);
         self.typing_rpc_mode.store(RPC_UNKNOWN, .release);
+        self.edit_rpc_mode.store(RPC_UNKNOWN, .release);
+        self.delete_rpc_mode.store(RPC_UNKNOWN, .release);
+        self.reactions_rpc_mode.store(RPC_UNKNOWN, .release);
+        self.read_receipts_rpc_mode.store(RPC_UNKNOWN, .release);
         self.last_health_probe_ns = 0;
         self.last_health_result = false;
     }
@@ -197,27 +237,15 @@ pub const ExternalChannel = struct {
     }
 
     fn sendRichLocked(self: *Self, target: []const u8, payload: root.Channel.OutboundPayload) !void {
-        if (!self.running.load(.acquire) or !self.rpc.hasChild()) {
-            return Error.ExternalChannelNotRunning;
-        }
-
-        if (self.send_rich_rpc_mode.load(.acquire) == RPC_UNSUPPORTED) {
-            return self.sendRichFallbackLocked(target, payload);
-        }
-
         const params = try external_protocol.buildSendRichParams(self.allocator, self.config, target, payload);
         defer self.allocator.free(params);
 
-        const response = try self.rpc.request("send_rich", params, self.sendRequestTimeoutMs());
-        defer self.allocator.free(response);
-        external_protocol.validateAcceptedResponse(self.allocator, response) catch |err| switch (err) {
-            error.MethodNotSupported => {
-                self.send_rich_rpc_mode.store(RPC_UNSUPPORTED, .release);
+        self.requestAcceptedOptionalRpcLocked("send_rich", params, &self.send_rich_rpc_mode, self.sendRequestTimeoutMs()) catch |err| switch (err) {
+            error.NotSupported => {
                 return self.sendRichFallbackLocked(target, payload);
             },
             else => return err,
         };
-        self.send_rich_rpc_mode.store(RPC_SUPPORTED, .release);
     }
 
     fn sendRichFallbackLocked(self: *Self, target: []const u8, payload: root.Channel.OutboundPayload) !void {
@@ -280,25 +308,67 @@ pub const ExternalChannel = struct {
         return @min(self.config.transport.timeout_ms, SEND_REQUEST_TIMEOUT_MS);
     }
 
-    fn typingRpcLocked(self: *Self, method: []const u8, recipient: []const u8) !void {
+    fn requestAcceptedOptionalRpcLocked(
+        self: *Self,
+        method: []const u8,
+        params: []const u8,
+        rpc_mode: *std.atomic.Value(i8),
+        timeout_ms: u32,
+    ) !void {
         if (!self.running.load(.acquire) or !self.rpc.hasChild()) {
             return Error.ExternalChannelNotRunning;
         }
-        if (self.typing_rpc_mode.load(.acquire) == RPC_UNSUPPORTED) return;
+        if (rpc_mode.load(.acquire) == RPC_UNSUPPORTED) {
+            return error.NotSupported;
+        }
 
+        const response = try self.rpc.request(method, params, timeout_ms);
+        defer self.allocator.free(response);
+
+        external_protocol.validateAcceptedResponse(self.allocator, response) catch |err| switch (err) {
+            error.MethodNotSupported => {
+                rpc_mode.store(RPC_UNSUPPORTED, .release);
+                return error.NotSupported;
+            },
+            else => return err,
+        };
+        rpc_mode.store(RPC_SUPPORTED, .release);
+    }
+
+    fn typingRpcLocked(self: *Self, method: []const u8, recipient: []const u8) !void {
         const params = try external_protocol.buildTypingParams(self.allocator, self.config, recipient);
         defer self.allocator.free(params);
 
-        const response = try self.rpc.request(method, params, self.controlRequestTimeoutMs());
-        defer self.allocator.free(response);
-        external_protocol.validateAcceptedResponse(self.allocator, response) catch |err| switch (err) {
-            error.MethodNotSupported => {
-                self.typing_rpc_mode.store(RPC_UNSUPPORTED, .release);
+        self.requestAcceptedOptionalRpcLocked(method, params, &self.typing_rpc_mode, self.controlRequestTimeoutMs()) catch |err| switch (err) {
+            error.NotSupported => {
                 return;
             },
             else => return err,
         };
-        self.typing_rpc_mode.store(RPC_SUPPORTED, .release);
+    }
+
+    fn editMessageLocked(self: *Self, edit: root.Channel.MessageEdit) !void {
+        const params = try external_protocol.buildEditMessageParams(self.allocator, self.config, edit);
+        defer self.allocator.free(params);
+        try self.requestAcceptedOptionalRpcLocked("edit_message", params, &self.edit_rpc_mode, self.sendRequestTimeoutMs());
+    }
+
+    fn deleteMessageLocked(self: *Self, message_ref: root.Channel.MessageRef) !void {
+        const params = try external_protocol.buildDeleteMessageParams(self.allocator, self.config, message_ref);
+        defer self.allocator.free(params);
+        try self.requestAcceptedOptionalRpcLocked("delete_message", params, &self.delete_rpc_mode, self.sendRequestTimeoutMs());
+    }
+
+    fn setReactionLocked(self: *Self, update: root.Channel.ReactionUpdate) !void {
+        const params = try external_protocol.buildSetReactionParams(self.allocator, self.config, update);
+        defer self.allocator.free(params);
+        try self.requestAcceptedOptionalRpcLocked("set_reaction", params, &self.reactions_rpc_mode, self.sendRequestTimeoutMs());
+    }
+
+    fn markReadLocked(self: *Self, message_ref: root.Channel.MessageRef) !void {
+        const params = try external_protocol.buildMarkReadParams(self.allocator, self.config, message_ref);
+        defer self.allocator.free(params);
+        try self.requestAcceptedOptionalRpcLocked("mark_read", params, &self.read_receipts_rpc_mode, self.sendRequestTimeoutMs());
     }
 
     fn handleNotification(ctx: *anyopaque, method: []const u8, params: std.json.Value) anyerror!void {
@@ -459,6 +529,26 @@ pub const ExternalChannel = struct {
         return self.stopTyping(recipient);
     }
 
+    fn vtableEditMessage(ptr: *anyopaque, edit: root.Channel.MessageEdit) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.editMessage(edit);
+    }
+
+    fn vtableDeleteMessage(ptr: *anyopaque, message_ref: root.Channel.MessageRef) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.deleteMessage(message_ref);
+    }
+
+    fn vtableSetReaction(ptr: *anyopaque, update: root.Channel.ReactionUpdate) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.setReaction(update);
+    }
+
+    fn vtableMarkRead(ptr: *anyopaque, message_ref: root.Channel.MessageRef) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.markRead(message_ref);
+    }
+
     fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.supportsStreamingOutbound();
@@ -474,6 +564,10 @@ pub const ExternalChannel = struct {
         .sendRich = &vtableSendRich,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
+        .editMessage = &vtableEditMessage,
+        .deleteMessage = &vtableDeleteMessage,
+        .setReaction = &vtableSetReaction,
+        .markRead = &vtableMarkRead,
         .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
     };
 };

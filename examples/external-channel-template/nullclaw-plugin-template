@@ -82,6 +82,10 @@ class ExternalChannelTemplate:
                     "streaming": False,
                     "send_rich": False,
                     "typing": False,
+                    "edit": False,
+                    "delete": False,
+                    "reactions": False,
+                    "read_receipts": False,
                 },
             }
         if method == "start":

@@ -156,7 +156,11 @@ The plugin must respond with:
       "health": true,
       "streaming": false,
       "send_rich": false,
-      "typing": false
+      "typing": false,
+      "edit": false,
+      "delete": false,
+      "reactions": false,
+      "read_receipts": false
     }
   }
 }
@@ -178,6 +182,14 @@ Capability meanings:
   The plugin implements `send_rich`.
 - `typing`
   The plugin implements `start_typing` and `stop_typing`.
+- `edit`
+  The plugin implements `edit_message`.
+- `delete`
+  The plugin implements `delete_message`.
+- `reactions`
+  The plugin implements `set_reaction`.
+- `read_receipts`
+  The plugin implements `mark_read`.
 
 ## Lifecycle RPCs
 
@@ -357,6 +369,142 @@ Attachment `kind` values:
 If `send_rich` is unsupported, leave the capability bit unset. The host may
 fall back to plain `send` only when the payload is simple enough.
 
+### `edit_message`
+
+Only used when `capabilities.edit=true`.
+
+Host request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "edit_message",
+  "params": {
+    "runtime": {
+      "name": "plugin_chat",
+      "account_id": "main"
+    },
+    "message": {
+      "target": "room-1",
+      "message_id": "msg-42",
+      "text": "Updated text",
+      "attachments": [],
+      "choices": []
+    }
+  }
+}
+```
+
+Required success response:
+
+```json
+{"jsonrpc":"2.0","id":7,"result":{"accepted":true}}
+```
+
+Rules:
+
+- `message.message_id` must identify the existing platform message to edit
+- payload fields follow the same schema as `send_rich`
+- if the plugin only supports text edits, it should reject unsupported
+  attachments/choices instead of pretending success
+
+### `delete_message`
+
+Only used when `capabilities.delete=true`.
+
+Host request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "delete_message",
+  "params": {
+    "runtime": {
+      "name": "plugin_chat",
+      "account_id": "main"
+    },
+    "message": {
+      "target": "room-1",
+      "message_id": "msg-42"
+    }
+  }
+}
+```
+
+Required success response:
+
+```json
+{"jsonrpc":"2.0","id":8,"result":{"accepted":true}}
+```
+
+### `set_reaction`
+
+Only used when `capabilities.reactions=true`.
+
+Host request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "set_reaction",
+  "params": {
+    "runtime": {
+      "name": "plugin_chat",
+      "account_id": "main"
+    },
+    "message": {
+      "target": "room-1",
+      "message_id": "msg-42",
+      "emoji": "✅"
+    }
+  }
+}
+```
+
+Required success response:
+
+```json
+{"jsonrpc":"2.0","id":9,"result":{"accepted":true}}
+```
+
+Rules:
+
+- `emoji` must be a string to set/update a reaction
+- `emoji: null` means clear the reaction for that message
+
+### `mark_read`
+
+Only used when `capabilities.read_receipts=true`.
+
+Host request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "method": "mark_read",
+  "params": {
+    "runtime": {
+      "name": "plugin_chat",
+      "account_id": "main"
+    },
+    "message": {
+      "target": "room-1",
+      "message_id": "msg-42"
+    }
+  }
+}
+```
+
+Required success response:
+
+```json
+{"jsonrpc":"2.0","id":10,"result":{"accepted":true}}
+```
+
 ### Typing RPCs
 
 Only used when `capabilities.typing=true`.
@@ -364,17 +512,17 @@ Only used when `capabilities.typing=true`.
 Requests:
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"start_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
+{"jsonrpc":"2.0","id":11,"method":"start_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":8,"method":"stop_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
+{"jsonrpc":"2.0","id":12,"method":"stop_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
 ```
 
 Required success response:
 
 ```json
-{"jsonrpc":"2.0","id":7,"result":{"accepted":true}}
+{"jsonrpc":"2.0","id":11,"result":{"accepted":true}}
 ```
 
 ## Inbound Notifications
@@ -536,14 +684,16 @@ bridge, use:
 
 Companion out-of-tree repositories:
 
-- `nullclaw-channel-whatsmeow-bridge`
-  Production-oriented Go/whatsmeow bridge with QR, pairing-code, and
-  deployment assets.
-- `nullclaw-channel-baileys`
+- [nullclaw/nullclaw-channel-baileys](https://github.com/nullclaw/nullclaw-channel-baileys)
   Direct Node/Baileys external channel plugin with QR and pairing-code flows.
+- [nullclaw/nullclaw-channel-whatsmeow-bridge](https://github.com/nullclaw/nullclaw-channel-whatsmeow-bridge)
+  Standalone Go/whatsmeow HTTP bridge with QR, pairing-code, and deployment assets.
 - `nullclaw-channel-imap-connector`
   Python IMAP/SMTP external channel plugin for bidirectional email plus
   companion mailbox CLI workflows.
+
+Those repositories are the recommended place for production channel-specific
+code. The in-tree examples here are reference adapters and templates.
 
 ## Plugin Author Checklist
 

@@ -10,6 +10,10 @@ pub const Manifest = struct {
     streaming_supported: ?bool = null,
     send_rich_supported: ?bool = null,
     typing_supported: ?bool = null,
+    edit_supported: ?bool = null,
+    delete_supported: ?bool = null,
+    reactions_supported: ?bool = null,
+    read_receipts_supported: ?bool = null,
 };
 
 pub const InboundMessage = struct {
@@ -67,6 +71,22 @@ pub fn parseManifestResponse(allocator: std.mem.Allocator, response_line: []cons
         if (capabilities_value.object.get("typing")) |typing_value| {
             if (typing_value != .bool) return Error.InvalidPluginManifest;
             manifest.typing_supported = typing_value.bool;
+        }
+        if (capabilities_value.object.get("edit")) |edit_value| {
+            if (edit_value != .bool) return Error.InvalidPluginManifest;
+            manifest.edit_supported = edit_value.bool;
+        }
+        if (capabilities_value.object.get("delete")) |delete_value| {
+            if (delete_value != .bool) return Error.InvalidPluginManifest;
+            manifest.delete_supported = delete_value.bool;
+        }
+        if (capabilities_value.object.get("reactions")) |reactions_value| {
+            if (reactions_value != .bool) return Error.InvalidPluginManifest;
+            manifest.reactions_supported = reactions_value.bool;
+        }
+        if (capabilities_value.object.get("read_receipts")) |read_receipts_value| {
+            if (read_receipts_value != .bool) return Error.InvalidPluginManifest;
+            manifest.read_receipts_supported = read_receipts_value.bool;
         }
     }
     return manifest;
@@ -132,33 +152,83 @@ pub fn buildSendRichParams(
     try appendRuntimeObject(&buf, allocator, config);
     try buf.appendSlice(allocator, ",\"message\":{\"target\":");
     try json_util.appendJsonString(&buf, allocator, target);
-    try buf.appendSlice(allocator, ",\"text\":");
-    try json_util.appendJsonString(&buf, allocator, payload.text);
-    try buf.appendSlice(allocator, ",\"attachments\":[");
-    for (payload.attachments, 0..) |attachment, index| {
-        if (index > 0) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, "{\"kind\":");
-        try json_util.appendJsonString(&buf, allocator, attachmentKindToSlice(attachment.kind));
-        try buf.appendSlice(allocator, ",\"target\":");
-        try json_util.appendJsonString(&buf, allocator, attachment.target);
-        if (attachment.caption) |caption| {
-            try buf.appendSlice(allocator, ",\"caption\":");
-            try json_util.appendJsonString(&buf, allocator, caption);
-        }
-        try buf.append(allocator, '}');
+    try buf.append(allocator, ',');
+    try appendPayloadFields(&buf, allocator, payload);
+    try buf.appendSlice(allocator, "}}");
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn buildEditMessageParams(
+    allocator: std.mem.Allocator,
+    config: config_types.ExternalChannelConfig,
+    edit: root.Channel.MessageEdit,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try appendRuntimeObject(&buf, allocator, config);
+    try buf.appendSlice(allocator, ",\"message\":{");
+    try appendMessageRefFields(&buf, allocator, .{
+        .target = edit.target,
+        .message_id = edit.message_id,
+    });
+    try buf.append(allocator, ',');
+    try appendPayloadFields(&buf, allocator, edit.payload);
+    try buf.appendSlice(allocator, "}}");
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn buildDeleteMessageParams(
+    allocator: std.mem.Allocator,
+    config: config_types.ExternalChannelConfig,
+    message_ref: root.Channel.MessageRef,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try appendRuntimeObject(&buf, allocator, config);
+    try buf.appendSlice(allocator, ",\"message\":{");
+    try appendMessageRefFields(&buf, allocator, message_ref);
+    try buf.appendSlice(allocator, "}}");
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn buildSetReactionParams(
+    allocator: std.mem.Allocator,
+    config: config_types.ExternalChannelConfig,
+    update: root.Channel.ReactionUpdate,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try appendRuntimeObject(&buf, allocator, config);
+    try buf.appendSlice(allocator, ",\"message\":{");
+    try appendMessageRefFields(&buf, allocator, .{
+        .target = update.target,
+        .message_id = update.message_id,
+    });
+    try buf.appendSlice(allocator, ",\"emoji\":");
+    if (update.emoji) |emoji| {
+        try json_util.appendJsonString(&buf, allocator, emoji);
+    } else {
+        try buf.appendSlice(allocator, "null");
     }
-    try buf.appendSlice(allocator, "],\"choices\":[");
-    for (payload.choices, 0..) |choice, index| {
-        if (index > 0) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, "{\"id\":");
-        try json_util.appendJsonString(&buf, allocator, choice.id);
-        try buf.appendSlice(allocator, ",\"label\":");
-        try json_util.appendJsonString(&buf, allocator, choice.label);
-        try buf.appendSlice(allocator, ",\"submit_text\":");
-        try json_util.appendJsonString(&buf, allocator, choice.submit_text);
-        try buf.append(allocator, '}');
-    }
-    try buf.appendSlice(allocator, "]}}");
+    try buf.appendSlice(allocator, "}}");
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn buildMarkReadParams(
+    allocator: std.mem.Allocator,
+    config: config_types.ExternalChannelConfig,
+    message_ref: root.Channel.MessageRef,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try appendRuntimeObject(&buf, allocator, config);
+    try buf.appendSlice(allocator, ",\"message\":{");
+    try appendMessageRefFields(&buf, allocator, message_ref);
+    try buf.appendSlice(allocator, "}}");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -292,6 +362,51 @@ fn appendRuntimeObject(
     try buf.append(allocator, '}');
 }
 
+fn appendMessageRefFields(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    message_ref: root.Channel.MessageRef,
+) !void {
+    try buf.appendSlice(allocator, "\"target\":");
+    try json_util.appendJsonString(buf, allocator, message_ref.target);
+    try buf.appendSlice(allocator, ",\"message_id\":");
+    try json_util.appendJsonString(buf, allocator, message_ref.message_id);
+}
+
+fn appendPayloadFields(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    payload: root.Channel.OutboundPayload,
+) !void {
+    try buf.appendSlice(allocator, "\"text\":");
+    try json_util.appendJsonString(buf, allocator, payload.text);
+    try buf.appendSlice(allocator, ",\"attachments\":[");
+    for (payload.attachments, 0..) |attachment, index| {
+        if (index > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"kind\":");
+        try json_util.appendJsonString(buf, allocator, attachmentKindToSlice(attachment.kind));
+        try buf.appendSlice(allocator, ",\"target\":");
+        try json_util.appendJsonString(buf, allocator, attachment.target);
+        if (attachment.caption) |caption| {
+            try buf.appendSlice(allocator, ",\"caption\":");
+            try json_util.appendJsonString(buf, allocator, caption);
+        }
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "],\"choices\":[");
+    for (payload.choices, 0..) |choice, index| {
+        if (index > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"id\":");
+        try json_util.appendJsonString(buf, allocator, choice.id);
+        try buf.appendSlice(allocator, ",\"label\":");
+        try json_util.appendJsonString(buf, allocator, choice.label);
+        try buf.appendSlice(allocator, ",\"submit_text\":");
+        try json_util.appendJsonString(buf, allocator, choice.submit_text);
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+}
+
 fn requiredString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
     return if (value == .string) value.string else null;
@@ -400,6 +515,77 @@ test "buildSendRichParams serializes attachments and choices" {
     try std.testing.expect(std.mem.indexOf(u8, params, "\"choices\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"yes\"}]") != null);
 }
 
+test "buildEditMessageParams serializes message reference and payload" {
+    const allocator = std.testing.allocator;
+    const params = try buildEditMessageParams(allocator, .{
+        .account_id = "main",
+        .runtime_name = "plugin_chat",
+        .transport = .{ .command = "plugin" },
+    }, .{
+        .target = "chat-9",
+        .message_id = "msg-7",
+        .payload = .{ .text = "patched" },
+    });
+    defer allocator.free(params);
+
+    try std.testing.expect(std.mem.indexOf(u8, params, "\"message\":{\"target\":\"chat-9\",\"message_id\":\"msg-7\",\"text\":\"patched\"") != null);
+}
+
+test "buildDeleteMessageParams serializes runtime and message reference" {
+    const allocator = std.testing.allocator;
+    const params = try buildDeleteMessageParams(allocator, .{
+        .account_id = "main",
+        .runtime_name = "plugin_chat",
+        .transport = .{ .command = "plugin" },
+    }, .{
+        .target = "chat-9",
+        .message_id = "msg-8",
+    });
+    defer allocator.free(params);
+
+    try std.testing.expectEqualStrings(
+        "{\"runtime\":{\"name\":\"plugin_chat\",\"account_id\":\"main\"},\"message\":{\"target\":\"chat-9\",\"message_id\":\"msg-8\"}}",
+        params,
+    );
+}
+
+test "buildSetReactionParams serializes emoji clears as null" {
+    const allocator = std.testing.allocator;
+    const params = try buildSetReactionParams(allocator, .{
+        .account_id = "main",
+        .runtime_name = "plugin_chat",
+        .transport = .{ .command = "plugin" },
+    }, .{
+        .target = "chat-9",
+        .message_id = "msg-8",
+        .emoji = null,
+    });
+    defer allocator.free(params);
+
+    try std.testing.expectEqualStrings(
+        "{\"runtime\":{\"name\":\"plugin_chat\",\"account_id\":\"main\"},\"message\":{\"target\":\"chat-9\",\"message_id\":\"msg-8\",\"emoji\":null}}",
+        params,
+    );
+}
+
+test "buildMarkReadParams serializes runtime and message reference" {
+    const allocator = std.testing.allocator;
+    const params = try buildMarkReadParams(allocator, .{
+        .account_id = "main",
+        .runtime_name = "plugin_chat",
+        .transport = .{ .command = "plugin" },
+    }, .{
+        .target = "chat-9",
+        .message_id = "msg-8",
+    });
+    defer allocator.free(params);
+
+    try std.testing.expectEqualStrings(
+        "{\"runtime\":{\"name\":\"plugin_chat\",\"account_id\":\"main\"},\"message\":{\"target\":\"chat-9\",\"message_id\":\"msg-8\"}}",
+        params,
+    );
+}
+
 test "buildTypingParams serializes runtime and recipient" {
     const allocator = std.testing.allocator;
     const params = try buildTypingParams(allocator, .{
@@ -415,12 +601,16 @@ test "buildTypingParams serializes runtime and recipient" {
 test "parseManifestResponse requires matching protocol version" {
     const manifest = try parseManifestResponse(
         std.testing.allocator,
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol_version\":2,\"capabilities\":{\"health\":true,\"streaming\":true,\"send_rich\":true,\"typing\":false}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol_version\":2,\"capabilities\":{\"health\":true,\"streaming\":true,\"send_rich\":true,\"typing\":false,\"edit\":true,\"delete\":false,\"reactions\":true,\"read_receipts\":false}}}",
     );
     try std.testing.expectEqual(@as(?bool, true), manifest.health_supported);
     try std.testing.expectEqual(@as(?bool, true), manifest.streaming_supported);
     try std.testing.expectEqual(@as(?bool, true), manifest.send_rich_supported);
     try std.testing.expectEqual(@as(?bool, false), manifest.typing_supported);
+    try std.testing.expectEqual(@as(?bool, true), manifest.edit_supported);
+    try std.testing.expectEqual(@as(?bool, false), manifest.delete_supported);
+    try std.testing.expectEqual(@as(?bool, true), manifest.reactions_supported);
+    try std.testing.expectEqual(@as(?bool, false), manifest.read_receipts_supported);
 
     try std.testing.expectError(
         Error.UnsupportedPluginProtocolVersion,

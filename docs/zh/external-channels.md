@@ -152,7 +152,11 @@ host 会先发：
       "health": true,
       "streaming": false,
       "send_rich": false,
-      "typing": false
+      "typing": false,
+      "edit": false,
+      "delete": false,
+      "reactions": false,
+      "read_receipts": false
     }
   }
 }
@@ -174,6 +178,14 @@ Capability 含义：
   插件实现了 `send_rich`。
 - `typing`
   插件实现了 `start_typing` 和 `stop_typing`。
+- `edit`
+  插件实现了 `edit_message`。
+- `delete`
+  插件实现了 `delete_message`。
+- `reactions`
+  插件实现了 `set_reaction`。
+- `read_receipts`
+  插件实现了 `mark_read`。
 
 ## 生命周期 RPC
 
@@ -350,6 +362,141 @@ Host 请求：
 
 如果不支持 `send_rich`，就不要声明 capability。只有在 payload 足够简单时，host 才可能退化为普通 `send`。
 
+### `edit_message`
+
+只有在 `capabilities.edit=true` 时才会调用。
+
+Host 请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "edit_message",
+  "params": {
+    "runtime": {
+      "name": "plugin_chat",
+      "account_id": "main"
+    },
+    "message": {
+      "target": "room-1",
+      "message_id": "msg-42",
+      "text": "Updated text",
+      "attachments": [],
+      "choices": []
+    }
+  }
+}
+```
+
+必须返回：
+
+```json
+{"jsonrpc":"2.0","id":7,"result":{"accepted":true}}
+```
+
+规则：
+
+- `message.message_id` 必须能唯一标识要编辑的已有平台消息
+- payload 字段和 `send_rich` 使用同一套 schema
+- 如果插件只支持纯文本编辑，就应该拒绝不支持的 attachments/choices，而不是伪造成功
+
+### `delete_message`
+
+只有在 `capabilities.delete=true` 时才会调用。
+
+Host 请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "delete_message",
+  "params": {
+    "runtime": {
+      "name": "plugin_chat",
+      "account_id": "main"
+    },
+    "message": {
+      "target": "room-1",
+      "message_id": "msg-42"
+    }
+  }
+}
+```
+
+必须返回：
+
+```json
+{"jsonrpc":"2.0","id":8,"result":{"accepted":true}}
+```
+
+### `set_reaction`
+
+只有在 `capabilities.reactions=true` 时才会调用。
+
+Host 请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "set_reaction",
+  "params": {
+    "runtime": {
+      "name": "plugin_chat",
+      "account_id": "main"
+    },
+    "message": {
+      "target": "room-1",
+      "message_id": "msg-42",
+      "emoji": "✅"
+    }
+  }
+}
+```
+
+必须返回：
+
+```json
+{"jsonrpc":"2.0","id":9,"result":{"accepted":true}}
+```
+
+规则：
+
+- `emoji` 为字符串时表示设置或更新 reaction
+- `emoji: null` 表示清除这个消息上的 reaction
+
+### `mark_read`
+
+只有在 `capabilities.read_receipts=true` 时才会调用。
+
+Host 请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "method": "mark_read",
+  "params": {
+    "runtime": {
+      "name": "plugin_chat",
+      "account_id": "main"
+    },
+    "message": {
+      "target": "room-1",
+      "message_id": "msg-42"
+    }
+  }
+}
+```
+
+必须返回：
+
+```json
+{"jsonrpc":"2.0","id":10,"result":{"accepted":true}}
+```
+
 ### Typing RPC
 
 只有在 `capabilities.typing=true` 时才会调用。
@@ -357,17 +504,17 @@ Host 请求：
 请求：
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"start_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
+{"jsonrpc":"2.0","id":11,"method":"start_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":8,"method":"stop_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
+{"jsonrpc":"2.0","id":12,"method":"stop_typing","params":{"runtime":{"name":"plugin_chat","account_id":"main"},"recipient":"room-1"}}
 ```
 
 必须返回：
 
 ```json
-{"jsonrpc":"2.0","id":7,"result":{"accepted":true}}
+{"jsonrpc":"2.0","id":11,"result":{"accepted":true}}
 ```
 
 ## 入站通知
@@ -523,16 +670,17 @@ WhatsApp 登录的职责边界、QR/pairing 归属以及首次联调步骤，请
 
 - [`examples/external-channel-template/README.md`](../../examples/external-channel-template/README.md)
 
-配套的仓库还包括：
+配套的仓库外实现：
 
-- `nullclaw-channel-whatsmeow-bridge`
-  面向生产环境的 Go/whatsmeow bridge，包含 QR、pairing-code 和部署资产。
-- `nullclaw-channel-baileys`
-  直接基于 Node/Baileys 的 external channel 插件，包含 QR 和 pairing-code
-  流程。
+- [nullclaw/nullclaw-channel-baileys](https://github.com/nullclaw/nullclaw-channel-baileys)
+  基于 Node/Baileys 的直连 external channel 插件，包含 QR 和 pairing-code 流程。
+- [nullclaw/nullclaw-channel-whatsmeow-bridge](https://github.com/nullclaw/nullclaw-channel-whatsmeow-bridge)
+  独立的 Go/whatsmeow HTTP bridge，包含 QR、pairing-code 和 deployment assets。
 - `nullclaw-channel-imap-connector`
-  基于 Python 的 IMAP/SMTP external channel 插件，用于双向邮件和配套的
-  邮箱 CLI 工作流。
+  基于 Python 的 IMAP/SMTP external channel 插件，用于双向邮件和配套的邮箱 CLI 工作流。
+
+推荐把真正的生产级渠道实现放在这些仓库外 repo 中。本仓库里的示例主要是
+reference adapter 和 authoring template。
 
 ## 插件作者检查单
 

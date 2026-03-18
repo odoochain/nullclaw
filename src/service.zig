@@ -716,6 +716,10 @@ fn firstExistingAbsolutePath(paths: []const []const u8) ?[]const u8 {
     return null;
 }
 
+fn hasAnyExistingAbsolutePath(paths: []const []const u8) bool {
+    return firstExistingAbsolutePath(paths) != null;
+}
+
 fn getOpenRcServiceCommandPath() ?[]const u8 {
     return firstExistingAbsolutePath(&openrc_command_candidates);
 }
@@ -729,7 +733,7 @@ fn getOpenRcRunPath() ?[]const u8 {
 }
 
 fn linuxHasOpenRcRuntime() bool {
-    return hasOpenRcMarkerInPaths(&openrc_markers);
+    return hasAnyExistingAbsolutePath(&openrc_markers);
 }
 
 fn linuxHasOpenRcSupport() bool {
@@ -1188,6 +1192,21 @@ test "hasOpenRcMarkerInPaths detects common OpenRC markers" {
 test "hasOpenRcCommandInPaths detects required OpenRC commands" {
     try std.testing.expect(hasOpenRcCommandInPaths(&.{ "/sbin/rc-service", "/sbin/openrc-run" }));
     try std.testing.expect(!hasOpenRcCommandInPaths(&.{"/sbin/rc-service"}));
+}
+
+test "hasAnyExistingAbsolutePath checks actual filesystem state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("openrc");
+    const existing = try tmp.dir.realpathAlloc(std.testing.allocator, "openrc");
+    defer std.testing.allocator.free(existing);
+
+    const missing = try std.fs.path.join(std.testing.allocator, &.{ existing, "softlevel" });
+    defer std.testing.allocator.free(missing);
+
+    try std.testing.expect(hasAnyExistingAbsolutePath(&.{ missing, existing }));
+    try std.testing.expect(!hasAnyExistingAbsolutePath(&.{missing}));
 }
 
 test "parsePasswdHome extracts matching user home" {

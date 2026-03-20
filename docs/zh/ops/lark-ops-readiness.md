@@ -13,6 +13,16 @@
 2. 业务码非零应视为运行失败。
 3. 权限/scope 类错误应立即升级处理。
 
+## `error.LarkApiError` 快速排查
+
+1. 先运行 `nullclaw doctor`，确认渠道配置在结构上是有效的。
+2. 启动后运行 `nullclaw channel status`，确认是否处于 running 但未 connected 的状态。
+3. 如果持续出现 `warning(lark): lark websocket cycle failed: error.LarkApiError`，优先按下面三类排查：
+   - Lark/飞书应用权限或 scope 缺失
+   - 区域端点选择错误（`use_feishu`）
+   - websocket 回调配置下发失败
+4. 如果旧版 Linux 二进制在进入稳定重连日志前就直接崩溃，先升级版本，再继续做权限排查。
+
 ## 事件处置步骤
 
 1. 在飞书/Lark 控制台检查应用权限与 scope。

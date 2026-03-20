@@ -13,6 +13,16 @@ This guide defines channel-specific operations checks for Lark/Feishu.
 2. Treat non-zero business code as operational failure.
 3. Escalate permission/scope-like errors immediately.
 
+## Fast Triage for `error.LarkApiError`
+
+1. Run `nullclaw doctor` to confirm the channel config is structurally valid.
+2. Run `nullclaw channel status` after startup to confirm whether the channel is running but disconnected.
+3. Treat repeated `warning(lark): lark websocket cycle failed: error.LarkApiError` as one of:
+   - missing Lark/Feishu app permissions or scopes
+   - wrong regional endpoint selection (`use_feishu`)
+   - websocket callback provisioning failure
+4. If an older Linux build crashes before stable reconnect logging, upgrade first and then continue permission triage.
+
 ## Incident Steps
 
 1. Check app permissions/scopes in Feishu/Lark console.

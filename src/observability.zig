@@ -597,6 +597,7 @@ pub const OtelObserver = struct {
                     .{ .key = "duration_ms", .value = dur_str },
                 });
                 self.clearCurrentTrace();
+                self.flushLocked();
             },
             .llm_request => |e| {
                 _ = self.requests_total.fetchAdd(1, .monotonic);
@@ -651,6 +652,7 @@ pub const OtelObserver = struct {
             .turn_complete => {
                 self.addSpan("turn.complete", now, now, &.{});
                 self.clearCurrentTrace();
+                self.flushLocked();
             },
             .channel_message => |e| {
                 self.addSpan("channel.message", now, now, &.{
@@ -1500,11 +1502,12 @@ test "OtelObserver resets trace after turn_complete" {
     const second = ObserverEvent{ .llm_request = .{ .provider = "b", .model = "m", .messages_count = 1 } };
 
     obs.recordEvent(&first);
+    const first_trace_id = otel.spans.items[0].trace_id;
     obs.recordEvent(&complete);
     obs.recordEvent(&second);
 
-    try std.testing.expectEqual(@as(usize, 3), otel.spans.items.len);
-    try std.testing.expect(!std.mem.eql(u8, &otel.spans.items[0].trace_id, &otel.spans.items[2].trace_id));
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    try std.testing.expect(!std.mem.eql(u8, &first_trace_id, &otel.spans.items[0].trace_id));
 }
 
 test "OtelObserver isolates trace context per thread" {
@@ -1519,9 +1522,9 @@ test "OtelObserver isolates trace context per thread" {
                 .model = "m",
                 .messages_count = 1,
             } };
-            const complete = ObserverEvent{ .turn_complete = {} };
+            const tick = ObserverEvent{ .heartbeat_tick = {} };
             obs.recordEvent(&request);
-            obs.recordEvent(&complete);
+            obs.recordEvent(&tick);
         }
     };
 
@@ -1539,14 +1542,14 @@ test "OtelObserver span building on all event types" {
     defer otel.deinit();
     const obs = otel.observer();
 
-    // Record 9 events (under batch threshold of 10) to verify all types produce spans
+    // Keep this set below the batch threshold and avoid flush boundaries so
+    // each recorded event remains inspectable in the in-memory span buffer.
     const events = [_]ObserverEvent{
         .{ .agent_start = .{ .provider = "test", .model = "test" } },
         .{ .llm_request = .{ .provider = "test", .model = "test", .messages_count = 1 } },
         .{ .llm_response = .{ .provider = "test", .model = "test", .duration_ms = 100, .success = true, .error_message = null } },
         .{ .tool_call_start = .{ .tool = "shell" } },
         .{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } },
-        .{ .turn_complete = {} },
         .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
         .{ .heartbeat_tick = {} },
         .{ .err = .{ .component = "test", .message = "oops" } },
@@ -1555,22 +1558,15 @@ test "OtelObserver span building on all event types" {
         obs.recordEvent(event);
     }
 
-    try std.testing.expectEqual(@as(usize, 9), otel.spans.items.len);
+    try std.testing.expectEqual(@as(usize, 8), otel.spans.items.len);
     try std.testing.expectEqualStrings("agent.start", otel.spans.items[0].name);
     try std.testing.expectEqualStrings("llm.request", otel.spans.items[1].name);
     try std.testing.expectEqualStrings("llm.response", otel.spans.items[2].name);
     try std.testing.expectEqualStrings("tool.start", otel.spans.items[3].name);
     try std.testing.expectEqualStrings("tool.call", otel.spans.items[4].name);
-    try std.testing.expectEqualStrings("turn.complete", otel.spans.items[5].name);
-    try std.testing.expectEqualStrings("channel.message", otel.spans.items[6].name);
-    try std.testing.expectEqualStrings("heartbeat.tick", otel.spans.items[7].name);
-    try std.testing.expectEqualStrings("error", otel.spans.items[8].name);
-
-    // Verify agent_end works too (10th event triggers batch flush)
-    const end_event = ObserverEvent{ .agent_end = .{ .duration_ms = 1000, .tokens_used = 500 } };
-    obs.recordEvent(&end_event);
-    // After flush, spans are cleared
-    try std.testing.expect(otel.spans.items.len < 10);
+    try std.testing.expectEqualStrings("channel.message", otel.spans.items[5].name);
+    try std.testing.expectEqualStrings("heartbeat.tick", otel.spans.items[6].name);
+    try std.testing.expectEqualStrings("error", otel.spans.items[7].name);
 }
 
 test "OtelObserver span attributes" {
@@ -1716,19 +1712,47 @@ test "OtelObserver JSON serialization" {
 test "OtelObserver JSON multiple spans" {
     var otel = OtelObserver.init(std.testing.allocator, null, null);
     defer otel.deinit();
-    const obs = otel.observer();
-
     const e1 = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
-    obs.recordEvent(&e1);
-    const e2 = ObserverEvent{ .turn_complete = {} };
-    obs.recordEvent(&e2);
+    otel.observer().recordEvent(&e1);
+    const e2 = ObserverEvent{ .heartbeat_tick = {} };
+    otel.observer().recordEvent(&e2);
 
     const json = try otel.serializeSpans();
     defer std.testing.allocator.free(json);
 
     // Two spans separated by comma
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent.start\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"turn.complete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"heartbeat.tick\"") != null);
+}
+
+test "OtelObserver flushes buffered spans on turn complete" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
+    obs.recordEvent(&start);
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+
+    const complete = ObserverEvent{ .turn_complete = {} };
+    obs.recordEvent(&complete);
+
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+}
+
+test "OtelObserver flushes buffered spans on agent end" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
+    obs.recordEvent(&start);
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+
+    const end = ObserverEvent{ .agent_end = .{ .duration_ms = 12, .tokens_used = 3 } };
+    obs.recordEvent(&end);
+
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
 }
 
 test "OtelObserver batch flush at 10 spans" {

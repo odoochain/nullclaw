@@ -29,6 +29,12 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/health` | GET | None | Health check |
 | `/pair` | POST | `X-Pairing-Code` | Exchange one-time pairing code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message payload: `{"message":"..."}` |
+| `/cron` | GET | `Authorization: Bearer <token>` when pairing tokens exist | List live scheduler jobs from the running daemon |
+| `/cron/add` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Add or schedule a live cron job |
+| `/cron/remove` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Remove a live cron job by `id` |
+| `/cron/pause` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Pause a live cron job by `id` |
+| `/cron/resume` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Resume a live cron job by `id` |
+| `/cron/update` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Partially update a live cron job |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | Meta signature | WhatsApp inbound webhook |
 | `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
@@ -63,7 +69,27 @@ curl -X POST \
   http://127.0.0.1:3000/webhook
 ```
 
-### 4) Max webhook delivery
+### 4) List live cron jobs
+
+```bash
+curl -X GET \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  http://127.0.0.1:3000/cron
+```
+
+### 5) Add a live cron job
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"expression":"*/15 * * * *","command":"echo hello"}' \
+  http://127.0.0.1:3000/cron/add
+```
+
+`/cron/add` also accepts one-shot payloads such as `{"delay":"10m","command":"echo later"}` and agent payloads such as `{"expression":"0 * * * *","prompt":"Summarize alerts","model":"openrouter/anthropic/claude-sonnet-4"}`.
+
+### 6) Max webhook delivery
 
 Single-account example:
 

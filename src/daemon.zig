@@ -401,10 +401,12 @@ fn mergeSchedulerTickChangesAndSave(
 /// Scheduler thread — executes due cron jobs and periodically reloads cron.json
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+    const gateway_mod = @import("gateway.zig");
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
     defer scheduler.deinit();
+    defer gateway_mod.clearSharedScheduler();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
         clearSchedulerSnapshot(allocator, &before_tick);
@@ -416,35 +418,50 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     // Initial load from disk (ignore errors — start empty if file missing/corrupt)
     cron.loadJobs(&scheduler) catch {};
 
+    // Register live scheduler pointer with the gateway for /cron HTTP endpoints.
+    gateway_mod.setSharedScheduler(&scheduler);
+
     state.markRunning("scheduler");
     health.markComponentOk("scheduler");
 
     while (!isShutdownRequested()) {
-        // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
-        cron.reloadJobs(&scheduler) catch |err| {
-            log.warn("scheduler reload failed: {}", .{err});
-            state.markError("scheduler", @errorName(err));
-            health.markComponentError("scheduler", @errorName(err));
-        };
+        var snapshot_ok = true;
+        gateway_mod.lockSharedScheduler();
+        {
+            defer gateway_mod.unlockSharedScheduler();
 
-        buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
-            log.warn("scheduler snapshot failed: {}", .{err});
-            state.markError("scheduler", @errorName(err));
-            health.markComponentError("scheduler", @errorName(err));
+            // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
+            cron.reloadJobs(&scheduler) catch |err| {
+                log.warn("scheduler reload failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+            };
+
+            buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
+                log.warn("scheduler snapshot failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+                snapshot_ok = false;
+            };
+
+            if (snapshot_ok) {
+                const changed = scheduler.tick(std.time.timestamp(), event_bus);
+                if (changed) {
+                    mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
+                        log.warn("scheduler merge-save failed: {}", .{err});
+                        state.markError("scheduler", @errorName(err));
+                        health.markComponentError("scheduler", @errorName(err));
+                    };
+                }
+            }
+        }
+
+        if (!snapshot_ok) {
             var snapshot_sleep: u64 = 0;
             while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
                 std.Thread.sleep(std.time.ns_per_s);
             }
             continue;
-        };
-
-        const changed = scheduler.tick(std.time.timestamp(), event_bus);
-        if (changed) {
-            mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
-                log.warn("scheduler merge-save failed: {}", .{err});
-                state.markError("scheduler", @errorName(err));
-                health.markComponentError("scheduler", @errorName(err));
-            };
         }
 
         state.markRunning("scheduler");

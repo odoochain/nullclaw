@@ -5,6 +5,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
+const cron_gateway = @import("cron_gateway.zig");
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
@@ -62,6 +63,16 @@ pub const ScheduleTool = struct {
         }
 
         if (std.mem.eql(u8, action, "list")) {
+            switch (cron.requestGatewayGet(allocator, "/cron")) {
+                .unavailable => {},
+                .response => |resp| {
+                    if (resp.status_code >= 200 and resp.status_code < 300) {
+                        return ToolResult{ .success = true, .output = resp.body };
+                    }
+                    return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                },
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.ok("No scheduled jobs.");
             };
@@ -100,6 +111,26 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for get action");
 
+            switch (cron.requestGatewayGet(allocator, "/cron")) {
+                .unavailable => {},
+                .response => |resp| {
+                    if (resp.status_code < 200 or resp.status_code >= 300) {
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    }
+                    defer allocator.free(resp.body);
+
+                    const job_json = cron_gateway.findJobByIdJson(allocator, resp.body, id) catch {
+                        return ToolResult.fail("Invalid gateway response");
+                    };
+                    if (job_json) |json| {
+                        return ToolResult{ .success = true, .output = json };
+                    }
+
+                    const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                },
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{id});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -133,6 +164,30 @@ pub const ScheduleTool = struct {
                 return ToolResult.fail("Missing 'command' parameter");
             const expression = root.getString(args, "expression") orelse
                 return ToolResult.fail("Missing 'expression' parameter for cron job");
+
+            const gateway_delivery = if (chat_id) |cid|
+                cron.DeliveryConfig{
+                    .mode = .always,
+                    .channel = delivery_channel,
+                    .account_id = delivery_account_id,
+                    .to = cid,
+                    .best_effort = true,
+                }
+            else
+                null;
+            const gateway_body = cron_gateway.buildAddBody(allocator, expression, null, command, null, null, gateway_delivery) catch null;
+            if (gateway_body) |json_body| {
+                defer allocator.free(json_body);
+                switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
+                    .unavailable => {},
+                    .response => |resp| {
+                        if (resp.status_code >= 200 and resp.status_code < 300) {
+                            return ToolResult{ .success = true, .output = resp.body };
+                        }
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    },
+                }
+            }
 
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
@@ -173,6 +228,30 @@ pub const ScheduleTool = struct {
             const delay = root.getString(args, "delay") orelse
                 return ToolResult.fail("Missing 'delay' parameter for one-shot task");
 
+            const gateway_delivery = if (chat_id) |cid|
+                cron.DeliveryConfig{
+                    .mode = .always,
+                    .channel = delivery_channel,
+                    .account_id = delivery_account_id,
+                    .to = cid,
+                    .best_effort = true,
+                }
+            else
+                null;
+            const gateway_body = cron_gateway.buildAddBody(allocator, null, delay, command, null, null, gateway_delivery) catch null;
+            if (gateway_body) |json_body| {
+                defer allocator.free(json_body);
+                switch (cron.requestGatewayPost(allocator, "/cron/add", json_body)) {
+                    .unavailable => {},
+                    .response => |resp| {
+                        if (resp.status_code >= 200 and resp.status_code < 300) {
+                            return ToolResult{ .success = true, .output = resp.body };
+                        }
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    },
+                }
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
@@ -210,6 +289,20 @@ pub const ScheduleTool = struct {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter for cancel action");
 
+            const gateway_body = cron_gateway.buildIdBody(allocator, id) catch null;
+            if (gateway_body) |json_body| {
+                defer allocator.free(json_body);
+                switch (cron.requestGatewayPost(allocator, "/cron/remove", json_body)) {
+                    .unavailable => {},
+                    .response => |resp| {
+                        if (resp.status_code >= 200 and resp.status_code < 300) {
+                            return ToolResult{ .success = true, .output = resp.body };
+                        }
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    },
+                }
+            }
+
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
             };
@@ -227,6 +320,21 @@ pub const ScheduleTool = struct {
         if (std.mem.eql(u8, action, "pause") or std.mem.eql(u8, action, "resume")) {
             const id = root.getString(args, "id") orelse
                 return ToolResult.fail("Missing 'id' parameter");
+
+            const gateway_body = cron_gateway.buildIdBody(allocator, id) catch null;
+            if (gateway_body) |json_body| {
+                defer allocator.free(json_body);
+                const path = if (std.mem.eql(u8, action, "pause")) "/cron/pause" else "/cron/resume";
+                switch (cron.requestGatewayPost(allocator, path, json_body)) {
+                    .unavailable => {},
+                    .response => |resp| {
+                        if (resp.status_code >= 200 and resp.status_code < 300) {
+                            return ToolResult{ .success = true, .output = resp.body };
+                        }
+                        return ToolResult{ .success = false, .output = "", .error_msg = resp.body };
+                    },
+                }
+            }
 
             var scheduler = loadScheduler(allocator) catch {
                 return ToolResult.fail("Failed to load scheduler state");
@@ -482,4 +590,20 @@ test "schedule resume requires id" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
+}
+
+test "schedule gateway get extracts matching job json" {
+    const body =
+        \\[
+        \\  {"id":"job-a","command":"echo a"},
+        \\  {"id":"job-b","command":"echo b"}
+        \\]
+    ;
+    const job_json = (try cron_gateway.findJobByIdJson(std.testing.allocator, body, "job-b")).?;
+    defer std.testing.allocator.free(job_json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, job_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("job-b", parsed.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("echo b", parsed.value.object.get("command").?.string);
 }

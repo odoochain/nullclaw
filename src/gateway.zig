@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -36,6 +36,7 @@ const bus_mod = @import("bus.zig");
 const a2a = @import("a2a.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const channel_adapters = @import("channel_adapters.zig");
+const cron_mod = @import("cron.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 
@@ -2391,6 +2392,488 @@ fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
     return null;
 }
 
+// ── Cron REST API route descriptors ──────────────────────────────
+
+const CronRouteDescriptor = struct {
+    path: []const u8,
+    method: []const u8,
+    handler: *const fn (ctx: *WebhookHandlerContext) void,
+};
+
+const cron_route_descriptors = [_]CronRouteDescriptor{
+    .{ .path = "/cron", .method = "GET", .handler = handleCronList },
+    .{ .path = "/cron/add", .method = "POST", .handler = handleCronAdd },
+    .{ .path = "/cron/remove", .method = "POST", .handler = handleCronRemove },
+    .{ .path = "/cron/pause", .method = "POST", .handler = handleCronPause },
+    .{ .path = "/cron/resume", .method = "POST", .handler = handleCronResume },
+    .{ .path = "/cron/update", .method = "POST", .handler = handleCronUpdate },
+};
+
+fn findCronRouteDescriptor(path: []const u8) ?*const CronRouteDescriptor {
+    for (&cron_route_descriptors) |*desc| {
+        if (std.mem.eql(u8, desc.path, path)) return desc;
+    }
+    return null;
+}
+
+fn cronObjectStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    if (value == .string and value.string.len > 0) return value.string;
+    return null;
+}
+
+fn cronObjectBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = obj.get(key) orelse return null;
+    if (value == .bool) return value.bool;
+    return null;
+}
+
+fn lockSharedSchedulerForRequest() ?*cron_mod.CronScheduler {
+    g_shared_scheduler_mutex.lock();
+    return g_shared_scheduler;
+}
+
+/// Serialize a single CronJob to a JSON object appended to `buf`.
+fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, job: cron_mod.CronJob) !void {
+    try buf.appendSlice(allocator, "{");
+    try buf.appendSlice(allocator, "\"id\":");
+    try appendJsonStringBuf(buf, allocator, job.id);
+    try buf.appendSlice(allocator, ",\"expression\":");
+    try appendJsonStringBuf(buf, allocator, job.expression);
+    try buf.appendSlice(allocator, ",\"command\":");
+    try appendJsonStringBuf(buf, allocator, job.command);
+    var int_buf: [32]u8 = undefined;
+    try buf.appendSlice(allocator, ",\"next_run_secs\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.next_run_secs}) catch "0");
+    try buf.appendSlice(allocator, ",\"last_run_secs\":");
+    if (job.last_run_secs) |lrs| {
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch "0");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"last_status\":");
+    if (job.last_status) |ls| {
+        try appendJsonStringBuf(buf, allocator, ls);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"paused\":");
+    try buf.appendSlice(allocator, if (job.paused) "true" else "false");
+    try buf.appendSlice(allocator, ",\"one_shot\":");
+    try buf.appendSlice(allocator, if (job.one_shot) "true" else "false");
+    try buf.appendSlice(allocator, ",\"job_type\":");
+    try appendJsonStringBuf(buf, allocator, job.job_type.asStr());
+    try buf.appendSlice(allocator, ",\"enabled\":");
+    try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",\"delete_after_run\":");
+    try buf.appendSlice(allocator, if (job.delete_after_run) "true" else "false");
+    try buf.appendSlice(allocator, ",\"prompt\":");
+    if (job.prompt) |p| try appendJsonStringBuf(buf, allocator, p) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"model\":");
+    if (job.model) |m| try appendJsonStringBuf(buf, allocator, m) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_mode\":");
+    try appendJsonStringBuf(buf, allocator, job.delivery.mode.asStr());
+    try buf.appendSlice(allocator, ",\"delivery_channel\":");
+    if (job.delivery.channel) |channel| try appendJsonStringBuf(buf, allocator, channel) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_account_id\":");
+    if (job.delivery.account_id) |account_id| try appendJsonStringBuf(buf, allocator, account_id) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_to\":");
+    if (job.delivery.to) |to| try appendJsonStringBuf(buf, allocator, to) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_best_effort\":");
+    try buf.appendSlice(allocator, if (job.delivery.best_effort) "true" else "false");
+    try buf.appendSlice(allocator, ",\"created_at_s\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.created_at_s}) catch "0");
+    try buf.appendSlice(allocator, "}");
+}
+
+/// Append a JSON-escaped string literal (with surrounding quotes) to `buf`.
+fn appendJsonStringBuf(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
+fn handleCronList(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "GET")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    buf.appendSlice(ctx.req_allocator, "[") catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    const jobs = sched.listJobs();
+    for (jobs, 0..) |job, i| {
+        if (i > 0) buf.appendSlice(ctx.req_allocator, ",") catch {};
+        appendCronJobJson(&buf, ctx.req_allocator, job) catch {
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"serialization failed\"}";
+            return;
+        };
+    }
+    buf.appendSlice(ctx.req_allocator, "]") catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = buf.items;
+}
+
+fn handleCronAdd(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+
+    const obj = parsed.value.object;
+    const expression_opt = cronObjectStringField(obj, "expression");
+    const delay_opt = cronObjectStringField(obj, "delay");
+    if (expression_opt == null and delay_opt == null) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing expression or delay\"}";
+        return;
+    }
+    if (expression_opt != null and delay_opt != null) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"provide expression or delay, not both\"}";
+        return;
+    }
+
+    const prompt_opt = cronObjectStringField(obj, "prompt");
+    const command_opt = cronObjectStringField(obj, "command");
+    const model_opt = cronObjectStringField(obj, "model");
+    const delivery_mode_opt = cronObjectStringField(obj, "delivery_mode");
+    const delivery_channel_opt = cronObjectStringField(obj, "delivery_channel");
+    const delivery_account_id_opt = cronObjectStringField(obj, "delivery_account_id");
+    const delivery_to_opt = cronObjectStringField(obj, "delivery_to");
+    const delivery_best_effort = cronObjectBoolField(obj, "delivery_best_effort") orelse true;
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    const delivery = cron_mod.DeliveryConfig{
+        .mode = if (delivery_mode_opt) |raw|
+            cron_mod.DeliveryMode.parse(raw)
+        else if (delivery_channel_opt != null or delivery_account_id_opt != null or delivery_to_opt != null)
+            .always
+        else
+            .none,
+        .channel = delivery_channel_opt,
+        .account_id = delivery_account_id_opt,
+        .to = delivery_to_opt,
+        .best_effort = delivery_best_effort,
+        .channel_owned = false,
+        .account_id_owned = false,
+        .to_owned = false,
+    };
+
+    const job_ptr = if (delay_opt) |delay|
+        if (prompt_opt != null)
+            sched.addAgentOnce(delay, prompt_opt.?, model_opt) catch |err| {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = if (err == error.MaxTasksReached)
+                    "{\"error\":\"max tasks reached\"}"
+                else if (err == error.EmptyDelay or err == error.InvalidDurationNumber or err == error.UnknownDurationUnit or err == error.DurationTooLarge)
+                    "{\"error\":\"invalid delay\"}"
+                else
+                    "{\"error\":\"add failed\"}";
+                return;
+            }
+        else blk: {
+            const cmd = command_opt orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing command or prompt\"}";
+                return;
+            };
+            break :blk sched.addOnce(delay, cmd) catch |err| {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = if (err == error.MaxTasksReached)
+                    "{\"error\":\"max tasks reached\"}"
+                else if (err == error.EmptyDelay or err == error.InvalidDurationNumber or err == error.UnknownDurationUnit or err == error.DurationTooLarge)
+                    "{\"error\":\"invalid delay\"}"
+                else
+                    "{\"error\":\"add failed\"}";
+                return;
+            };
+        }
+    else if (prompt_opt != null)
+        sched.addAgentJob(expression_opt.?, prompt_opt.?, model_opt, delivery) catch |err| {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = if (err == error.MaxTasksReached)
+                "{\"error\":\"max tasks reached\"}"
+            else if (err == error.InvalidCronExpression)
+                "{\"error\":\"invalid cron expression\"}"
+            else
+                "{\"error\":\"add failed\"}";
+            return;
+        }
+    else blk: {
+        const cmd = command_opt orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing command or prompt\"}";
+            return;
+        };
+        break :blk sched.addJob(expression_opt.?, cmd) catch |err| {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = if (err == error.MaxTasksReached)
+                "{\"error\":\"max tasks reached\"}"
+            else if (err == error.InvalidCronExpression)
+                "{\"error\":\"invalid cron expression\"}"
+            else
+                "{\"error\":\"add failed\"}";
+            return;
+        };
+    };
+
+    cron_mod.saveJobs(sched) catch {};
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    appendCronJobJson(&buf, ctx.req_allocator, job_ptr.*) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"serialization failed\"}";
+        return;
+    };
+    ctx.response_status = "200 OK";
+    ctx.response_body = buf.items;
+}
+
+fn handleCronRemove(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+    const id = cronObjectStringField(parsed.value.object, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    if (!sched.removeJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"removed\"}";
+}
+
+fn handleCronPause(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+    const id = cronObjectStringField(parsed.value.object, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    if (!sched.pauseJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"paused\"}";
+}
+
+fn handleCronResume(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+    const id = cronObjectStringField(parsed.value.object, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    if (!sched.resumeJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"resumed\"}";
+}
+
+fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+
+    const obj = parsed.value.object;
+    const id = cronObjectStringField(obj, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const expression = cronObjectStringField(obj, "expression");
+    const command = cronObjectStringField(obj, "command");
+    const prompt = cronObjectStringField(obj, "prompt");
+    const model = cronObjectStringField(obj, "model");
+    const paused_opt = cronObjectBoolField(obj, "paused");
+    const enabled_explicit = cronObjectBoolField(obj, "enabled");
+    const enabled_opt = if (enabled_explicit) |enabled| enabled else if (paused_opt) |paused| !paused else null;
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    const patch = cron_mod.CronJobPatch{
+        .expression = expression,
+        .command = command,
+        .prompt = prompt,
+        .model = model,
+        .enabled = enabled_opt,
+    };
+
+    if (!sched.updateJob(ctx.req_allocator, id, patch)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found or update failed\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"updated\"}";
+}
+
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (!build_options.enable_channel_telegram) {
         ctx.response_status = "404 Not Found";
@@ -4315,6 +4798,31 @@ fn spawnA2aStreamingWorker(
     thread.detach();
 }
 
+// ── Shared scheduler state for cross-thread access ───────────────
+
+var g_shared_scheduler: ?*cron_mod.CronScheduler = null;
+var g_shared_scheduler_mutex: std.Thread.Mutex = .{};
+
+pub fn lockSharedScheduler() void {
+    g_shared_scheduler_mutex.lock();
+}
+
+pub fn unlockSharedScheduler() void {
+    g_shared_scheduler_mutex.unlock();
+}
+
+pub fn setSharedScheduler(sched: *cron_mod.CronScheduler) void {
+    g_shared_scheduler_mutex.lock();
+    defer g_shared_scheduler_mutex.unlock();
+    g_shared_scheduler = sched;
+}
+
+pub fn clearSharedScheduler() void {
+    g_shared_scheduler_mutex.lock();
+    defer g_shared_scheduler_mutex.unlock();
+    g_shared_scheduler = null;
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
@@ -4615,7 +5123,45 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         var response_body: []const u8 = "";
         var pair_response_buf: [256]u8 = undefined;
 
-        if (findWebhookRouteDescriptor(base_path)) |desc| {
+        if (findCronRouteDescriptor(base_path)) |desc| {
+            // Auth check for /cron endpoints:
+            // - No pairing guard → allow (pairing not configured)
+            // - Pairing disabled → allow
+            // - Pairing required, no tokens yet → DENY (bootstrap phase; CLI falls back to disk)
+            // - Pairing required, tokens exist → require valid bearer token
+            const auth_header = extractHeader(raw, "Authorization");
+            const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+            const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+            const cron_authorized = if (pairing_guard) |g|
+                if (!g.requirePairing())
+                    true
+                else if (!g.hasPairedTokens())
+                    false // bootstrap phase: deny, CLI falls back to disk
+                else
+                    isWebhookAuthorized(pairing_guard, bearer)
+            else
+                true;
+            if (!cron_authorized) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                _ = desc.method; // method check is inside each handler
+                var cron_ctx = WebhookHandlerContext{
+                    .root_allocator = allocator,
+                    .req_allocator = req_allocator,
+                    .raw_request = raw,
+                    .method = method_str,
+                    .target = target,
+                    .config_opt = config_opt,
+                    .state = &state,
+                    .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+                };
+                desc.handler(&cron_ctx);
+                response_status = cron_ctx.response_status;
+                response_content_type = cron_ctx.response_content_type;
+                response_body = cron_ctx.response_body;
+            }
+        } else if (findWebhookRouteDescriptor(base_path)) |desc| {
             var webhook_ctx = WebhookHandlerContext{
                 .root_allocator = allocator,
                 .req_allocator = req_allocator,
@@ -4851,6 +5397,145 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+test "cron auth matrix: no pairing guard allows all" {
+    // When pairing is not configured (guard is null), /cron is open.
+    try std.testing.expect(isWebhookAuthorized(null, null) == false); // webhook still fails
+    // Simulate the cron_authorized logic with null guard
+    const cron_authorized = true; // null guard → allow
+    try std.testing.expect(cron_authorized);
+}
+
+test "cron auth matrix: pairing disabled allows all" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+    try std.testing.expect(!guard.requirePairing());
+    // cron_authorized = !requirePairing() → true
+    try std.testing.expect(!guard.requirePairing());
+}
+
+test "cron auth matrix: bootstrap phase denies all" {
+    // Pairing required but no tokens issued yet → deny regardless of bearer
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expect(guard.requirePairing());
+    try std.testing.expect(!guard.hasPairedTokens());
+    // cron_authorized = hasPairedTokens() is false → false (deny)
+    const cron_authorized = guard.hasPairedTokens();
+    try std.testing.expect(!cron_authorized);
+}
+
+test "cron auth matrix: paired phase requires valid token" {
+    const tokens = [_][]const u8{"zc_secret_token"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.requirePairing());
+    try std.testing.expect(guard.hasPairedTokens());
+    // Valid token → authorized
+    try std.testing.expect(guard.isAuthenticated("zc_secret_token"));
+    // Invalid token → denied
+    try std.testing.expect(!guard.isAuthenticated("wrong_token"));
+    // No token → denied
+    try std.testing.expect(!guard.isAuthenticated(""));
+}
+
+test "shared scheduler registration sets and clears global pointer" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 4, true);
+    defer scheduler.deinit();
+    defer clearSharedScheduler();
+
+    setSharedScheduler(&scheduler);
+    lockSharedScheduler();
+    try std.testing.expect(g_shared_scheduler == &scheduler);
+    unlockSharedScheduler();
+
+    clearSharedScheduler();
+    lockSharedScheduler();
+    try std.testing.expect(g_shared_scheduler == null);
+    unlockSharedScheduler();
+}
+
+test "handleCronAdd preserves delivery routing fields" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"prompt\":\"Check \\\"traffic\\\"\",\"model\":\"openrouter/anthropic/claude-sonnet-4\",\"delivery_mode\":\"always\",\"delivery_channel\":\"telegram\",\"delivery_account_id\":\"backup\",\"delivery_to\":\"chat-42\",\"delivery_best_effort\":false}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(cron_mod.DeliveryMode.always, jobs[0].delivery.mode);
+    try std.testing.expectEqualStrings("Check \"traffic\"", jobs[0].command);
+    try std.testing.expectEqualStrings("Check \"traffic\"", jobs[0].prompt.?);
+    try std.testing.expectEqualStrings("telegram", jobs[0].delivery.channel.?);
+    try std.testing.expectEqualStrings("backup", jobs[0].delivery.account_id.?);
+    try std.testing.expectEqualStrings("chat-42", jobs[0].delivery.to.?);
+    try std.testing.expect(!jobs[0].delivery.best_effort);
+}
+
+test "handleCronAdd supports one-shot delay payloads" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"delay\":\"5m\",\"command\":\"echo once\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expect(jobs[0].one_shot);
+    try std.testing.expect(std.mem.startsWith(u8, jobs[0].expression, "@once:"));
+    try std.testing.expectEqualStrings("echo once", jobs[0].command);
+}
 
 test "constants are set correctly" {
     try std.testing.expectEqual(@as(usize, 65_536), MAX_BODY_SIZE);

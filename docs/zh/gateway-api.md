@@ -15,6 +15,12 @@
 | `/health` | GET | 无 | 健康检查 |
 | `/pair` | POST | `X-Pairing-Code` | 用一次性配对码换取 bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | 发送消息：`{"message":"..."}` |
+| `/cron` | GET | 已存在配对 token 时需要 `Authorization: Bearer <token>` | 查看运行中 daemon 的实时 scheduler 任务 |
+| `/cron/add` | POST | 已存在配对 token 时需要 `Authorization: Bearer <token>` | 新增实时 cron 任务 |
+| `/cron/remove` | POST | 已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 删除实时 cron 任务 |
+| `/cron/pause` | POST | 已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 暂停实时 cron 任务 |
+| `/cron/resume` | POST | 已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 恢复实时 cron 任务 |
+| `/cron/update` | POST | 已存在配对 token 时需要 `Authorization: Bearer <token>` | 部分更新实时 cron 任务 |
 | `/whatsapp` | GET | Query 参数 | Meta Webhook 验证 |
 | `/whatsapp` | POST | Meta 签名 | WhatsApp 入站消息 |
 | `/max` | POST | `X-Max-Bot-Api-Secret`（配置后必填） | Max 入站 webhook |
@@ -49,7 +55,27 @@ curl -X POST \
   http://127.0.0.1:3000/webhook
 ```
 
-### 4) Max webhook 投递
+### 4) 查看实时 cron 任务
+
+```bash
+curl -X GET \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  http://127.0.0.1:3000/cron
+```
+
+### 5) 新增实时 cron 任务
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"expression":"*/15 * * * *","command":"echo hello"}' \
+  http://127.0.0.1:3000/cron/add
+```
+
+`/cron/add` 也支持一次性任务，例如 `{"delay":"10m","command":"echo later"}`，以及 agent 任务，例如 `{"expression":"0 * * * *","prompt":"Summarize alerts","model":"openrouter/anthropic/claude-sonnet-4"}`。
+
+### 6) Max webhook 投递
 
 单账号示例：
 

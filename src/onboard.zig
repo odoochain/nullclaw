@@ -15,6 +15,7 @@ const fs_compat = @import("fs_compat.zig");
 const platform = @import("platform.zig");
 const codex_support = @import("codex_support.zig");
 const config_mod = @import("config.zig");
+const net_security = @import("net_security.zig");
 const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
 const provider_names = @import("provider_names.zig");
@@ -175,14 +176,8 @@ fn isValidCustomProviderUrl(url: []const u8) bool {
 }
 
 fn isLocalEndpoint(url: []const u8) bool {
-    return std.mem.startsWith(u8, url, "http://localhost") or
-        std.mem.startsWith(u8, url, "https://localhost") or
-        std.mem.startsWith(u8, url, "http://127.") or
-        std.mem.startsWith(u8, url, "https://127.") or
-        std.mem.startsWith(u8, url, "http://0.0.0.0") or
-        std.mem.startsWith(u8, url, "https://0.0.0.0") or
-        std.mem.startsWith(u8, url, "http://[::1]") or
-        std.mem.startsWith(u8, url, "https://[::1]");
+    const host = net_security.extractHost(url) orelse return false;
+    return net_security.isLocalHost(host);
 }
 
 fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) bool {
@@ -3066,7 +3061,11 @@ test "providerRequiresApiKeyForSetup marks local and OAuth providers as keyless"
     try std.testing.expect(!providerRequiresApiKeyForSetup("gemini-cli", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("codex-cli", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("openai-codex", null));
+    // Regression: local-network compatible endpoints should not require API keys.
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1"));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://100.64.0.1:8080/v1", "http://100.64.0.1:8080/v1"));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://model.local:8080/v1", "http://model.local:8080/v1"));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://[fd00::1]:8080/v1", "http://[fd00::1]:8080/v1"));
     try std.testing.expect(providerRequiresApiKeyForSetup("openai", null));
 }
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 const codex_support = @import("codex_support.zig");
+const net_security = @import("net_security.zig");
 const onboard = @import("onboard.zig");
 const providers = @import("providers/root.zig");
 
@@ -32,14 +33,8 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn isLocalEndpoint(url: []const u8) bool {
-    return std.mem.startsWith(u8, url, "http://localhost") or
-        std.mem.startsWith(u8, url, "https://localhost") or
-        std.mem.startsWith(u8, url, "http://127.") or
-        std.mem.startsWith(u8, url, "https://127.") or
-        std.mem.startsWith(u8, url, "http://0.0.0.0") or
-        std.mem.startsWith(u8, url, "https://0.0.0.0") or
-        std.mem.startsWith(u8, url, "http://[::1]") or
-        std.mem.startsWith(u8, url, "https://[::1]");
+    const host = net_security.extractHost(url) orelse return false;
+    return net_security.isLocalHost(host);
 }
 
 fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
@@ -415,7 +410,11 @@ test "providerRequiresApiKey marks local providers as keyless" {
     try std.testing.expect(!providerRequiresApiKey("gemini-cli", null));
     try std.testing.expect(providerRequiresApiKey("openai", null));
     try std.testing.expect(!providerRequiresApiKey("lmstudio", null));
+    // Regression: local-network compatible endpoints should not require API keys.
     try std.testing.expect(!providerRequiresApiKey("custom:http://127.0.0.1:8080/v1", null));
+    try std.testing.expect(!providerRequiresApiKey("custom:http://100.64.0.1:8080/v1", null));
+    try std.testing.expect(!providerRequiresApiKey("custom:http://model.local:8080/v1", null));
+    try std.testing.expect(!providerRequiresApiKey("custom:http://[fd00::1]:8080/v1", null));
     try std.testing.expect(providerRequiresApiKey("custom:https://example.com/v1", null));
 }
 

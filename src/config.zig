@@ -1412,7 +1412,7 @@ pub const Config = struct {
             ValidationError.InvalidMcpTransport => std.debug.print("Config error: mcp_servers.<name>.transport must be 'stdio' or 'http'.\n", .{}),
             ValidationError.MissingMcpCommand => std.debug.print("Config error: mcp_servers.<name>.command is required when transport='stdio'.\n", .{}),
             ValidationError.MissingMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url is required when transport='http'.\n", .{}),
-            ValidationError.InvalidMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url must be an absolute https:// URL.\n", .{}),
+            ValidationError.InvalidMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url must be an absolute https:// URL (or http:// for localhost/private hosts).\n", .{}),
             ValidationError.InvalidMcpHeader => std.debug.print("Config error: mcp_servers.<name>.headers must contain valid HTTP header names/values (no CR/LF).\n", .{}),
             ValidationError.InvalidMcpTimeoutMs => std.debug.print("Config error: mcp_servers.<name>.timeout_ms must be in [1, 600000].\n", .{}),
             ValidationError.InvalidExternalRuntimeName => std.debug.print("Config error: channels.external.accounts.<id>.runtime_name must be non-empty and contain only letters, digits, '_', '-', or '.'.\n", .{}),

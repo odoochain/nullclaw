@@ -61,19 +61,30 @@ pub fn pendingTextChainStatsForKey(
     return .{ .latest = latest, .parts = parts, .total_bytes = total_bytes };
 }
 
-pub fn textDebounceSecsForChain(parts: usize, total_bytes: usize) u64 {
+pub fn textDebounceSecsForChainWithBase(parts: usize, total_bytes: usize, base_debounce_secs: u64) u64 {
+    if (base_debounce_secs == 0) return 0;
     if (parts >= LARGE_TEXT_CHAIN_MIN_PARTS or total_bytes >= LARGE_TEXT_CHAIN_MIN_BYTES) {
-        return LARGE_TEXT_CHAIN_DEBOUNCE_SECS;
+        return @max(base_debounce_secs, LARGE_TEXT_CHAIN_DEBOUNCE_SECS);
     }
-    return TEXT_MESSAGE_DEBOUNCE_SECS;
+    return base_debounce_secs;
 }
 
-fn chainStillWarm(now: u64, stats: PendingTextChainStats) bool {
-    return now <= stats.latest + textDebounceSecsForChain(stats.parts, stats.total_bytes);
+pub fn textDebounceSecsForChain(parts: usize, total_bytes: usize) u64 {
+    return textDebounceSecsForChainWithBase(parts, total_bytes, TEXT_MESSAGE_DEBOUNCE_SECS);
 }
 
-fn chainIsMature(now: u64, stats: PendingTextChainStats) bool {
-    return !chainStillWarm(now, stats);
+fn chainStillWarm(now: u64, stats: PendingTextChainStats, base_debounce_secs: u64) bool {
+    const debounce_secs = textDebounceSecsForChainWithBase(
+        stats.parts,
+        stats.total_bytes,
+        base_debounce_secs,
+    );
+    if (debounce_secs == 0) return false;
+    return now <= stats.latest + debounce_secs;
+}
+
+fn chainIsMature(now: u64, stats: PendingTextChainStats, base_debounce_secs: u64) bool {
+    return !chainStillWarm(now, stats, base_debounce_secs);
 }
 
 pub fn pendingTextBuffersInSync(
@@ -87,6 +98,16 @@ pub fn nextPendingTextDeadline(
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
 ) ?u64 {
+    return nextPendingTextDeadlineWithBase(pending_messages, received_at, TEXT_MESSAGE_DEBOUNCE_SECS);
+}
+
+pub fn nextPendingTextDeadlineWithBase(
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+    base_debounce_secs: u64,
+) ?u64 {
+    if (base_debounce_secs == 0) return null;
+
     const n = @min(pending_messages.len, received_at.len);
     var seen = false;
     var next_deadline: u64 = 0;
@@ -97,7 +118,11 @@ pub fn nextPendingTextDeadline(
             pending_messages,
             received_at,
         ) orelse continue;
-        const deadline = stats.latest + textDebounceSecsForChain(stats.parts, stats.total_bytes);
+        const deadline = stats.latest + textDebounceSecsForChainWithBase(
+            stats.parts,
+            stats.total_bytes,
+            base_debounce_secs,
+        );
         if (!seen or deadline < next_deadline) next_deadline = deadline;
         seen = true;
     }
@@ -110,6 +135,23 @@ pub fn shouldDebounceTextMessage(
     received_at: []const u64,
     msg: root.ChannelMessage,
 ) bool {
+    return shouldDebounceTextMessageWithBase(
+        now,
+        pending_messages,
+        received_at,
+        msg,
+        TEXT_MESSAGE_DEBOUNCE_SECS,
+    );
+}
+
+pub fn shouldDebounceTextMessageWithBase(
+    now: u64,
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+    msg: root.ChannelMessage,
+    base_debounce_secs: u64,
+) bool {
+    if (base_debounce_secs == 0) return false;
     if (!hasMessageId(msg)) return false;
     if (isSlashCommandMessage(msg.content)) return false;
     if (isLikelySplitTextChunk(msg)) return true;
@@ -120,7 +162,7 @@ pub fn shouldDebounceTextMessage(
         pending_messages,
         received_at,
     ) orelse return false;
-    return chainStillWarm(now, stats);
+    return chainStillWarm(now, stats, base_debounce_secs);
 }
 
 pub fn pendingTextChainMatureAtIndex(
@@ -128,6 +170,22 @@ pub fn pendingTextChainMatureAtIndex(
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
     index: usize,
+) bool {
+    return pendingTextChainMatureAtIndexWithBase(
+        now,
+        pending_messages,
+        received_at,
+        index,
+        TEXT_MESSAGE_DEBOUNCE_SECS,
+    );
+}
+
+pub fn pendingTextChainMatureAtIndexWithBase(
+    now: u64,
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+    index: usize,
+    base_debounce_secs: u64,
 ) bool {
     if (index >= pending_messages.len or index >= received_at.len) return false;
 
@@ -138,7 +196,7 @@ pub fn pendingTextChainMatureAtIndex(
         pending_messages,
         received_at,
     ) orelse return false;
-    return chainIsMature(now, stats);
+    return chainIsMature(now, stats, base_debounce_secs);
 }
 
 pub fn cancelPendingTextChainForKey(
@@ -438,6 +496,12 @@ test "telegram ingress textDebounceSecsForChain extends window for large chains"
     try std.testing.expectEqual(@as(u64, TEXT_MESSAGE_DEBOUNCE_SECS), textDebounceSecsForChain(1, 900));
     try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(4, 900));
     try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(2, LARGE_TEXT_CHAIN_MIN_BYTES));
+}
+
+test "telegram ingress textDebounceSecsForChainWithBase honors configured debounce" {
+    try std.testing.expectEqual(@as(u64, 5), textDebounceSecsForChainWithBase(1, 900, 5));
+    try std.testing.expectEqual(@as(u64, 8), textDebounceSecsForChainWithBase(4, 900, 5));
+    try std.testing.expectEqual(@as(u64, 0), textDebounceSecsForChainWithBase(1, 900, 0));
 }
 
 test "telegram ingress shouldDebounceTextMessage debounces medium chunk (~900 bytes)" {

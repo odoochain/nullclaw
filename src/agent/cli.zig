@@ -21,7 +21,9 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const subagent_mod = @import("../subagent.zig");
 const subagent_runner = @import("../subagent_runner.zig");
+const bus_mod = @import("../bus.zig");
 const cli_mod = @import("../channels/cli.zig");
+const inbound_debounce = @import("../inbound_debounce.zig");
 const security = @import("../security/policy.zig");
 const codex_support = @import("../codex_support.zig");
 const onboard = @import("../onboard.zig");
@@ -623,8 +625,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Append to history
         repl_history.append(allocator, allocator.dupe(u8, line) catch continue) catch {};
 
+        const debounced_input = try collectCliDebouncedInput(allocator, stdin, line, cfg.messages.inbound.debounce_ms);
+        defer allocator.free(debounced_input);
+
         stream_ctx.emitted_text = false;
-        const response = agent.turn(line) catch |err| {
+        const response = agent.turn(debounced_input) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
             } else if (err == error.RateLimited) {
@@ -651,6 +656,64 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
         try w.flush();
     }
+}
+
+fn collectCliDebouncedInput(
+    allocator: std.mem.Allocator,
+    stdin: std.fs.File,
+    first_line: []const u8,
+    debounce_ms: u32,
+) ![]const u8 {
+    if (debounce_ms == 0 or @import("builtin").os.tag == .windows) {
+        return try allocator.dupe(u8, first_line);
+    }
+
+    var debouncer = inbound_debounce.InboundDebouncer.init(allocator, debounce_ms);
+    defer debouncer.deinit();
+
+    var ready: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
+    defer {
+        for (ready.items) |msg| msg.deinit(allocator);
+        ready.deinit(allocator);
+    }
+
+    try debouncer.push(try bus_mod.makeInbound(allocator, "cli", "local-user", "cli", first_line, "cli:repl"), inbound_debounce.nowMs(), &ready);
+
+    while (ready.items.len == 0) {
+        const timeout_ms = debouncer.nextPollTimeoutMs(inbound_debounce.nowMs());
+        if (timeout_ms == 0) {
+            try debouncer.flushMatured(inbound_debounce.nowMs(), &ready);
+            continue;
+        }
+
+        var poll_fds = [_]std.posix.pollfd{
+            .{ .fd = stdin.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const events = std.posix.poll(&poll_fds, timeout_ms) catch 0;
+        if (events > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
+            var extra_line_buf: [4096]u8 = undefined;
+            const extra_line = readCliLine(stdin, &extra_line_buf) orelse break;
+            if (extra_line.len > 0) {
+                try debouncer.push(try bus_mod.makeInbound(allocator, "cli", "local-user", "cli", extra_line, "cli:repl"), inbound_debounce.nowMs(), &ready);
+            }
+        } else {
+            try debouncer.flushMatured(inbound_debounce.nowMs(), &ready);
+        }
+    }
+
+    if (ready.items.len == 0) return try allocator.dupe(u8, first_line);
+    return try allocator.dupe(u8, ready.items[0].content);
+}
+
+fn readCliLine(stdin: std.fs.File, buf: []u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (pos < buf.len) {
+        const n = stdin.read(buf[pos .. pos + 1]) catch return null;
+        if (n == 0) return null;
+        if (buf[pos] == '\n') break;
+        pos += 1;
+    }
+    return buf[0..pos];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

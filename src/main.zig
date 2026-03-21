@@ -3291,6 +3291,9 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     tg.topic_commands_enabled = telegram_config.topic_commands_enabled;
     tg.topic_map_command_enabled = telegram_config.topic_map_command_enabled;
     tg.commands_menu_mode = telegram_config.commands_menu_mode;
+    tg.text_debounce_secs = yc.channels.telegram.TelegramChannel.textDebounceSecsFromMs(
+        config.messages.inbound.debounce_ms,
+    );
 
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;

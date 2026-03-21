@@ -2272,6 +2272,20 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         try parseChannels(self, ch);
     }
 
+    if (root.get("messages")) |messages| {
+        if (messages == .object) {
+            if (messages.object.get("inbound")) |inbound| {
+                if (inbound == .object) {
+                    if (inbound.object.get("debounce_ms")) |v| {
+                        if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                            self.messages.inbound.debounce_ms = @intCast(v.integer);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Session config
     if (root.get("session")) |sess| {
         if (sess == .object) {

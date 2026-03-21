@@ -168,6 +168,7 @@ pub const Config = struct {
     runtime: RuntimeConfig = .{},
     reliability: ReliabilityConfig = .{},
     scheduler: SchedulerConfig = .{},
+    messages: config_types.MessagesConfig = .{},
     agent: AgentConfig = .{},
     heartbeat: HeartbeatConfig = .{},
     cron: CronConfig = .{},

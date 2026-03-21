@@ -177,6 +177,14 @@ pub const ReliabilityConfig = struct {
     model_fallbacks: []const ModelFallbackEntry = &.{},
 };
 
+pub const InboundMessagesConfig = struct {
+    debounce_ms: u32 = 3_000,
+};
+
+pub const MessagesConfig = struct {
+    inbound: InboundMessagesConfig = .{},
+};
+
 pub const SchedulerConfig = struct {
     enabled: bool = true,
     max_tasks: u32 = 64,

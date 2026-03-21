@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const config_types = @import("../config_types.zig");
 const Provider = root.Provider;
 const anthropic = @import("anthropic.zig");
 const openai = @import("openai.zig");
@@ -347,6 +348,28 @@ pub const ProviderHolder = union(enum) {
         user_agent: ?[]const u8,
         max_streaming_prompt_bytes: ?usize,
     ) ProviderHolder {
+        return fromConfigWithApiMode(
+            allocator,
+            provider_name,
+            api_key,
+            base_url,
+            native_tools,
+            user_agent,
+            .chat_completions,
+            max_streaming_prompt_bytes,
+        );
+    }
+
+    pub fn fromConfigWithApiMode(
+        allocator: std.mem.Allocator,
+        provider_name: []const u8,
+        api_key: ?[]const u8,
+        base_url: ?[]const u8,
+        native_tools: bool,
+        user_agent: ?[]const u8,
+        api_mode: config_types.ProviderEntry.ApiMode,
+        max_streaming_prompt_bytes: ?usize,
+    ) ProviderHolder {
         const kind = classifyProvider(provider_name);
         return switch (kind) {
             .anthropic_provider => .{ .anthropic = anthropic.AnthropicProvider.init(
@@ -371,6 +394,10 @@ pub const ProviderHolder = union(enum) {
                 prov.owned_base_url = azure_url;
                 prov.custom_header = "api-key";
                 if (!native_tools) prov.native_tools = false;
+                prov.api_mode = switch (api_mode) {
+                    .responses => .responses,
+                    else => .chat_completions,
+                };
                 if (max_streaming_prompt_bytes) |limit| prov.max_streaming_prompt_bytes = limit;
                 break :blk .{ .compatible = prov };
             },
@@ -416,6 +443,10 @@ pub const ProviderHolder = union(enum) {
 
                 // Apply config-level overrides.
                 if (!native_tools) prov.native_tools = false;
+                prov.api_mode = switch (api_mode) {
+                    .responses => .responses,
+                    else => .chat_completions,
+                };
                 if (max_streaming_prompt_bytes) |limit| prov.max_streaming_prompt_bytes = limit;
 
                 break :blk .{ .compatible = prov };
@@ -445,6 +476,10 @@ pub const ProviderHolder = union(enum) {
                     user_agent,
                 );
                 prov.native_tools = native_tools;
+                prov.api_mode = switch (api_mode) {
+                    .responses => .responses,
+                    else => .chat_completions,
+                };
                 if (max_streaming_prompt_bytes) |limit| prov.max_streaming_prompt_bytes = limit;
                 break :blk .{ .compatible = prov };
             } else .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
@@ -1073,4 +1108,21 @@ test "fromConfig threads max_streaming_prompt_bytes zero value" {
     defer h3.deinit();
     try std.testing.expect(h3 == .compatible);
     try std.testing.expectEqual(@as(?usize, 0), h3.compatible.max_streaming_prompt_bytes);
+}
+
+test "fromConfigWithApiMode applies responses mode to compatible provider" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfigWithApiMode(
+        alloc,
+        "groq",
+        "key",
+        "https://example.com/v1",
+        true,
+        null,
+        .responses,
+        null,
+    );
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqual(compatible.CompatibleApiMode.responses, h.compatible.api_mode);
 }

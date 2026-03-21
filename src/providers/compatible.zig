@@ -146,6 +146,11 @@ pub const AuthStyle = enum {
     }
 };
 
+pub const CompatibleApiMode = enum {
+    chat_completions,
+    responses,
+};
+
 /// A provider that speaks the OpenAI-compatible chat completions API.
 ///
 /// Used by: Venice, Vercel, Cloudflare, Moonshot, Synthetic, OpenCode,
@@ -188,6 +193,8 @@ pub const OpenAiCompatibleProvider = struct {
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Primary OpenAI-compatible protocol to use for this provider.
+    api_mode: CompatibleApiMode = .chat_completions,
     /// Maximum estimated request text bytes before streaming is skipped.
     /// null means no limit — streaming is always attempted.
     /// Set via per-provider config field `max_streaming_prompt_bytes`.
@@ -327,99 +334,457 @@ pub const OpenAiCompatibleProvider = struct {
         return STREAMING_FALLBACK_TIMEOUT_SECS;
     }
 
-    /// Build a Responses API request JSON body.
-    pub fn buildResponsesRequestBody(
+    fn appendResponsesMessageText(
+        buf: *std.ArrayListUnmanaged(u8),
         allocator: std.mem.Allocator,
-        system_prompt: ?[]const u8,
-        message: []const u8,
-        model: []const u8,
-    ) ![]const u8 {
-        if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"instructions":"{s}","stream":false}}
-            , .{ model, message, sys });
-        } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"stream":false}}
-            , .{ model, message });
+        msg: ChatMessage,
+    ) !bool {
+        if (msg.content_parts) |parts| {
+            var wrote = false;
+            for (parts) |part| {
+                switch (part) {
+                    .text => |text| {
+                        const trimmed = std.mem.trim(u8, text, " \t\n\r");
+                        if (trimmed.len == 0) continue;
+                        if (wrote) try buf.appendSlice(allocator, "\n");
+                        try buf.appendSlice(allocator, trimmed);
+                        wrote = true;
+                    },
+                    else => {},
+                }
+            }
+            return wrote;
+        }
+
+        const trimmed = std.mem.trim(u8, msg.content, " \t\n\r");
+        if (trimmed.len == 0) return false;
+        try buf.appendSlice(allocator, trimmed);
+        return true;
+    }
+
+    fn collectResponsesInstructions(allocator: std.mem.Allocator, messages: []const ChatMessage) !?[]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        for (messages) |msg| {
+            if (msg.role != .system) continue;
+            const before = buf.items.len;
+            if (before > 0) try buf.appendSlice(allocator, "\n\n");
+            const wrote = try appendResponsesMessageText(&buf, allocator, msg);
+            if (!wrote) buf.items.len = before;
+        }
+
+        if (buf.items.len == 0) {
+            buf.deinit(allocator);
+            return null;
+        }
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn appendResponsesContentPart(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        part: ContentPart,
+    ) !void {
+        switch (part) {
+            .text => |text| {
+                try buf.appendSlice(allocator, "{\"type\":\"input_text\",\"text\":");
+                try root.appendJsonString(buf, allocator, text);
+                try buf.append(allocator, '}');
+            },
+            .image_url => |img| {
+                try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":");
+                try root.appendJsonString(buf, allocator, img.url);
+                try buf.appendSlice(allocator, ",\"detail\":");
+                try root.appendJsonString(buf, allocator, img.detail.toSlice());
+                try buf.append(allocator, '}');
+            },
+            .image_base64 => |img| {
+                try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":\"data:");
+                try buf.appendSlice(allocator, img.media_type);
+                try buf.appendSlice(allocator, ";base64,");
+                try buf.appendSlice(allocator, img.data);
+                try buf.appendSlice(allocator, "\"}");
+            },
         }
     }
 
-    /// Extract text from a Responses API JSON response.
-    /// Checks output_text first, then output[*].content[*] with type "output_text",
-    /// then any text in output[*].content[*].
-    pub fn extractResponsesText(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-        defer parsed.deinit();
-        const root_obj = parsed.value.object;
+    fn appendResponsesMessageContent(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        msg: ChatMessage,
+    ) !void {
+        if (msg.content_parts) |parts| {
+            try buf.append(allocator, '[');
+            var first = true;
+            for (parts) |part| {
+                if (!first) try buf.append(allocator, ',');
+                first = false;
+                try appendResponsesContentPart(buf, allocator, part);
+            }
+            try buf.append(allocator, ']');
+            return;
+        }
+        try root.appendJsonString(buf, allocator, msg.content);
+    }
 
-        // Check top-level output_text first
+    fn serializeResponsesInputInto(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        messages: []const ChatMessage,
+    ) !void {
+        var first = true;
+        for (messages) |msg| {
+            if (msg.role == .system) continue;
+            if (!first) try buf.append(allocator, ',');
+            first = false;
+
+            switch (msg.role) {
+                .user, .assistant => {
+                    try buf.appendSlice(allocator, "{\"type\":\"message\",\"role\":\"");
+                    try buf.appendSlice(allocator, msg.role.toSlice());
+                    try buf.appendSlice(allocator, "\",\"content\":");
+                    try appendResponsesMessageContent(buf, allocator, msg);
+                    try buf.append(allocator, '}');
+                },
+                .tool => {
+                    try buf.appendSlice(allocator, "{\"type\":\"function_call_output\",\"call_id\":");
+                    try root.appendJsonString(buf, allocator, msg.tool_call_id orelse "unknown");
+                    try buf.appendSlice(allocator, ",\"output\":");
+                    try root.appendJsonString(buf, allocator, msg.content);
+                    try buf.append(allocator, '}');
+                },
+                .system => unreachable,
+            }
+        }
+    }
+
+    fn appendResponsesGenerationFields(
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        model: []const u8,
+        temperature: f64,
+        max_tokens: ?u32,
+        reasoning_effort: ?[]const u8,
+    ) !void {
+        const normalized_effort = root.normalizeOpenAiReasoningEffort(reasoning_effort);
+        const effort_is_none = if (normalized_effort) |re| std.mem.eql(u8, re, "none") else false;
+
+        if (!root.isReasoningModel(model) or effort_is_none) {
+            try buf.appendSlice(allocator, ",\"temperature\":");
+            var temp_buf: [16]u8 = undefined;
+            const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
+            try buf.appendSlice(allocator, temp_str);
+        }
+
+        if (max_tokens) |max_tok| {
+            try buf.appendSlice(allocator, ",\"max_output_tokens\":");
+            var max_buf: [16]u8 = undefined;
+            const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.FormatError;
+            try buf.appendSlice(allocator, max_str);
+        }
+
+        if (normalized_effort) |re| {
+            if (!std.mem.eql(u8, re, "none")) {
+                try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
+                try root.appendJsonString(buf, allocator, re);
+                try buf.append(allocator, '}');
+            }
+        }
+    }
+
+    /// Build a Responses API request JSON body from a full ChatRequest.
+    pub fn buildResponsesRequestBody(
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+    ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        const instructions = try collectResponsesInstructions(allocator, request.messages);
+        defer if (instructions) |text| allocator.free(text);
+
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"input\":[");
+        try serializeResponsesInputInto(&buf, allocator, request.messages);
+        try buf.append(allocator, ']');
+
+        if (instructions) |text| {
+            try buf.appendSlice(allocator, ",\"instructions\":");
+            try root.appendJsonString(&buf, allocator, text);
+        }
+
+        try appendResponsesGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+
+        if (request.tools) |tools| {
+            if (tools.len > 0) {
+                try buf.appendSlice(allocator, ",\"tools\":");
+                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+            }
+        }
+
+        try buf.appendSlice(allocator, ",\"stream\":false}");
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    fn extractResponsesOutputText(
+        allocator: std.mem.Allocator,
+        root_obj: std.json.ObjectMap,
+    ) !?[]const u8 {
+        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer text_buf.deinit(allocator);
+
         if (root_obj.get("output_text")) |ot| {
             if (ot == .string) {
                 const trimmed = std.mem.trim(u8, ot.string, " \t\n\r");
-                if (trimmed.len > 0) {
-                    return stripThinkBlocks(allocator, trimmed);
-                }
+                if (trimmed.len > 0) try text_buf.appendSlice(allocator, trimmed);
             }
         }
 
-        // Walk output[*].content[*] looking for type "output_text"
         if (root_obj.get("output")) |output_arr| {
-            for (output_arr.array.items) |item| {
-                if (item.object.get("content")) |content_arr| {
-                    for (content_arr.array.items) |content| {
-                        const cobj = content.object;
-                        if (cobj.get("type")) |t| {
-                            if (t == .string and std.mem.eql(u8, t.string, "output_text")) {
-                                if (cobj.get("text")) |text| {
-                                    if (text == .string) {
-                                        const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
-                                        if (trimmed.len > 0) {
-                                            return stripThinkBlocks(allocator, trimmed);
-                                        }
-                                    }
-                                }
-                            }
+            if (output_arr == .array) {
+                for (output_arr.array.items) |item| {
+                    if (item != .object) continue;
+                    const item_obj = item.object;
+                    if (item_obj.get("role")) |role_val| {
+                        if (role_val != .string or !std.mem.eql(u8, role_val.string, "assistant")) continue;
+                    }
+                    if (item_obj.get("content")) |content_arr| {
+                        if (content_arr != .array) continue;
+                        for (content_arr.array.items) |content| {
+                            if (content != .object) continue;
+                            const text_val = content.object.get("text") orelse continue;
+                            if (text_val != .string) continue;
+                            const trimmed = std.mem.trim(u8, text_val.string, " \t\n\r");
+                            if (trimmed.len == 0) continue;
+                            if (text_buf.items.len > 0) try text_buf.appendSlice(allocator, "\n\n");
+                            try text_buf.appendSlice(allocator, trimmed);
                         }
                     }
                 }
             }
         }
 
-        // Fallback: any text in output[*].content[*]
-        if (root_obj.get("output")) |output_arr| {
-            for (output_arr.array.items) |item| {
-                if (item.object.get("content")) |content_arr| {
-                    for (content_arr.array.items) |content| {
-                        if (content.object.get("text")) |text| {
-                            if (text == .string) {
-                                const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
-                                if (trimmed.len > 0) {
-                                    return stripThinkBlocks(allocator, trimmed);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if (text_buf.items.len == 0) {
+            text_buf.deinit(allocator);
+            return null;
         }
 
+        const raw = try text_buf.toOwnedSlice(allocator);
+        errdefer allocator.free(raw);
+        const cleaned = try stripThinkBlocks(allocator, raw);
+        allocator.free(raw);
+        if (cleaned.len == 0) {
+            allocator.free(cleaned);
+            return null;
+        }
+        return cleaned;
+    }
+
+    fn extractResponsesToolCalls(
+        allocator: std.mem.Allocator,
+        root_obj: std.json.ObjectMap,
+    ) ![]const ToolCall {
+        const output_arr = root_obj.get("output") orelse return try allocator.alloc(ToolCall, 0);
+        if (output_arr != .array) return try allocator.alloc(ToolCall, 0);
+
+        var tool_calls: std.ArrayListUnmanaged(ToolCall) = .empty;
+        errdefer {
+            for (tool_calls.items) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            tool_calls.deinit(allocator);
+        }
+
+        for (output_arr.array.items) |item| {
+            if (item != .object) continue;
+            const item_obj = item.object;
+            const type_val = item_obj.get("type") orelse continue;
+            if (type_val != .string or !std.mem.eql(u8, type_val.string, "function_call")) continue;
+
+            const id = if (item_obj.get("call_id")) |call_id|
+                if (call_id == .string) try allocator.dupe(u8, call_id.string) else try allocator.dupe(u8, "unknown")
+            else
+                try allocator.dupe(u8, "unknown");
+            errdefer allocator.free(id);
+
+            const name = if (item_obj.get("name")) |name_val|
+                if (name_val == .string) try allocator.dupe(u8, name_val.string) else try allocator.dupe(u8, "")
+            else
+                try allocator.dupe(u8, "");
+            errdefer allocator.free(name);
+
+            const arguments = if (item_obj.get("arguments")) |args_val|
+                if (args_val == .string) try allocator.dupe(u8, args_val.string) else try allocator.dupe(u8, "{}")
+            else
+                try allocator.dupe(u8, "{}");
+            errdefer allocator.free(arguments);
+
+            try tool_calls.append(allocator, .{
+                .id = id,
+                .name = name,
+                .arguments = arguments,
+            });
+        }
+
+        return try tool_calls.toOwnedSlice(allocator);
+    }
+
+    fn extractResponsesReasoning(
+        allocator: std.mem.Allocator,
+        root_obj: std.json.ObjectMap,
+    ) !?[]u8 {
+        const output_arr = root_obj.get("output") orelse return null;
+        if (output_arr != .array) return null;
+
+        for (output_arr.array.items) |item| {
+            if (item != .object) continue;
+            const item_obj = item.object;
+            const type_val = item_obj.get("type") orelse continue;
+            if (type_val != .string or !std.mem.eql(u8, type_val.string, "reasoning")) continue;
+
+            if (item_obj.get("summary")) |summary_val| {
+                switch (summary_val) {
+                    .string => |summary| {
+                        if (summary.len > 0) return try allocator.dupe(u8, summary);
+                    },
+                    .array => |summary_arr| {
+                        for (summary_arr.items) |summary_item| {
+                            if (summary_item != .object) continue;
+                            const text_val = summary_item.object.get("text") orelse continue;
+                            if (text_val == .string and text_val.string.len > 0) {
+                                return try allocator.dupe(u8, text_val.string);
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (item_obj.get("content")) |content| {
+                if (content == .string and content.string.len > 0) return try allocator.dupe(u8, content.string);
+            }
+        }
+        return null;
+    }
+
+    fn extractResponsesUsage(root_obj: std.json.ObjectMap) TokenUsage {
+        var usage = TokenUsage{};
+        const usage_obj = root_obj.get("usage") orelse return usage;
+        if (usage_obj != .object) return usage;
+
+        if (usage_obj.object.get("input_tokens")) |v| {
+            if (v == .integer) usage.prompt_tokens = @intCast(v.integer);
+        }
+        if (usage_obj.object.get("output_tokens")) |v| {
+            if (v == .integer) usage.completion_tokens = @intCast(v.integer);
+        }
+        if (usage_obj.object.get("total_tokens")) |v| {
+            if (v == .integer) usage.total_tokens = @intCast(v.integer);
+        }
+        return usage;
+    }
+
+    pub fn parseResponsesResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.NoResponseContent;
+
+        const root_obj = parsed.value.object;
+
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("compatible", sanitized orelse summary);
+            return mapped_err;
+        }
+
+        const content = try extractResponsesOutputText(allocator, root_obj);
+        errdefer if (content) |text| allocator.free(text);
+
+        const tool_calls = try extractResponsesToolCalls(allocator, root_obj);
+        errdefer {
+            for (tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(tool_calls);
+        }
+
+        const reasoning = try extractResponsesReasoning(allocator, root_obj);
+        errdefer if (reasoning) |text| allocator.free(text);
+
+        if (content == null and tool_calls.len == 0 and reasoning == null) {
+            return error.NoResponseContent;
+        }
+
+        const model_str = if (root_obj.get("model")) |m|
+            if (m == .string and m.string.len > 0) try allocator.dupe(u8, m.string) else ""
+        else
+            "";
+
+        return .{
+            .content = content,
+            .tool_calls = tool_calls,
+            .usage = extractResponsesUsage(root_obj),
+            .model = model_str,
+            .reasoning_content = reasoning,
+        };
+    }
+
+    /// Extract plain text from a Responses response.
+    pub fn extractResponsesText(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+        var response = try parseResponsesResponse(allocator, body);
+        errdefer {
+            if (response.content) |text| allocator.free(text);
+            for (response.tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(response.tool_calls);
+            if (response.model.len > 0) allocator.free(response.model);
+            if (response.reasoning_content) |text| allocator.free(text);
+        }
+        if (response.content) |text| {
+            const result = text;
+            response.content = null;
+            for (response.tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(response.tool_calls);
+            if (response.model.len > 0) allocator.free(response.model);
+            if (response.reasoning_content) |reasoning| allocator.free(reasoning);
+            return result;
+        }
         return error.NoResponseContent;
     }
 
-    /// Chat via the Responses API endpoint (fallback when chat completions returns 404).
+    /// Chat via the Responses API endpoint using a full ChatRequest.
     pub fn chatViaResponses(
         self: OpenAiCompatibleProvider,
         allocator: std.mem.Allocator,
-        system_prompt: ?[]const u8,
-        message: []const u8,
+        request: ChatRequest,
         model: []const u8,
+        temperature: f64,
         timeout_secs: u64,
-    ) ![]const u8 {
+    ) !ChatResponse {
         const url = try self.responsesUrl(allocator);
         defer allocator.free(url);
 
-        const body = try buildResponsesRequestBody(allocator, system_prompt, message, model);
+        const body = try buildResponsesRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -447,7 +812,10 @@ pub const OpenAiCompatibleProvider = struct {
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
-        return extractResponsesText(allocator, resp_body);
+        return parseResponsesResponse(allocator, resp_body) catch |err| {
+            logCompatibleApiError(allocator, self.name, err, url, resp_body);
+            return err;
+        };
     }
 
     /// Build a chat request JSON body.
@@ -832,6 +1200,41 @@ pub const OpenAiCompatibleProvider = struct {
         .supports_streaming = supportsStreamingImpl,
     };
 
+    fn buildSingleTurnMessages(
+        allocator: std.mem.Allocator,
+        system_prompt: ?[]const u8,
+        message: []const u8,
+        merge_system_into_user: bool,
+    ) ![]ChatMessage {
+        if (merge_system_into_user) {
+            if (system_prompt) |sp| {
+                const merged = try std.fmt.allocPrint(allocator, "[System: {s}]\n\n{s}", .{ sp, message });
+                errdefer allocator.free(merged);
+                const messages = try allocator.alloc(ChatMessage, 1);
+                messages[0] = .{ .role = .user, .content = merged, .name = "__merged_system__" };
+                return messages;
+            }
+        }
+
+        const messages = try allocator.alloc(ChatMessage, if (system_prompt != null) 2 else 1);
+        if (system_prompt) |sp| {
+            messages[0] = ChatMessage.system(sp);
+            messages[1] = ChatMessage.user(message);
+        } else {
+            messages[0] = ChatMessage.user(message);
+        }
+        return messages;
+    }
+
+    fn freeSingleTurnMessages(allocator: std.mem.Allocator, messages: []ChatMessage) void {
+        for (messages) |msg| {
+            if (msg.role == .user and msg.name != null and std.mem.eql(u8, msg.name.?, "__merged_system__")) {
+                allocator.free(msg.content);
+            }
+        }
+        allocator.free(messages);
+    }
+
     fn streamChatImpl(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -843,6 +1246,11 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror!root.StreamChatResult {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+
+        if (self.api_mode == .responses) {
+            var fallback = try chatImpl(ptr, allocator, request, effective_model, temperature);
+            return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
+        }
 
         if (shouldSkipStreaming(self.max_streaming_prompt_bytes, request)) {
             const request_text_bytes = estimateRequestTextBytes(request);
@@ -945,7 +1353,7 @@ pub const OpenAiCompatibleProvider = struct {
 
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
-        return !self.disable_streaming;
+        return !self.disable_streaming and self.api_mode != .responses;
     }
 
     fn chatWithSystemImpl(
@@ -958,6 +1366,34 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror![]const u8 {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+
+        if (self.api_mode == .responses) {
+            const messages = try buildSingleTurnMessages(allocator, system_prompt, message, self.merge_system_into_user);
+            defer freeSingleTurnMessages(allocator, messages);
+
+            const request = ChatRequest{
+                .messages = messages,
+                .model = effective_model,
+                .temperature = temperature,
+                .timeout_secs = 0,
+            };
+
+            const response = try self.chatViaResponses(allocator, request, effective_model, temperature, 0);
+            defer {
+                if (response.content) |text| allocator.free(text);
+                for (response.tool_calls) |tc| {
+                    allocator.free(tc.id);
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                }
+                allocator.free(response.tool_calls);
+                if (response.model.len > 0) allocator.free(response.model);
+                if (response.reasoning_content) |text| allocator.free(text);
+            }
+
+            if (response.content) |text| return try allocator.dupe(u8, text);
+            return error.NoResponseContent;
+        }
 
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
@@ -1006,10 +1442,31 @@ pub const OpenAiCompatibleProvider = struct {
         return parseTextResponse(allocator, resp_body) catch |err| {
             // Only switch protocols when chat-completions explicitly reports endpoint absence.
             if (self.supports_responses_fallback and shouldFallbackToResponses(allocator, resp_body)) {
-                return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model, 0) catch {
+                const fallback_messages = try buildSingleTurnMessages(allocator, eff_system, merged_msg orelse message, false);
+                defer freeSingleTurnMessages(allocator, fallback_messages);
+                const fallback_request = ChatRequest{
+                    .messages = fallback_messages,
+                    .model = effective_model,
+                    .temperature = temperature,
+                    .timeout_secs = 0,
+                };
+                const fallback_resp = self.chatViaResponses(allocator, fallback_request, effective_model, temperature, 0) catch {
                     logCompatibleApiError(allocator, self.name, err, url, resp_body);
                     return err;
                 };
+                defer {
+                    if (fallback_resp.content) |text| allocator.free(text);
+                    for (fallback_resp.tool_calls) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.name);
+                        allocator.free(tc.arguments);
+                    }
+                    allocator.free(fallback_resp.tool_calls);
+                    if (fallback_resp.model.len > 0) allocator.free(fallback_resp.model);
+                    if (fallback_resp.reasoning_content) |text| allocator.free(text);
+                }
+                if (fallback_resp.content) |text| return try allocator.dupe(u8, text);
+                return error.NoResponseContent;
             }
             logCompatibleApiError(allocator, self.name, err, url, resp_body);
             return err;
@@ -1025,11 +1482,15 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror!ChatResponse {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+        const capped_request = self.capNonStreamingMaxTokens(request);
+
+        if (self.api_mode == .responses) {
+            return self.chatViaResponses(allocator, capped_request, effective_model, temperature, capped_request.timeout_secs);
+        }
 
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
-        const capped_request = self.capNonStreamingMaxTokens(request);
         const body = try buildChatRequestBody(
             allocator,
             capped_request,
@@ -1943,11 +2404,20 @@ test "extractResponsesText empty returns error" {
 }
 
 test "buildResponsesRequestBody with system" {
+    const messages = [_]root.ChatMessage{
+        root.ChatMessage.system("You are helpful"),
+        root.ChatMessage.user("hello"),
+    };
     const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
         std.testing.allocator,
-        "You are helpful",
-        "hello",
+        .{
+            .messages = &messages,
+            .model = "gpt-4o",
+            .temperature = 0.7,
+            .timeout_secs = 0,
+        },
         "gpt-4o",
+        0.7,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "gpt-4o") != null);
@@ -1956,17 +2426,146 @@ test "buildResponsesRequestBody with system" {
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
 }
 
-test "buildResponsesRequestBody without system" {
+test "buildResponsesRequestBody preserves short system prompt" {
+    const messages = [_]root.ChatMessage{
+        root.ChatMessage.system("hi"),
+        root.ChatMessage.user("hello"),
+    };
     const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
         std.testing.allocator,
-        null,
-        "hello",
+        .{
+            .messages = &messages,
+            .model = "gpt-4o",
+            .temperature = 0.7,
+            .timeout_secs = 0,
+        },
         "gpt-4o",
+        0.7,
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"hi\"") != null);
+}
+
+test "buildResponsesRequestBody without system" {
+    const messages = [_]root.ChatMessage{
+        root.ChatMessage.user("hello"),
+    };
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        .{
+            .messages = &messages,
+            .model = "gpt-4o",
+            .temperature = 0.7,
+            .timeout_secs = 0,
+        },
+        "gpt-4o",
+        0.7,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "gpt-4o") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "instructions") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
+}
+
+test "buildResponsesRequestBody includes tools and tool results" {
+    const messages = [_]root.ChatMessage{
+        root.ChatMessage.user("list files"),
+        root.ChatMessage.toolMsg("done", "call_123"),
+    };
+    const tools = [_]root.ToolSpec{.{
+        .name = "bash",
+        .description = "Run shell command",
+        .parameters_json = "{\"type\":\"object\"}",
+    }};
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        .{
+            .messages = &messages,
+            .model = "gpt-5.4",
+            .temperature = 0.2,
+            .max_tokens = 512,
+            .tools = &tools,
+            .timeout_secs = 30,
+            .reasoning_effort = "medium",
+        },
+        "gpt-5.4",
+        0.2,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"function_call_output\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "call_123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_output_tokens\":512") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"medium\"}") != null);
+}
+
+test "buildResponsesRequestBody includes image parts with responses schema" {
+    const parts = [_]root.ContentPart{
+        root.makeTextPart("describe this"),
+        root.makeImageUrlPart("https://example.com/cat.png"),
+        root.makeBase64ImagePart("Zm9v", "image/png"),
+    };
+    const messages = [_]root.ChatMessage{.{
+        .role = .user,
+        .content = "describe this",
+        .content_parts = &parts,
+    }};
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        .{
+            .messages = &messages,
+            .model = "gpt-4.1",
+            .temperature = 0.7,
+            .timeout_secs = 0,
+        },
+        "gpt-4.1",
+        0.7,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input_image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"image_url\":\"https://example.com/cat.png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"detail\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"image_url\":\"data:image/png;base64,Zm9v\"") != null);
+}
+
+test "parseResponsesResponse extracts function call text and reasoning summary" {
+    const body =
+        \\{"model":"gpt-5.4","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Need tool"}]},{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking summary"}]},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseResponsesResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |text| std.testing.allocator.free(text);
+        for (result.tool_calls) |tc| {
+            std.testing.allocator.free(tc.id);
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |text| std.testing.allocator.free(text);
+    }
+
+    try std.testing.expectEqualStrings("Need tool", result.content.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", result.tool_calls[0].arguments);
+    try std.testing.expectEqual(@as(u32, 10), result.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 5), result.usage.completion_tokens);
+    try std.testing.expectEqual(@as(u32, 15), result.usage.total_tokens);
+    try std.testing.expectEqualStrings("gpt-5.4", result.model);
+    try std.testing.expectEqualStrings("thinking summary", result.reasoning_content.?);
+}
+
+test "parseResponsesResponse maps generic error envelope" {
+    const body =
+        \\{"error":{"message":"An error occurred while processing your request."}}
+    ;
+    try std.testing.expectError(error.ApiError, OpenAiCompatibleProvider.parseResponsesResponse(std.testing.allocator, body));
 }
 
 test "AuthStyle custom headerName fallback" {

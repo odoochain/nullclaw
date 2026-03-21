@@ -1320,13 +1320,14 @@ pub const SessionManager = struct {
             break :blk owned_api_key;
         };
 
-        var holder = providers.ProviderHolder.fromConfig(
+        var holder = providers.ProviderHolder.fromConfigWithApiMode(
             self.allocator,
             profile.provider,
             provider_api_key,
             self.config.getProviderBaseUrl(profile.provider),
             self.config.getProviderNativeTools(profile.provider),
             self.config.getProviderUserAgent(profile.provider),
+            self.config.getProviderApiMode(profile.provider),
             self.config.getProviderMaxStreamingPromptBytes(profile.provider),
         );
         return .{

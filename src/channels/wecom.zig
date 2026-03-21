@@ -1,6 +1,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const tencent_crypto = @import("../security/tencent_crypto.zig");
 
 const log = std.log.scoped(.wecom);
 
@@ -202,27 +203,7 @@ pub fn verifySignature(
     encrypted: []const u8,
     msg_signature: []const u8,
 ) bool {
-    var parts = [4][]const u8{ token, timestamp, nonce, encrypted };
-
-    // Small fixed-size lexical sort for WeCom signature inputs.
-    var i: usize = 0;
-    while (i < parts.len) : (i += 1) {
-        var j: usize = i + 1;
-        while (j < parts.len) : (j += 1) {
-            if (std.mem.lessThan(u8, parts[j], parts[i])) {
-                const tmp = parts[i];
-                parts[i] = parts[j];
-                parts[j] = tmp;
-            }
-        }
-    }
-
-    var sha1 = std.crypto.hash.Sha1.init(.{});
-    for (parts) |p| sha1.update(p);
-    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
-    sha1.final(&digest);
-    const expected_hex = std.fmt.bytesToHex(digest, .lower);
-
+    const expected_hex = tencent_crypto.wechatMessageSha1Signature(token, timestamp, nonce, encrypted);
     return std.ascii.eqlIgnoreCase(msg_signature, expected_hex[0..]);
 }
 
@@ -232,7 +213,9 @@ pub fn decryptSecurePayload(
     encrypted_b64: []const u8,
     expected_receive_id: ?[]const u8,
 ) ![]u8 {
-    const key = try decodeEncodingAesKey(encoding_aes_key);
+    const key = tencent_crypto.decodeEncodingAesKey(encoding_aes_key) catch {
+        return error.InvalidWeComEncodingAesKey;
+    };
 
     const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encrypted_b64) catch return error.InvalidWeComEncryptedPayload;
     const cipher = try allocator.alloc(u8, decoded_len);
@@ -241,9 +224,14 @@ pub fn decryptSecurePayload(
 
     const plain_with_pad = try allocator.dupe(u8, cipher);
     defer allocator.free(plain_with_pad);
-    try aes256CbcDecryptInPlace(plain_with_pad, key, key[0..16].*);
+    tencent_crypto.aes256CbcDecryptInPlace(plain_with_pad, key, key[0..16].*) catch {
+        return error.InvalidWeComEncryptedPayload;
+    };
 
-    const plain = try pkcs7UnpadLenient32(plain_with_pad);
+    const plain = tencent_crypto.pkcs7Unpad(
+        plain_with_pad,
+        tencent_crypto.WECHAT_PKCS7_BLOCK,
+    ) catch return error.InvalidWeComEncryptedPayload;
     if (plain.len < 20) return error.InvalidWeComEncryptedPayload;
 
     const msg_len = (@as(u32, plain[16]) << 24) |
@@ -263,56 +251,6 @@ pub fn decryptSecurePayload(
     }
 
     return allocator.dupe(u8, plain[msg_start..msg_end]);
-}
-
-fn decodeEncodingAesKey(encoding_aes_key: []const u8) ![32]u8 {
-    if (encoding_aes_key.len != 43) return error.InvalidWeComEncodingAesKey;
-
-    var with_padding: [44]u8 = undefined;
-    @memcpy(with_padding[0..43], encoding_aes_key);
-    with_padding[43] = '=';
-
-    var decoded: [32]u8 = undefined;
-    _ = std.base64.standard.Decoder.decode(&decoded, &with_padding) catch return error.InvalidWeComEncodingAesKey;
-    return decoded;
-}
-
-fn aes256CbcDecryptInPlace(buf: []u8, key: [32]u8, iv: [16]u8) !void {
-    if (buf.len == 0 or (buf.len % 16) != 0) return error.InvalidWeComEncryptedPayload;
-
-    const Aes256 = std.crypto.core.aes.Aes256;
-    const dec = Aes256.initDec(key);
-
-    var prev = iv;
-    var offset: usize = 0;
-    while (offset < buf.len) : (offset += 16) {
-        var src_block: [16]u8 = undefined;
-        @memcpy(src_block[0..], buf[offset .. offset + 16]);
-
-        var dst_block: [16]u8 = undefined;
-        dec.decrypt(&dst_block, &src_block);
-
-        var i: usize = 0;
-        while (i < 16) : (i += 1) {
-            dst_block[i] ^= prev[i];
-        }
-
-        @memcpy(buf[offset .. offset + 16], dst_block[0..]);
-        prev = src_block;
-    }
-}
-
-fn pkcs7UnpadLenient32(buf: []const u8) ![]const u8 {
-    if (buf.len == 0) return error.InvalidWeComEncryptedPayload;
-    const pad = buf[buf.len - 1];
-    if (pad == 0 or pad > 32) return error.InvalidWeComEncryptedPayload;
-    if (pad > buf.len) return error.InvalidWeComEncryptedPayload;
-
-    var i: usize = 0;
-    while (i < pad) : (i += 1) {
-        if (buf[buf.len - 1 - i] != pad) return error.InvalidWeComEncryptedPayload;
-    }
-    return buf[0 .. buf.len - pad];
 }
 
 pub fn parseIncomingPayload(allocator: std.mem.Allocator, payload: []const u8) !?ParsedWeComMessage {

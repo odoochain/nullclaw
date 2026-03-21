@@ -27,6 +27,7 @@ const subagent_runner = @import("subagent_runner.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
+const tencent_crypto = @import("security/tencent_crypto.zig");
 const root_mod = @import("root.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
@@ -5880,13 +5881,9 @@ fn testEncodeWeChatSecurePayload(
     app_id: []const u8,
     plain_xml: []const u8,
 ) ![]u8 {
-    if (encoding_aes_key.len != 43) return error.InvalidWeChatEncodingAesKey;
-
-    var key_padded: [44]u8 = undefined;
-    @memcpy(key_padded[0..43], encoding_aes_key);
-    key_padded[43] = '=';
-    var key: [32]u8 = undefined;
-    _ = std.base64.standard.Decoder.decode(&key, &key_padded) catch return error.InvalidWeChatEncodingAesKey;
+    const key = tencent_crypto.decodeEncodingAesKey(encoding_aes_key) catch {
+        return error.InvalidWeChatEncodingAesKey;
+    };
 
     var plain: std.ArrayListUnmanaged(u8) = .empty;
     defer plain.deinit(allocator);
@@ -5900,68 +5897,22 @@ fn testEncodeWeChatSecurePayload(
     try plain.appendSlice(allocator, plain_xml);
     try plain.appendSlice(allocator, app_id);
 
-    const block_size: usize = 32;
-    const rem = plain.items.len % block_size;
-    const pad_len: usize = if (rem == 0) block_size else (block_size - rem);
-    var i: usize = 0;
-    while (i < pad_len) : (i += 1) {
-        try plain.append(allocator, @as(u8, @intCast(pad_len)));
-    }
-
-    const cipher = try allocator.dupe(u8, plain.items);
-    errdefer allocator.free(cipher);
-
-    const Aes256 = std.crypto.core.aes.Aes256;
-    const enc = Aes256.initEnc(key);
-    var prev = key[0..16].*;
-    var offset: usize = 0;
-    while (offset < cipher.len) : (offset += 16) {
-        var block: [16]u8 = undefined;
-        @memcpy(block[0..], cipher[offset .. offset + 16]);
-        var j: usize = 0;
-        while (j < 16) : (j += 1) {
-            block[j] ^= prev[j];
-        }
-        var out_block: [16]u8 = undefined;
-        enc.encrypt(&out_block, &block);
-        @memcpy(cipher[offset .. offset + 16], out_block[0..]);
-        prev = out_block;
-    }
+    const cipher = tencent_crypto.aesCbcEncrypt(
+        allocator,
+        key,
+        key[0..16].*,
+        plain.items,
+        tencent_crypto.WECHAT_PKCS7_BLOCK,
+    ) catch |err| switch (err) {
+        error.InvalidBlockSize => unreachable,
+        else => return err,
+    };
+    defer allocator.free(cipher);
 
     const encoded_len = std.base64.standard.Encoder.calcSize(cipher.len);
     const encoded = try allocator.alloc(u8, encoded_len);
     _ = std.base64.standard.Encoder.encode(encoded, cipher);
-    allocator.free(cipher);
     return encoded;
-}
-
-fn testWeChatMsgSignature(
-    allocator: std.mem.Allocator,
-    token: []const u8,
-    timestamp: []const u8,
-    nonce: []const u8,
-    encrypted: []const u8,
-) ![]u8 {
-    var parts = [4][]const u8{ token, timestamp, nonce, encrypted };
-
-    var i: usize = 0;
-    while (i < parts.len) : (i += 1) {
-        var j: usize = i + 1;
-        while (j < parts.len) : (j += 1) {
-            if (std.mem.lessThan(u8, parts[j], parts[i])) {
-                const tmp = parts[i];
-                parts[i] = parts[j];
-                parts[j] = tmp;
-            }
-        }
-    }
-
-    var sha1 = std.crypto.hash.Sha1.init(.{});
-    for (parts) |p| sha1.update(p);
-    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
-    sha1.final(&digest);
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    return allocator.dupe(u8, hex[0..]);
 }
 
 test "handleWeChatWebhookRoute accepts secure encrypted callback" {
@@ -5987,8 +5938,7 @@ test "handleWeChatWebhookRoute accepts secure encrypted callback" {
 
     const encrypted = try testEncodeWeChatSecurePayload(std.testing.allocator, encoding_aes_key, app_id, plain_xml);
     defer std.testing.allocator.free(encrypted);
-    const msg_sig = try testWeChatMsgSignature(std.testing.allocator, token, timestamp, nonce, encrypted);
-    defer std.testing.allocator.free(msg_sig);
+    const msg_sig = tencent_crypto.wechatMessageSha1Signature(token, timestamp, nonce, encrypted);
 
     const secure_body = try std.fmt.allocPrint(
         std.testing.allocator,

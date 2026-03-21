@@ -1,14 +1,4 @@
-//! Tencent platform cryptographic primitives.
-//!
-//! Provides three focused utilities required for WeChat/WeChat Work and
-//! Tencent Cloud (Hunyuan) integration:
-//!
-//!  - AES-256-CBC + PKCS#7  — WeChat enterprise message encryption (企业号消息加密方案)
-//!  - wechatSha1Signature    — WeChat URL-verification signature (SHA-1 of sorted strings)
-//!  - tc3Sign                — Tencent Cloud TC3-HMAC-SHA256 request signing (Hunyuan, etc.)
-//!
-//! All functions are allocation-free where the output size is statically known.
-//! AES functions allocate because ciphertext/plaintext lengths are runtime values.
+//! Tencent platform cryptographic helpers shared by WeChat, WeCom, and Tencent Cloud.
 
 const std = @import("std");
 const Aes256 = std.crypto.core.aes.Aes256;
@@ -18,12 +8,23 @@ const Sha1 = std.crypto.hash.Sha1;
 /// AES block size in bytes.
 pub const AES_BLOCK: usize = 16;
 
-// ── PKCS#7 ──────────────────────────────────────────────────────────────────
+/// WeChat and WeCom secure callbacks use PKCS#7 padding up to 32 bytes.
+pub const WECHAT_PKCS7_BLOCK: u8 = 32;
 
-/// Apply PKCS#7 padding so the result length is a multiple of 16.
+/// Tencent EncodingAESKey values are 43 base64 characters without trailing '='.
+pub const ENCODING_AES_KEY_LEN: usize = 43;
+
+/// Apply PKCS#7 padding so the result length is a multiple of `block_multiple`.
 /// Allocates; caller must free.
-pub fn pkcs7Pad(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    const pad_len: u8 = @intCast(AES_BLOCK - (data.len % AES_BLOCK));
+pub fn pkcs7Pad(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    block_multiple: u8,
+) ![]u8 {
+    if (block_multiple == 0) return error.InvalidBlockSize;
+
+    const rem = data.len % block_multiple;
+    const pad_len: u8 = @intCast(if (rem == 0) block_multiple else (block_multiple - rem));
     const out = try allocator.alloc(u8, data.len + pad_len);
     @memcpy(out[0..data.len], data);
     @memset(out[data.len..], pad_len);
@@ -31,17 +32,15 @@ pub fn pkcs7Pad(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 /// Validate and strip PKCS#7 padding. Returns a sub-slice of `data` (no allocation).
-pub fn pkcs7Unpad(data: []const u8) ![]const u8 {
+pub fn pkcs7Unpad(data: []const u8, max_pad: u8) ![]const u8 {
     if (data.len == 0 or data.len % AES_BLOCK != 0) return error.InvalidPadding;
     const pad_len = data[data.len - 1];
-    if (pad_len == 0 or pad_len > AES_BLOCK) return error.InvalidPadding;
+    if (pad_len == 0 or pad_len > max_pad or pad_len > data.len) return error.InvalidPadding;
     for (data[data.len - pad_len ..]) |b| {
         if (b != pad_len) return error.InvalidPadding;
     }
     return data[0 .. data.len - pad_len];
 }
-
-// ── AES-256-CBC ──────────────────────────────────────────────────────────────
 
 /// AES-256-CBC encrypt with PKCS#7 padding.
 /// Returns heap-allocated ciphertext. Caller must free.
@@ -50,22 +49,56 @@ pub fn aesCbcEncrypt(
     key: [32]u8,
     iv: [16]u8,
     plaintext: []const u8,
+    padding_block: u8,
 ) ![]u8 {
-    const padded = try pkcs7Pad(allocator, plaintext);
+    const padded = try pkcs7Pad(allocator, plaintext, padding_block);
     defer allocator.free(padded);
 
     const out = try allocator.alloc(u8, padded.len);
-    const ctx = Aes256.initEnc(key);
-    var prev: [AES_BLOCK]u8 = iv;
+    const enc = Aes256.initEnc(key);
+    var prev = iv;
 
-    var i: usize = 0;
-    while (i < padded.len) : (i += AES_BLOCK) {
-        var block: [AES_BLOCK]u8 = padded[i..][0..AES_BLOCK].*;
-        for (&block, prev) |*b, p| b.* ^= p;
-        ctx.encrypt(out[i..][0..AES_BLOCK], &block);
-        prev = out[i..][0..AES_BLOCK].*;
+    var offset: usize = 0;
+    while (offset < padded.len) : (offset += AES_BLOCK) {
+        var block: [AES_BLOCK]u8 = undefined;
+        @memcpy(block[0..], padded[offset .. offset + AES_BLOCK]);
+
+        var i: usize = 0;
+        while (i < AES_BLOCK) : (i += 1) {
+            block[i] ^= prev[i];
+        }
+
+        var out_block: [AES_BLOCK]u8 = undefined;
+        enc.encrypt(&out_block, &block);
+        @memcpy(out[offset .. offset + AES_BLOCK], out_block[0..]);
+        prev = out_block;
     }
+
     return out;
+}
+
+/// AES-256-CBC decrypt in place.
+pub fn aes256CbcDecryptInPlace(buf: []u8, key: [32]u8, iv: [16]u8) !void {
+    if (buf.len == 0 or (buf.len % AES_BLOCK) != 0) return error.InvalidCiphertext;
+
+    const dec = Aes256.initDec(key);
+    var prev = iv;
+    var offset: usize = 0;
+    while (offset < buf.len) : (offset += AES_BLOCK) {
+        var src_block: [AES_BLOCK]u8 = undefined;
+        @memcpy(src_block[0..], buf[offset .. offset + AES_BLOCK]);
+
+        var dst_block: [AES_BLOCK]u8 = undefined;
+        dec.decrypt(&dst_block, &src_block);
+
+        var i: usize = 0;
+        while (i < AES_BLOCK) : (i += 1) {
+            dst_block[i] ^= prev[i];
+        }
+
+        @memcpy(buf[offset .. offset + AES_BLOCK], dst_block[0..]);
+        prev = src_block;
+    }
 }
 
 /// AES-256-CBC decrypt with PKCS#7 unpadding.
@@ -75,85 +108,94 @@ pub fn aesCbcDecrypt(
     key: [32]u8,
     iv: [16]u8,
     ciphertext: []const u8,
+    max_pad: u8,
 ) ![]u8 {
-    if (ciphertext.len == 0 or ciphertext.len % AES_BLOCK != 0)
-        return error.InvalidCiphertext;
-
-    var buf = try allocator.alloc(u8, ciphertext.len);
+    const buf = try allocator.dupe(u8, ciphertext);
     defer allocator.free(buf);
 
-    const ctx = Aes256.initDec(key);
-    var prev: [AES_BLOCK]u8 = iv;
-
-    var i: usize = 0;
-    while (i < ciphertext.len) : (i += AES_BLOCK) {
-        const block: [AES_BLOCK]u8 = ciphertext[i..][0..AES_BLOCK].*;
-        ctx.decrypt(buf[i..][0..AES_BLOCK], &block);
-        for (buf[i..][0..AES_BLOCK], prev) |*b, p| b.* ^= p;
-        prev = block;
-    }
-
-    const unpadded = try pkcs7Unpad(buf);
+    try aes256CbcDecryptInPlace(buf, key, iv);
+    const unpadded = try pkcs7Unpad(buf, max_pad);
     return try allocator.dupe(u8, unpadded);
 }
 
-// ── WeChat URL verification ──────────────────────────────────────────────────
+/// Decode a Tencent EncodingAESKey (43 chars, base64 without trailing '=').
+pub fn decodeEncodingAesKey(encoding_aes_key: []const u8) ![32]u8 {
+    if (encoding_aes_key.len != ENCODING_AES_KEY_LEN) return error.InvalidEncodingAesKey;
 
-/// WeChat URL-verification signature.
-///
-/// Algorithm: SHA-1(sort(token, timestamp, nonce)) — all three strings are
-/// sorted lexicographically, concatenated without separator, then SHA-1 hashed.
-///
-/// Returns lowercase hex (40 chars) on the stack — no allocation.
+    var with_padding: [ENCODING_AES_KEY_LEN + 1]u8 = undefined;
+    @memcpy(with_padding[0..ENCODING_AES_KEY_LEN], encoding_aes_key);
+    with_padding[ENCODING_AES_KEY_LEN] = '=';
+
+    var decoded: [32]u8 = undefined;
+    _ = std.base64.standard.Decoder.decode(&decoded, &with_padding) catch return error.InvalidEncodingAesKey;
+    return decoded;
+}
+
+/// SHA-1(sort(token, timestamp, nonce)) as lowercase hex.
 pub fn wechatSha1Signature(
     token: []const u8,
     timestamp: []const u8,
     nonce: []const u8,
 ) [40]u8 {
-    var strs = [3][]const u8{ token, timestamp, nonce };
-    std.mem.sort([]const u8, &strs, {}, strLessThan);
+    var parts = [_][]const u8{ token, timestamp, nonce };
+    return sortedSha1Hex(parts[0..]);
+}
 
-    var h = Sha1.init(.{});
-    for (strs) |s| h.update(s);
+/// SHA-1(sort(token, timestamp, nonce, encrypted)) as lowercase hex.
+pub fn wechatMessageSha1Signature(
+    token: []const u8,
+    timestamp: []const u8,
+    nonce: []const u8,
+    encrypted: []const u8,
+) [40]u8 {
+    var parts = [_][]const u8{ token, timestamp, nonce, encrypted };
+    return sortedSha1Hex(parts[0..]);
+}
+
+fn sortedSha1Hex(parts: [][]const u8) [40]u8 {
+    sortLexParts(parts);
+
+    var sha1 = Sha1.init(.{});
+    for (parts) |part| sha1.update(part);
+
     var digest: [Sha1.digest_length]u8 = undefined;
-    h.final(&digest);
+    sha1.final(&digest);
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-fn strLessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
+fn sortLexParts(parts: [][]const u8) void {
+    var i: usize = 0;
+    while (i < parts.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < parts.len) : (j += 1) {
+            if (std.mem.lessThan(u8, parts[j], parts[i])) {
+                const tmp = parts[i];
+                parts[i] = parts[j];
+                parts[j] = tmp;
+            }
+        }
+    }
 }
-
-// ── TC3-HMAC-SHA256 ──────────────────────────────────────────────────────────
 
 /// Tencent Cloud TC3-HMAC-SHA256 signing algorithm.
 ///
-/// Used by Hunyuan and other Tencent Cloud APIs. Identical structure to AWS SigV4:
-///
+/// Signature = Hex(HMAC-SHA256(SecretSigning, StringToSign))
+/// where:
 ///   SecretDate    = HMAC-SHA256("TC3" + secret_key, date)
 ///   SecretService = HMAC-SHA256(SecretDate, service)
 ///   SecretSigning = HMAC-SHA256(SecretService, "tc3_request")
-///   Signature     = Hex(HMAC-SHA256(SecretSigning, string_to_sign))
-///
-/// Parameters:
-///   secret_key     — bare Tencent Cloud SecretKey (max 220 bytes)
-///   date           — UTC date "YYYY-MM-DD"
-///   service        — Tencent Cloud service name, e.g. "hunyuan"
-///   string_to_sign — pre-built canonical string (caller constructs per API spec)
-///
-/// Returns lowercase hex signature (64 chars) on the stack — no allocation.
 pub fn tc3Sign(
     secret_key: []const u8,
     date: []const u8,
     service: []const u8,
     string_to_sign: []const u8,
 ) error{KeyTooLong}![64]u8 {
-    // Build "TC3{secret_key}" in a stack buffer.
-    var kbuf: [224]u8 = undefined;
-    if (3 + secret_key.len > kbuf.len) return error.KeyTooLong;
-    @memcpy(kbuf[0..3], "TC3");
-    @memcpy(kbuf[3..][0..secret_key.len], secret_key);
-    const tc3_key = kbuf[0 .. 3 + secret_key.len];
+    var key_buf: [224]u8 = undefined;
+    if (3 + secret_key.len > key_buf.len) return error.KeyTooLong;
+
+    @memcpy(key_buf[0..3], "TC3");
+    @memcpy(key_buf[3..][0..secret_key.len], secret_key);
+    const tc3_key = key_buf[0 .. 3 + secret_key.len];
 
     var secret_date: [HmacSha256.mac_length]u8 = undefined;
     HmacSha256.create(&secret_date, date, tc3_key);
@@ -170,146 +212,115 @@ pub fn tc3Sign(
     return std.fmt.bytesToHex(signature, .lower);
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
-test "pkcs7Pad adds correct padding" {
-    // 3 bytes → pad to 16 (pad_len = 13 = 0x0D)
-    const padded = try pkcs7Pad(std.testing.allocator, "abc");
+test "pkcs7Pad respects requested block multiple" {
+    const padded = try pkcs7Pad(std.testing.allocator, "abc", WECHAT_PKCS7_BLOCK);
     defer std.testing.allocator.free(padded);
-    try std.testing.expectEqual(@as(usize, 16), padded.len);
-    for (padded[3..]) |b| try std.testing.expectEqual(@as(u8, 13), b);
-}
 
-test "pkcs7Pad on block boundary adds full padding block" {
-    // 16 bytes → pad to 32 (pad_len = 16 = 0x10)
-    const padded = try pkcs7Pad(std.testing.allocator, "1234567890123456");
-    defer std.testing.allocator.free(padded);
     try std.testing.expectEqual(@as(usize, 32), padded.len);
-    for (padded[16..]) |b| try std.testing.expectEqual(@as(u8, 16), b);
+    for (padded[3..]) |b| try std.testing.expectEqual(@as(u8, 29), b);
 }
 
-test "pkcs7Unpad strips padding correctly" {
-    // 3 bytes of data + 13 bytes of value 13 (correct PKCS#7 for a 16-byte block)
-    var buf = [_]u8{ 'a', 'b', 'c' } ++ [_]u8{13} ** 13;
-    const result = try pkcs7Unpad(&buf);
+test "pkcs7Pad on block boundary adds a full block" {
+    const padded = try pkcs7Pad(std.testing.allocator, "12345678901234567890123456789012", WECHAT_PKCS7_BLOCK);
+    defer std.testing.allocator.free(padded);
+
+    try std.testing.expectEqual(@as(usize, 64), padded.len);
+    for (padded[32..]) |b| try std.testing.expectEqual(WECHAT_PKCS7_BLOCK, b);
+}
+
+test "pkcs7Unpad strips valid 32-byte padding" {
+    var buf = [_]u8{ 'a', 'b', 'c' } ++ [_]u8{29} ** 29;
+    const result = try pkcs7Unpad(&buf, WECHAT_PKCS7_BLOCK);
     try std.testing.expectEqualStrings("abc", result);
 }
 
-test "pkcs7Unpad rejects invalid padding byte" {
-    // Last byte says pad_len=4, but third-from-last byte is 3 — mismatch → invalid.
-    var buf = [_]u8{0} ** 11 ++ [_]u8{ 4, 4, 3, 4 };
-    try std.testing.expectError(error.InvalidPadding, pkcs7Unpad(&buf));
+test "pkcs7Unpad rejects padding longer than configured maximum" {
+    var buf = [_]u8{0} ** 16 ++ [_]u8{17} ** 16;
+    try std.testing.expectError(error.InvalidPadding, pkcs7Unpad(&buf, 16));
 }
 
-test "pkcs7Unpad rejects zero padding byte" {
-    var buf = [_]u8{'a'} ++ [_]u8{0} ** 15;
-    try std.testing.expectError(error.InvalidPadding, pkcs7Unpad(&buf));
+test "decodeEncodingAesKey decodes 43-char base64 key" {
+    var raw: [32]u8 = undefined;
+    for (&raw, 0..) |*byte, idx| byte.* = @as(u8, @intCast(idx));
+
+    var encoded: [44]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&encoded, &raw);
+
+    const decoded = try decodeEncodingAesKey(encoded[0..43]);
+    try std.testing.expectEqualSlices(u8, &raw, &decoded);
 }
 
-test "aesCbcEncrypt decrypt roundtrip" {
+test "aesCbcEncrypt decrypt roundtrip with WeChat padding" {
     const key = [_]u8{0x2b} ** 32;
     const iv = [_]u8{0x00} ** 16;
-    const plaintext = "WeChat message body — hello 你好";
+    const plaintext = "wechat secure callback payload";
 
-    const ct = try aesCbcEncrypt(std.testing.allocator, key, iv, plaintext);
-    defer std.testing.allocator.free(ct);
+    const ciphertext = try aesCbcEncrypt(
+        std.testing.allocator,
+        key,
+        iv,
+        plaintext,
+        WECHAT_PKCS7_BLOCK,
+    );
+    defer std.testing.allocator.free(ciphertext);
 
-    const pt = try aesCbcDecrypt(std.testing.allocator, key, iv, ct);
-    defer std.testing.allocator.free(pt);
+    const decrypted = try aesCbcDecrypt(
+        std.testing.allocator,
+        key,
+        iv,
+        ciphertext,
+        WECHAT_PKCS7_BLOCK,
+    );
+    defer std.testing.allocator.free(decrypted);
 
-    try std.testing.expectEqualStrings(plaintext, pt);
+    try std.testing.expectEqualStrings(plaintext, decrypted);
 }
 
-test "aesCbcEncrypt output length is multiple of 16" {
-    const key = [_]u8{0x01} ** 32;
-    const iv = [_]u8{0x00} ** 16;
-
-    const ct = try aesCbcEncrypt(std.testing.allocator, key, iv, "hello");
-    defer std.testing.allocator.free(ct);
-
-    try std.testing.expect(ct.len % AES_BLOCK == 0);
-}
-
-test "aesCbcEncrypt different IVs produce different ciphertext" {
-    const key = [_]u8{0x42} ** 32;
-    const iv1 = [_]u8{0x01} ** 16;
-    const iv2 = [_]u8{0x02} ** 16;
-
-    const ct1 = try aesCbcEncrypt(std.testing.allocator, key, iv1, "same plaintext");
-    defer std.testing.allocator.free(ct1);
-    const ct2 = try aesCbcEncrypt(std.testing.allocator, key, iv2, "same plaintext");
-    defer std.testing.allocator.free(ct2);
-
-    try std.testing.expect(!std.mem.eql(u8, ct1, ct2));
-}
-
-test "aesCbcDecrypt rejects non-block-aligned ciphertext" {
-    const key = [_]u8{0x01} ** 32;
-    const iv = [_]u8{0x00} ** 16;
+test "aes256CbcDecryptInPlace rejects non-block-aligned ciphertext" {
+    var buf = [_]u8{0} ** 15;
     try std.testing.expectError(
         error.InvalidCiphertext,
-        aesCbcDecrypt(std.testing.allocator, key, iv, "not aligned"),
+        aes256CbcDecryptInPlace(&buf, [_]u8{0} ** 32, [_]u8{0} ** 16),
     );
 }
 
 test "wechatSha1Signature is deterministic" {
-    const s1 = wechatSha1Signature("mytoken", "1234567890", "abc123");
-    const s2 = wechatSha1Signature("mytoken", "1234567890", "abc123");
-    try std.testing.expectEqualSlices(u8, &s1, &s2);
+    const sig1 = wechatSha1Signature("mytoken", "1234567890", "abc123");
+    const sig2 = wechatSha1Signature("mytoken", "1234567890", "abc123");
+    try std.testing.expectEqualSlices(u8, &sig1, &sig2);
 }
 
-test "wechatSha1Signature is order-independent" {
-    // Permuting the three arguments must not change the result (sort normalises order).
-    const s1 = wechatSha1Signature("token", "stamp", "nonce");
-    const s2 = wechatSha1Signature("nonce", "token", "stamp");
-    const s3 = wechatSha1Signature("stamp", "nonce", "token");
-    try std.testing.expectEqualSlices(u8, &s1, &s2);
-    try std.testing.expectEqualSlices(u8, &s1, &s3);
+test "wechatMessageSha1Signature matches official WeCom example" {
+    const encrypted =
+        "RypEvHKD8QQKFhvQ6QleEB4J58tiPdvo+rtK1I9qca6aM/wvqnLSV5zEPeusUiX5" ++
+        "L5X/0lWfrf0QADHHhGd3QczcdCUpj911L3vg3W/sYYvuJTs3TUUkSUXxaccAS0qh" ++
+        "xchrRYt66wiSpGLYL42aM6A8dTT+6k4aSknmPj48kzJs8qLjvd4Xgpue06DOdnLx" ++
+        "AUHzM6+kDZ+HMZfJYuR+LtwGc2hgf5gsijff0ekUNXZiqATP7PF5mZxZ3Izoun1s" ++
+        "4zG4LUMnvw2r+KqCKIw+3IQH03v+BCA9nMELNqbSf6tiWSrXJB3LAVGUcallcrw8" ++
+        "V2t9EL4EhzJWrQUax5wLVMNS0+rUPA3k22Ncx4XXZS9o0MBH27Bo6BpNelZpS+/u" ++
+        "h9KsNlY6bHCmJU9p8g7m3fVKn28H3KDYA5Pl/T8Z1ptDAVe0lXdQ2YoyyH2uyPIGH" ++
+        "BZZIs2pDBS8R07+qN+E7Q==";
+
+    const sig = wechatMessageSha1Signature("QDG6eK", "1409659813", "1372623149", encrypted);
+    try std.testing.expectEqualStrings("477715d11cdb4164915debcba66cb864d751f3e6", sig[0..]);
 }
 
-test "wechatSha1Signature changes when input changes" {
-    const s1 = wechatSha1Signature("token", "1234567890", "nonce");
-    const s2 = wechatSha1Signature("token", "9999999999", "nonce");
-    try std.testing.expect(!std.mem.eql(u8, &s1, &s2));
-}
+test "tc3Sign matches official Tencent Cloud example" {
+    const string_to_sign =
+        "TC3-HMAC-SHA256\n" ++
+        "1551113065\n" ++
+        "2019-02-25/cvm/tc3_request\n" ++
+        "5ffe6a04c0664d6b969fab9a13bdab201d63ee709638e2749d62a09ca18d7031";
 
-test "wechatSha1Signature output is 40 hex chars" {
-    const sig = wechatSha1Signature("t", "ts", "n");
-    try std.testing.expectEqual(@as(usize, 40), sig.len);
-    for (sig) |c| try std.testing.expect(
-        (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'),
+    const signature = try tc3Sign(
+        "Gu5t9xGARNpq86cd98joQYCN3EXAMPLE",
+        "2019-02-25",
+        "cvm",
+        string_to_sign,
     );
-}
-
-test "tc3Sign is deterministic" {
-    const s1 = try tc3Sign("mysecret", "2026-03-16", "hunyuan", "string_to_sign");
-    const s2 = try tc3Sign("mysecret", "2026-03-16", "hunyuan", "string_to_sign");
-    try std.testing.expectEqualSlices(u8, &s1, &s2);
-}
-
-test "tc3Sign changes with different secret key" {
-    const s1 = try tc3Sign("key-a", "2026-03-16", "hunyuan", "payload");
-    const s2 = try tc3Sign("key-b", "2026-03-16", "hunyuan", "payload");
-    try std.testing.expect(!std.mem.eql(u8, &s1, &s2));
-}
-
-test "tc3Sign changes with different date" {
-    const s1 = try tc3Sign("key", "2026-03-16", "hunyuan", "payload");
-    const s2 = try tc3Sign("key", "2026-03-17", "hunyuan", "payload");
-    try std.testing.expect(!std.mem.eql(u8, &s1, &s2));
-}
-
-test "tc3Sign changes with different service" {
-    const s1 = try tc3Sign("key", "2026-03-16", "hunyuan", "payload");
-    const s2 = try tc3Sign("key", "2026-03-16", "cos", "payload");
-    try std.testing.expect(!std.mem.eql(u8, &s1, &s2));
-}
-
-test "tc3Sign output is 64 hex chars" {
-    const sig = try tc3Sign("k", "2026-03-16", "hunyuan", "s");
-    try std.testing.expectEqual(@as(usize, 64), sig.len);
-    for (sig) |c| try std.testing.expect(
-        (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'),
+    try std.testing.expectEqualStrings(
+        "72e494ea809ad7a8c8f7a4507b9bddcbaa8e581f516e8da2f66e2c5a96525168",
+        signature[0..],
     );
 }
 

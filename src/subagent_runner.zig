@@ -60,6 +60,7 @@ pub fn runTaskWithTools(
     const provider_user_agent = if (provider_entry) |entry| entry.user_agent else null;
     const provider_api_mode = if (provider_entry) |entry| entry.api_mode else .chat_completions;
     const provider_max_streaming_prompt_bytes = if (provider_entry) |entry| entry.max_streaming_prompt_bytes else null;
+    const provider_extra_body_params = if (provider_entry) |entry| entry.extra_body_params else null;
 
     var provider_holder = providers.ProviderHolder.fromConfigWithApiMode(
         allocator,
@@ -70,6 +71,7 @@ pub fn runTaskWithTools(
         provider_user_agent,
         provider_api_mode,
         provider_max_streaming_prompt_bytes,
+        provider_extra_body_params,
     );
     defer provider_holder.deinit();
 

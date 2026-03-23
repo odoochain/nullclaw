@@ -124,6 +124,7 @@ pub const DelegateTool = struct {
                 sys_prompt,
                 full_prompt,
                 ac.temperature orelse @as(f64, 0.7),
+                if (provider_entry) |entry| entry.extra_body_params else null,
             ) catch |err| {
                 const msg = std.fmt.allocPrint(
                     allocator,
@@ -187,7 +188,8 @@ pub const DelegateTool = struct {
         system_prompt: []const u8,
         prompt: []const u8,
         temperature: f64,
-    ) ![]const u8 {
+        extra_body_params: ?[]const u8,
+        ) ![]const u8 {
         if (builtin.is_test) {
             if (test_complete_agent_prompt_override) |override| {
                 return override(allocator, provider_name, api_key, base_url, native_tools, user_agent, api_mode, model, system_prompt, prompt, temperature);
@@ -208,8 +210,8 @@ pub const DelegateTool = struct {
             // If a named agent config with a provider entry is used the field
             // will be threaded through via the agent config resolution above.
             null,
-        );
-        defer provider_holder.deinit();
+            extra_body_params,
+        );        defer provider_holder.deinit();
         return provider_holder.provider().chatWithSystem(
             allocator,
             system_prompt,

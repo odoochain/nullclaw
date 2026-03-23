@@ -287,6 +287,15 @@ pub const Config = struct {
         return true;
     }
 
+    /// Look up extra body parameters for a provider.
+    /// Returns null if provider is not in the list or has no extra params.
+    pub fn getProviderExtraBodyParams(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.providers) |e| {
+            if (provider_names.providerNamesMatch(e.name, name)) return e.extra_body_params;
+        }
+        return null;
+    }
+
     fn isReservedRuntimeChannelName(runtime_name: []const u8) bool {
         inline for (std.meta.fields(config_types.ChannelsConfig)) |field| {
             if (std.mem.eql(u8, field.name, runtime_name)) return true;

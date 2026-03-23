@@ -15,6 +15,7 @@ const HolderPlan = struct {
     user_agent: ?[]const u8,
     api_mode: @import("../config_types.zig").ProviderEntry.ApiMode,
     max_streaming_prompt_bytes: ?usize,
+    extra_body_params: ?[]const u8,
 };
 
 fn trimOptionalKey(raw_key: ?[]const u8) ?[]const u8 {
@@ -66,6 +67,7 @@ fn appendHolderPlan(
         .user_agent = cfg.getProviderUserAgent(provider_name),
         .api_mode = cfg.getProviderApiMode(provider_name),
         .max_streaming_prompt_bytes = cfg.getProviderMaxStreamingPromptBytes(provider_name),
+        .extra_body_params = cfg.getProviderExtraBodyParams(provider_name),
     });
     return plans.items.len;
 }
@@ -120,6 +122,7 @@ pub const RuntimeProviderBundle = struct {
             cfg.getProviderUserAgent(cfg.default_provider),
             cfg.getProviderApiMode(cfg.default_provider),
             cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
+            cfg.getProviderExtraBodyParams(cfg.default_provider),
         );
 
         if (cfg.model_routes.len > 0) {
@@ -222,6 +225,7 @@ pub const RuntimeProviderBundle = struct {
                         plan.user_agent,
                         plan.api_mode,
                         plan.max_streaming_prompt_bytes,
+                        plan.extra_body_params,
                     );
                     bundle.router_holders_initialized = i + 1;
                 }
@@ -294,6 +298,7 @@ pub const RuntimeProviderBundle = struct {
                     cfg.getProviderUserAgent(provider_name),
                     cfg.getProviderApiMode(provider_name),
                     cfg.getProviderMaxStreamingPromptBytes(provider_name),
+                    cfg.getProviderExtraBodyParams(provider_name),
                 );
                 bundle.extra_holders_initialized = extra_i + 1;
                 bundle.reliable_entries.?[extra_i] = .{
@@ -322,6 +327,7 @@ pub const RuntimeProviderBundle = struct {
                         cfg.getProviderUserAgent(cfg.default_provider),
                         cfg.getProviderApiMode(cfg.default_provider),
                         cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
+                        cfg.getProviderExtraBodyParams(cfg.default_provider),
                     );
                     bundle.extra_holders_initialized = extra_i + 1;
                     bundle.reliable_entries.?[extra_i] = .{

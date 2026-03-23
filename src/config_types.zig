@@ -78,9 +78,10 @@ pub const ProviderEntry = struct {
     /// skipped and a non-streaming POST is used instead.
     /// null means no limit — streaming is always attempted (recommended for
     /// modern LLMs with large context windows).
-    /// When set, 0 forces the non-streaming path for every request and any
-    /// positive value applies that byte threshold. Example: 524288 for 512 KiB.
     max_streaming_prompt_bytes: ?usize = null,
+    /// Optional compact JSON string of additional key-value pairs to merge into
+    /// request bodies for OpenAI-compatible providers.
+    extra_body_params: ?[]const u8 = null,
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────

@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_util = @import("json_util.zig");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
 const secrets = @import("security/secrets.zig");
@@ -2258,6 +2259,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         if (val.object.get("max_streaming_prompt_bytes")) |mb| {
                             if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
+                        }
+                        if (val.object.get("extra_body_params")) |eb| {
+                            if (eb == .object) {
+                                pe.extra_body_params = try std.json.Stringify.valueAlloc(self.allocator, eb, .{});
+                            }
                         }
                         try prov_list.append(self.allocator, pe);
                     }

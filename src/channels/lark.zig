@@ -97,6 +97,9 @@ pub const LarkChannel = struct {
     cached_token: ?[]const u8 = null,
     /// Epoch seconds when cached_token expires.
     token_expires_at: i64 = 0,
+    reaction_emojis: []const []const u8 = &.{},
+    /// Pending reaction message_ids keyed by chat_id (for undo after response sent).
+    pending_reactions: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
     pub const LARK_BASE_URL = "https://open.larksuite.com/open-apis";
@@ -134,6 +137,7 @@ pub const LarkChannel = struct {
         ch.account_id = cfg.account_id;
         ch.receive_mode = cfg.receive_mode;
         ch.use_feishu = cfg.use_feishu;
+        ch.reaction_emojis = cfg.reaction_emojis;
         return ch;
     }
 
@@ -200,6 +204,7 @@ pub const LarkChannel = struct {
                 .content = try allocator.dupe(u8, text),
                 .timestamp = root.nowEpochSecs(),
                 .is_group = extractCardActionIsGroup(event, root_context),
+                .message_id = &.{},
             });
             return result.toOwnedSlice(allocator);
         } else {
@@ -279,11 +284,16 @@ pub const LarkChannel = struct {
             break :blk root.nowEpochSecs();
         };
 
+        // Extract message_id for reaction support
+        const msg_id_val = msg_obj.object.get("message_id");
+        const message_id = if (msg_id_val) |mid_val| (if (mid_val == .string) mid_val.string else "") else "";
+
         try result.append(allocator, .{
             .sender = try allocator.dupe(u8, chat_id),
             .content = try allocator.dupe(u8, text),
             .timestamp = timestamp,
             .is_group = std.mem.eql(u8, chat_type, "group"),
+            .message_id = if (message_id.len > 0) try allocator.dupe(u8, message_id) else &.{},
         });
 
         return result.toOwnedSlice(allocator);
@@ -823,6 +833,147 @@ pub const LarkChannel = struct {
         try self.postWithTokenRetry(url, body_fbs.getWritten());
     }
 
+    /// Add a reaction emoji to a message. Randomly picks from reaction_emojis config.
+    /// Stores the reaction for later undo (via deletePendingReaction).
+    fn reactToMessage(self: *LarkChannel, message_id: []const u8, chat_id: []const u8) !void {
+        if (message_id.len == 0) return;
+        if (self.reaction_emojis.len == 0) return;
+
+        const idx = if (self.reaction_emojis.len == 1) 0 else blk: {
+            const seed = @as(u64, @bitCast(std.time.timestamp()));
+            break :blk @as(usize, @intCast(@mod(seed, @as(u64, @intCast(self.reaction_emojis.len)))));
+        };
+        const emoji = self.reaction_emojis[idx];
+
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions", .{ self.apiBase(), message_id });
+
+        var body_buf: [256]u8 = undefined;
+        var body_fbs = std.io.fixedBufferStream(&body_buf);
+        try body_fbs.writer().writeAll("{\"reaction_type\":{\"emoji_type\":\"");
+        try body_fbs.writer().writeAll(emoji);
+        try body_fbs.writer().writeAll("\"}}");
+
+        const token = try self.getTenantAccessToken();
+        defer self.allocator.free(token);
+
+        var auth_buf: [512]u8 = undefined;
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
+
+        const resp = http_util.curlPostWithStatus(self.allocator, url_fbs.getWritten(), body_fbs.getWritten(), &.{auth_header}) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
+
+        if (!statusCodeIsSuccess(resp.status_code)) {
+            log.warn("lark reactToMessage failed: status={}", .{resp.status_code});
+            return error.LarkApiError;
+        }
+
+        if (chat_id.len > 0) {
+            try self.pending_reactions.put(self.allocator, try self.allocator.dupe(u8, chat_id), try self.allocator.dupe(u8, message_id));
+        }
+    }
+
+    /// Delete pending reaction for a chat (called after sending response).
+    fn deletePendingReaction(self: *LarkChannel, chat_id: []const u8) void {
+        const message_id = self.pending_reactions.get(chat_id) orelse return;
+        defer {
+            if (self.pending_reactions.fetchRemove(chat_id)) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value);
+            }
+        }
+        self.deleteReaction(message_id) catch |err| {
+            log.warn("lark deletePendingReaction failed: {}", .{err});
+        };
+    }
+
+    /// List reactions on a message and delete ones matching our configured emojis.
+    fn deleteReaction(self: *LarkChannel, message_id: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions", .{ self.apiBase(), message_id });
+
+        const token = try self.getTenantAccessToken();
+        defer self.allocator.free(token);
+
+        var auth_buf: [512]u8 = undefined;
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
+
+        const resp = http_util.curlGetWithStatus(self.allocator, url_fbs.getWritten(), &.{auth_header}) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
+
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp.body, .{}) catch return error.LarkApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        const data = parsed.value.object.get("data") orelse return;
+        if (data != .object) return;
+        const items = data.object.get("items") orelse return;
+        if (items != .array) return;
+
+        for (items.array.items) |item| {
+            if (item != .object) continue;
+            const reaction_type = item.object.get("reaction_type") orelse continue;
+            if (reaction_type != .object) continue;
+            const emoji_type = reaction_type.object.get("emoji_type") orelse continue;
+            if (emoji_type != .string) continue;
+            const reaction_id = item.object.get("reaction_id") orelse continue;
+            if (reaction_id != .string) continue;
+
+            for (self.reaction_emojis) |our_emoji| {
+                if (std.mem.eql(u8, emoji_type.string, our_emoji)) {
+                    self.deleteReactionById(message_id, reaction_id.string) catch |err| {
+                        log.warn("lark deleteReactionById failed: {}", .{err});
+                    };
+                    break;
+                }
+            }
+        }
+    }
+
+    fn deleteReactionById(self: *LarkChannel, message_id: []const u8, reaction_id: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions/{s}", .{ self.apiBase(), message_id, reaction_id });
+
+        const token = try self.getTenantAccessToken();
+        defer self.allocator.free(token);
+
+        var auth_buf: [512]u8 = undefined;
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
+
+        var argv_buf: [16][]const u8 = undefined;
+        var argc: usize = 0;
+        argv_buf[argc] = "curl"; argc += 1;
+        argv_buf[argc] = "-s"; argc += 1;
+        argv_buf[argc] = "-X"; argc += 1;
+        argv_buf[argc] = "DELETE"; argc += 1;
+        argv_buf[argc] = "-H"; argc += 1;
+        argv_buf[argc] = auth_header; argc += 1;
+        argv_buf[argc] = url_fbs.getWritten(); argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch return error.LarkApiError;
+        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 4096) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.LarkApiError;
+        };
+        defer self.allocator.free(stdout);
+        _ = child.wait() catch return error.LarkApiError;
+    }
+
     fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
         const host = if (self.use_feishu) FEISHU_CALLBACK_HOST else LARK_CALLBACK_HOST;
         var fbs = std.io.fixedBufferStream(buf);
@@ -961,6 +1112,12 @@ pub const LarkChannel = struct {
     }
 
     fn publishInboundMessage(self: *LarkChannel, msg: ParsedLarkMessage) void {
+        if (msg.message_id.len > 0) {
+            self.reactToMessage(msg.message_id, msg.sender) catch |err| {
+                log.warn("lark reactToMessage failed: {}", .{err});
+            };
+        }
+
         var key_buf: [256]u8 = undefined;
         const session_key = std.fmt.bufPrint(&key_buf, "lark:{s}", .{msg.sender}) catch "lark:unknown";
 
@@ -1223,11 +1380,13 @@ pub const LarkChannel = struct {
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
+        self.deletePendingReaction(target);
     }
 
     fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
         try self.sendRichMessage(target, payload);
+        self.deletePendingReaction(target);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -1259,10 +1418,12 @@ pub const ParsedLarkMessage = struct {
     content: []const u8,
     timestamp: u64,
     is_group: bool = false,
+    message_id: []const u8 = &.{},
 
     pub fn deinit(self: *ParsedLarkMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.sender);
         allocator.free(self.content);
+        if (self.message_id.len > 0) allocator.free(self.message_id);
     }
 };
 

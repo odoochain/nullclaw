@@ -497,6 +497,50 @@ test "hotApplyConfigChange updates model primary as provider plus model" {
     try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
 }
 
+test "hotApplyConfigChange handles split custom provider reload payload" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "custom:https://example.com/api",
+        .default_model = "meta-llama/Llama-4-70B-Instruct",
+        .allocator = allocator,
+    };
+
+    const value_json = try hotReloadValueJson(allocator, &cfg, "agents.defaults.model.primary");
+    defer allocator.free(value_json);
+
+    // Regression: hot reload must preserve split custom providers instead of truncating at the first slash.
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        value_json,
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", dummy.model_name);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://example.com/api", dummy.default_provider);
+}
+
 test "hotApplyConfigChange rejects malformed model primary" {
     const allocator = std.testing.allocator;
     var dummy = struct {
@@ -876,15 +920,23 @@ test "applyHotReloadConfig clears removed profile overrides and skips provider r
 }
 
 test "splitPrimaryModelRef parses provider model format" {
-    const parsed = splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
+    const parsed = config_module.splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("openrouter", parsed.provider);
     try std.testing.expectEqualStrings("inception/mercury", parsed.model);
 }
 
+test "splitPrimaryModelRef parses versioned custom provider model format" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://example.com/v2/meta-llama/Llama-4-70B-Instruct",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/v2", parsed.provider);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", parsed.model);
+}
+
 test "splitPrimaryModelRef rejects malformed values" {
-    try std.testing.expect(splitPrimaryModelRef("noslash") == null);
-    try std.testing.expect(splitPrimaryModelRef("/model-only") == null);
-    try std.testing.expect(splitPrimaryModelRef("provider/") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("noslash") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("/model-only") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("provider/") == null);
 }
 
 fn setExecNodeId(self: anytype, value: ?[]const u8) !void {
@@ -2631,12 +2683,23 @@ fn parseJsonBool(raw: []const u8) ?bool {
     };
 }
 
-fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
-    const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
-    if (slash == 0 or slash + 1 >= primary.len) return null;
-    return .{
-        .provider = primary[0..slash],
-        .model = primary[slash + 1 ..],
+fn parseHotReloadPrimaryModelRef(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !?config_module.PrimaryModelRef {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    return switch (parsed.value) {
+        .string => |primary| config_module.splitPrimaryModelRef(primary),
+        .object => |obj| blk: {
+            const provider_val = obj.get("provider") orelse break :blk null;
+            const primary_val = obj.get("primary") orelse break :blk null;
+            if (provider_val != .string or primary_val != .string) break :blk null;
+            break :blk .{
+                .provider = provider_val.string,
+                .model = primary_val.string,
+            };
+        },
+        else => null,
     };
 }
 
@@ -2665,9 +2728,9 @@ fn hotApplyConfigChange(
     if (action == .unset) return false;
 
     if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
-        const primary = try parseJsonStringOwned(self.allocator, new_value_json) orelse return false;
-        defer self.allocator.free(primary);
-        const parsed = splitPrimaryModelRef(primary) orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const parsed = try parseHotReloadPrimaryModelRef(arena.allocator(), new_value_json) orelse return false;
         try setModelName(self, parsed.model);
         try setDefaultProvider(self, parsed.provider);
         if (@hasField(@TypeOf(self.*), "default_model")) {
@@ -2780,6 +2843,15 @@ fn hotReloadValueJson(
 ) ![]u8 {
     if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
         const model = cfg.default_model orelse return allocator.dupe(u8, "null");
+        if (config_module.shouldSerializeDefaultModelProviderField(cfg.default_provider)) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            var model_obj = std.json.ObjectMap.init(arena.allocator());
+            try model_obj.put("provider", .{ .string = cfg.default_provider });
+            try model_obj.put("primary", .{ .string = model });
+            return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
+        }
+
         const primary = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.default_provider, model });
         defer allocator.free(primary);
         return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = primary }, .{});

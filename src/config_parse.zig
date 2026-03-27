@@ -10,6 +10,8 @@ const log = std.log.scoped(.config);
 // no comptime-initialization cycle.
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
+const PrimaryModelRef = config_mod.PrimaryModelRef;
+const splitPrimaryModelRef = config_mod.splitPrimaryModelRef;
 
 /// Parse a JSON array of strings into an allocated slice.
 pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]const []const u8 {
@@ -57,11 +59,6 @@ fn parseApiKeyField(cfg: *const Config, value: std.json.Value) !?[]const u8 {
     };
 }
 
-const PrimaryModelRef = struct {
-    provider: []const u8,
-    model: []const u8,
-};
-
 fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAgentConfig) void {
     allocator.free(agent_cfg.name);
     allocator.free(agent_cfg.provider);
@@ -70,59 +67,6 @@ fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAge
     if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
     if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
     if (agent_cfg.api_key) |api_key| allocator.free(api_key);
-}
-
-fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
-    // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model" or "custom:bifrost/model")
-    if (std.mem.startsWith(u8, primary, "custom:")) {
-        // The format is "custom:<provider_info>/<model>"
-        // If <provider_info> looks like a URL (contains ://), split after a versioned API segment
-        // to preserve model IDs that may also contain slashes.
-        if (std.mem.indexOf(u8, primary, "://")) |proto_start| {
-            var i: usize = proto_start + 3;
-            var model_start: ?usize = null;
-            while (i + 3 < primary.len) : (i += 1) {
-                if (primary[i] != '/' or primary[i + 1] != 'v') continue;
-                var j = i + 2;
-                var has_digit = false;
-                while (j < primary.len and std.ascii.isDigit(primary[j])) : (j += 1) {
-                    has_digit = true;
-                }
-                if (!has_digit) continue;
-                if (j < primary.len and primary[j] == '/') {
-                    if (j + 1 >= primary.len) return null;
-                    model_start = j + 1;
-                    break;
-                }
-            }
-            const split_at = model_start orelse return null;
-            return .{
-                .provider = primary[0 .. split_at - 1],
-                .model = primary[split_at..],
-            };
-        } else {
-            // No :// found, treat as a simple named provider: custom:<name>/<model>
-            // We split at the first '/' after "custom:".
-            const custom_prefix_len = "custom:".len;
-            if (std.mem.indexOfScalar(u8, primary[custom_prefix_len..], '/')) |slash_pos| {
-                const absolute_slash_pos = custom_prefix_len + slash_pos;
-                if (absolute_slash_pos + 1 >= primary.len) return null;
-                return .{
-                    .provider = primary[0..absolute_slash_pos],
-                    .model = primary[absolute_slash_pos + 1 ..],
-                };
-            }
-            return null;
-        }
-    }
-
-    // Regular provider/model format (e.g., "openrouter/anthropic/claude-sonnet-4")
-    const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
-    if (slash == 0 or slash + 1 >= primary.len) return null;
-    return .{
-        .provider = primary[0..slash],
-        .model = primary[slash + 1 ..],
-    };
 }
 
 fn parsePrimaryModelObject(

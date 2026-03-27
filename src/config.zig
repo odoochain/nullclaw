@@ -30,6 +30,11 @@ fn writeJsonStr(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+pub const PrimaryModelRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
+
 fn hasVersionedApiSegment(url: []const u8) bool {
     const proto_start = std.mem.indexOf(u8, url, "://") orelse return false;
     var i: usize = proto_start + 3;
@@ -46,7 +51,60 @@ fn hasVersionedApiSegment(url: []const u8) bool {
     return false;
 }
 
-fn shouldSerializeDefaultModelProviderField(provider: []const u8) bool {
+pub fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
+    // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model" or "custom:bifrost/model")
+    if (std.mem.startsWith(u8, primary, "custom:")) {
+        // The format is "custom:<provider_info>/<model>"
+        // If <provider_info> looks like a URL (contains ://), split after a versioned API segment
+        // to preserve model IDs that may also contain slashes.
+        if (std.mem.indexOf(u8, primary, "://")) |proto_start| {
+            var i: usize = proto_start + 3;
+            var model_start: ?usize = null;
+            while (i + 3 < primary.len) : (i += 1) {
+                if (primary[i] != '/' or primary[i + 1] != 'v') continue;
+                var j = i + 2;
+                var has_digit = false;
+                while (j < primary.len and std.ascii.isDigit(primary[j])) : (j += 1) {
+                    has_digit = true;
+                }
+                if (!has_digit) continue;
+                if (j < primary.len and primary[j] == '/') {
+                    if (j + 1 >= primary.len) return null;
+                    model_start = j + 1;
+                    break;
+                }
+            }
+            const split_at = model_start orelse return null;
+            return .{
+                .provider = primary[0 .. split_at - 1],
+                .model = primary[split_at..],
+            };
+        } else {
+            // No :// found, treat as a simple named provider: custom:<name>/<model>
+            // We split at the first '/' after "custom:".
+            const custom_prefix_len = "custom:".len;
+            if (std.mem.indexOfScalar(u8, primary[custom_prefix_len..], '/')) |slash_pos| {
+                const absolute_slash_pos = custom_prefix_len + slash_pos;
+                if (absolute_slash_pos + 1 >= primary.len) return null;
+                return .{
+                    .provider = primary[0..absolute_slash_pos],
+                    .model = primary[absolute_slash_pos + 1 ..],
+                };
+            }
+            return null;
+        }
+    }
+
+    // Regular provider/model format (e.g., "openrouter/anthropic/claude-sonnet-4")
+    const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
+    if (slash == 0 or slash + 1 >= primary.len) return null;
+    return .{
+        .provider = primary[0..slash],
+        .model = primary[slash + 1 ..],
+    };
+}
+
+pub fn shouldSerializeDefaultModelProviderField(provider: []const u8) bool {
     if (!std.mem.startsWith(u8, provider, "custom:")) return false;
     const custom_target = provider["custom:".len..];
     if (std.mem.indexOf(u8, custom_target, "://") == null) return false;

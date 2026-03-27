@@ -117,12 +117,9 @@ pub const HeartbeatEngine = struct {
                 }
                 const tasks = try self.collectTasks(allocator);
                 defer freeTasks(allocator, tasks);
-                for (tasks) |task| {
-                    log.debug("heartbeat task: {s}", .{task});
-                }
                 return .{ .outcome = .processed, .task_count = tasks.len };
             }
-            log.debug("heartbeat tick: HEARTBEAT.md not found by bootstrap provider", .{});
+            log.debug("heartbeat tick: HEARTBEAT.md could not be loaded via bootstrap provider", .{});
             return .{ .outcome = .skipped_missing_file, .task_count = 0 };
         }
 
@@ -132,7 +129,7 @@ pub const HeartbeatEngine = struct {
 
         const file = std.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                log.debug("heartbeat tick: HEARTBEAT.md not found at {s}", .{heartbeat_path});
+                log.debug("heartbeat tick: HEARTBEAT.md is missing", .{});
                 return .{ .outcome = .skipped_missing_file, .task_count = 0 };
             },
             else => return err,
@@ -148,9 +145,6 @@ pub const HeartbeatEngine = struct {
 
         const tasks = try self.collectTasks(allocator);
         defer freeTasks(allocator, tasks);
-        for (tasks) |task| {
-            log.debug("heartbeat task: {s}", .{task});
-        }
 
         return .{ .outcome = .processed, .task_count = tasks.len };
     }
@@ -313,4 +307,67 @@ test "isContentEffectivelyEmpty mirrors OpenClaw file gating semantics" {
     try std.testing.expect(HeartbeatEngine.isContentEffectivelyEmpty("## Tasks\n- [ ]\n+ [x]\n* [X]"));
     try std.testing.expect(!HeartbeatEngine.isContentEffectivelyEmpty("Check status"));
     try std.testing.expect(!HeartbeatEngine.isContentEffectivelyEmpty("#TODO keep this"));
+}
+
+test "HeartbeatEngine tick processes workspace tasks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "HEARTBEAT.md",
+        .data =
+        \\# Periodic Tasks
+        \\- Check status
+        \\- Review calendar
+        ,
+    });
+
+    const engine = HeartbeatEngine.init(true, 30, workspace_dir, null);
+    const result = try engine.tick(allocator);
+
+    try std.testing.expectEqual(TickOutcome.processed, result.outcome);
+    try std.testing.expectEqual(@as(usize, 2), result.task_count);
+}
+
+test "HeartbeatEngine tick skips missing heartbeat file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    const engine = HeartbeatEngine.init(true, 30, workspace_dir, null);
+    const result = try engine.tick(allocator);
+
+    try std.testing.expectEqual(TickOutcome.skipped_missing_file, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), result.task_count);
+}
+
+test "HeartbeatEngine tick skips comment-only heartbeat file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "HEARTBEAT.md",
+        .data =
+        \\# Periodic Tasks
+        \\
+        \\- [ ]
+        ,
+    });
+
+    const engine = HeartbeatEngine.init(true, 30, workspace_dir, null);
+    const result = try engine.tick(allocator);
+
+    try std.testing.expectEqual(TickOutcome.skipped_empty_file, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), result.task_count);
 }

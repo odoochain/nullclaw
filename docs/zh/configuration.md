@@ -381,8 +381,8 @@ WeChat 说明：
 
 规则说明：
 
-- `allow_from: []` 表示拒绝所有入站消息。
-- `allow_from: ["*"]` 表示允许所有来源（仅在你明确接受风险时使用）。
+- 空 `allow_from` 的行为因渠道而异。对 WeChat 和 Discord 来说，省略或留空会关闭过滤；如果要做私有机器人，请显式填写 ID/OpenID。
+- `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
 
 Telegram forum topics：
 

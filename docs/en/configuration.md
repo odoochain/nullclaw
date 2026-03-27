@@ -618,8 +618,8 @@ Effect on delivery:
 
 Rules:
 
-- `allow_from: []` means deny all inbound messages.
-- `allow_from: ["*"]` means allow all sources (use only when you accept the risk).
+- Empty `allow_from` behavior is channel-specific. For WeChat and Discord, an omitted or empty list disables filtering, so set explicit IDs/OpenIDs for a private bot.
+- `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
 
 Max example:
 

@@ -638,7 +638,6 @@ fn buildInboundConversationContext(
         .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
         .sender_username = meta.sender_username,
         .sender_display_name = meta.sender_display_name,
-        .delivery_chat_id = if (msg.chat_id.len > 0) msg.chat_id else null,
         .peer_id = meta.peer_id orelse if (has_scope) msg.chat_id else null,
         .group_id = group_id,
         .is_group = inferred_is_group,
@@ -2247,7 +2246,6 @@ test "buildInboundConversationContext preserves discord identity metadata" {
     try std.testing.expectEqualStrings("discord", context.channel.?);
     try std.testing.expectEqualStrings("discord-main", context.account_id.?);
     try std.testing.expectEqualStrings("user-42", context.sender_id.?);
-    try std.testing.expectEqualStrings("778899", context.delivery_chat_id.?);
     try std.testing.expectEqualStrings("778899", context.peer_id.?);
     try std.testing.expectEqualStrings("discord-user", context.sender_username.?);
     try std.testing.expectEqualStrings("Discord User", context.sender_display_name.?);
@@ -2267,7 +2265,6 @@ test "buildInboundConversationContext keeps channel and sender when metadata is 
 
     try std.testing.expectEqualStrings("external", context.channel.?);
     try std.testing.expectEqualStrings("user-1", context.sender_id.?);
-    try std.testing.expectEqualStrings("chat-1", context.delivery_chat_id.?);
     try std.testing.expect(context.group_id == null);
     try std.testing.expect(context.is_group == null);
 }
@@ -2288,7 +2285,6 @@ test "buildInboundConversationContext uses standardized peer metadata for extern
 
     try std.testing.expectEqualStrings("external", context.channel.?);
     try std.testing.expectEqualStrings("user-42", context.sender_id.?);
-    try std.testing.expectEqualStrings("120363-room", context.delivery_chat_id.?);
     try std.testing.expectEqualStrings("120363-room", context.peer_id.?);
     try std.testing.expectEqualStrings("120363-room", context.group_id.?);
     try std.testing.expect(context.is_group.?);

@@ -10,6 +10,7 @@ const file_common = @import("file_common.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const memory_root = @import("../memory/root.zig");
 const bootstrapRootFilename = file_common.bootstrapRootFilename;
+const prepareWorkspacePath = file_common.prepareWorkspacePath;
 const resolveNearestExistingAncestor = file_common.resolveNearestExistingAncestor;
 
 /// Default maximum file size to read (10MB).
@@ -130,22 +131,16 @@ pub const FileReadTool = struct {
             return ToolResult.fail("Missing 'path' parameter");
 
         // Build full path — absolute or relative
-        const full_path = if (std.fs.path.isAbsolute(path)) blk: {
-            if (self.allowed_paths.len == 0)
-                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
-            if (std.mem.indexOfScalar(u8, path, 0) != null)
-                return ToolResult.fail("Path contains null bytes");
-            break :blk try allocator.dupe(u8, path);
-        } else blk: {
-            if (!isPathSafe(path))
-                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        const path_info = prepareWorkspacePath(allocator, self.workspace_dir, path, self.allowed_paths.len > 0) catch |err| switch (err) {
+            error.AbsolutePathsNotAllowed => return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)"),
+            error.PathContainsNullBytes => return ToolResult.fail("Path contains null bytes"),
+            error.UnsafePath => return ToolResult.fail("Path not allowed: contains traversal or absolute path"),
+            else => return err,
         };
-        defer allocator.free(full_path);
+        defer path_info.deinit(allocator);
 
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
-        defer if (ws_resolved) |wr| allocator.free(wr);
-        const ws_path = ws_resolved orelse "";
+        const full_path = path_info.full_path;
+        const ws_path = path_info.workspacePath();
         const bootstrap_filename = bootstrapRootFilename(path);
         const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
         const effective_max_file_size = @min(self.max_file_size, max_usize_u64);
@@ -202,7 +197,7 @@ pub const FileReadTool = struct {
         defer allocator.free(resolved);
 
         // Validate against workspace + allowed_paths + system blocklist
-        if (!isResolvedPathAllowed(allocator, resolved, ws_resolved orelse "", self.allowed_paths)) {
+        if (!isResolvedPathAllowed(allocator, resolved, path_info.workspacePath(), self.allowed_paths)) {
             return ToolResult.fail("Path is outside allowed areas");
         }
 

@@ -239,6 +239,7 @@ fn resolveProfileProvider(
         cfg.getProviderUserAgent(profile.provider),
         cfg.getProviderApiMode(profile.provider),
         cfg.getProviderMaxStreamingPromptBytes(profile.provider),
+        cfg.getProviderChatTemplateEnableThinkingParam(profile.provider),
     );
     return .{
         .provider = holder.provider(),

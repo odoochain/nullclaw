@@ -117,6 +117,15 @@ nullclaw onboard --interactive
 }
 ```
 
+常见的 provider 级字段：
+
+- `api_key`：该 provider 条目的凭据。
+- `base_url`：用于自定义或自托管 OpenAI 兼容端点的地址覆盖。
+- `api_mode`：为兼容 provider 选择 `chat_completions` 或 `responses`。
+- `user_agent`：可选的 `User-Agent` 请求头覆盖。
+- `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
+- `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
+
 ### `agents.defaults.model.primary`
 
 - 设置默认模型路由，格式通常为：`provider/vendor/model`。
@@ -241,6 +250,37 @@ nullclaw onboard --interactive
 }
 ```
 
+### `reliability`
+
+- 配置 LLM 提供者的全局重试和故障转移行为。
+- `provider_retries`: 重试失败的 LLM 请求的次数（默认值：2）。
+- `provider_backoff_ms`: 重试之间的初始指数退避延迟（默认值：500 毫秒）。
+- `fallback_providers`: 当未显式指定 provider 的模型需要在主要提供方之外继续尝试时，可使用的备用提供方名称列表。
+- `model_fallbacks`: 模型到有序备用模型列表的映射。每个备用项既可以是裸模型名，也可以是显式的 `provider/model` 引用。
+
+示例：
+
+```json
+{
+  "reliability": {
+    "provider_retries": 2,
+    "provider_backoff_ms": 500,
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
+  }
+}
+```
+
+备注：
+
+- 裸模型名的故障转移顺序：先尝试主要提供方，再依次尝试每个列出的 `fallback_provider`。
+- 像 `openai/gpt-4o` 这样的显式 `provider/model` 备用项会直接路由到对应 provider，不会再走通用 provider 扇出链路。
+- `api_keys`: (可选) 用于在速率限制 (429) 错误时轮换的额外 API 密钥列表。
 ### `identity`（AIEOS v1.1）
 
 如果你希望运行时身份来自 AIEOS 文档，可以使用这一节。配置后，nullclaw 会把解析后的 AIEOS 内容连同 `AGENTS.md`、`IDENTITY.md` 等工作区身份文件一起注入 system prompt：
@@ -480,6 +520,68 @@ Telegram forum topics：
 - `bindings` 中的 `match.account_id` 将 binding 限定到某个特定 Telegram 账号。
 - 如果省略 `match.account_id`，该 binding 可匹配该 channel 下的任意 Telegram 账号。
 - 只有同一个 nullclaw 实例运行多个 Telegram bot 账号/token 时，不同 account id 才有意义。
+
+### Web UI / Browser Relay
+
+`channels.web` 用于浏览器 UI / 扩展通过 WebSocket 接入，默认路径是 `/ws`。
+
+示例：
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "127.0.0.1",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "pairing",
+          "allowed_origins": ["http://localhost:5173"]
+        }
+      }
+    }
+  }
+}
+```
+
+实用规则：
+
+- 想使用“先连上再配对”的本地体验，保持 `listen = "127.0.0.1"`。
+- 在 local transport 下，只有 loopback 才允许未鉴权的 WebSocket upgrade；这样 UI 才能先连上，再发送 `pairing_request`。
+- 如果把 `listen` 改成 `0.0.0.0` 或其他非 loopback 地址，那么 WebSocket upgrade 一开始就必须带上 channel token：
+  - `ws://host:32123/ws?token=<auth_token>`
+  - 或 `Authorization: Bearer <auth_token>`
+- 非 loopback bind 下，不要假设 local `pairing_request` 还能在未鉴权连接上工作；这个 pairing-first 流程本来就是只给 loopback 用的。
+- `message_auth_mode = "pairing"` 表示每条 `user_message` 都要带上 pairing 流程返回的 UI `access_token`。
+- `message_auth_mode = "token"` 只支持 local transport，并且要求使用配置或环境变量中的稳定 token。此模式下，UI 每条 `user_message` 发送 `auth_token`，而不是 pairing JWT。
+- `auth_token` 既可以加固 WebSocket upgrade，在非 loopback bind 时也会变成必需项。
+- WebSocket 端点用的是 `/ws`。`/pair` 属于 HTTP gateway API，不是 web channel 的 WebSocket 配对入口。
+- 对于 headless/LAN 场景，更稳妥的运维路径仍然是 SSH 隧道，或者在 loopback 绑定前面加反向代理。
+
+远程 / 无头设备示例：
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "0.0.0.0",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "token",
+          "allowed_origins": ["https://chat-ui.example.com"]
+        }
+      }
+    }
+  }
+}
+```
 
 Max 示例：
 

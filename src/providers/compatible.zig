@@ -207,6 +207,9 @@ pub const OpenAiCompatibleProvider = struct {
     /// When true, include `"reasoning_split":true` in request bodies
     /// when reasoning_effort is set. Used by MiniMax to separate reasoning output.
     reasoning_split_param: bool = false,
+    /// When true, include `chat_template_kwargs.enable_thinking` in request
+    /// bodies so custom vLLM/Qwen endpoints can opt into reasoning.
+    chat_template_enable_thinking_param: bool = false,
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
@@ -1299,6 +1302,7 @@ pub const OpenAiCompatibleProvider = struct {
             self.thinking_param,
             self.enable_thinking_param,
             self.reasoning_split_param,
+            self.chat_template_enable_thinking_param,
         );
         defer allocator.free(body);
 
@@ -1516,6 +1520,7 @@ pub const OpenAiCompatibleProvider = struct {
             self.thinking_param,
             self.enable_thinking_param,
             self.reasoning_split_param,
+            self.chat_template_enable_thinking_param,
         );
         defer allocator.free(body);
 
@@ -1672,6 +1677,7 @@ fn buildChatRequestBody(
     thinking_param: bool,
     enable_thinking_param: bool,
     reasoning_split_param: bool,
+    chat_template_enable_thinking_param: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -1697,6 +1703,13 @@ fn buildChatRequestBody(
     }
     if (reasoning_split_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"reasoning_split\":true");
+    }
+    if (chat_template_enable_thinking_param) {
+        if (reasoning_enabled) {
+            try buf.appendSlice(allocator, ",\"chat_template_kwargs\":{\"enable_thinking\":true}");
+        } else {
+            try buf.appendSlice(allocator, ",\"chat_template_kwargs\":{\"enable_thinking\":false}");
+        }
     }
     if (request.tools) |tools| {
         if (tools.len > 0) {
@@ -1721,6 +1734,7 @@ fn buildStreamingChatRequestBody(
     thinking_param: bool,
     enable_thinking_param: bool,
     reasoning_split_param: bool,
+    chat_template_enable_thinking_param: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -1746,6 +1760,13 @@ fn buildStreamingChatRequestBody(
     }
     if (reasoning_split_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"reasoning_split\":true");
+    }
+    if (chat_template_enable_thinking_param) {
+        if (reasoning_enabled) {
+            try buf.appendSlice(allocator, ",\"chat_template_kwargs\":{\"enable_thinking\":true}");
+        } else {
+            try buf.appendSlice(allocator, ",\"chat_template_kwargs\":{\"enable_thinking\":false}");
+        }
     }
     if (request.tools) |tools| {
         if (tools.len > 0) {
@@ -1995,7 +2016,7 @@ test "buildChatRequestBody emits thinking param for GLM when reasoning_effort se
         .model = "glm-4.7-thinking",
         .reasoning_effort = "high",
     };
-    const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, false, false);
+    const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, false, false, false);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\"}") != null);
 }
@@ -2008,7 +2029,7 @@ test "buildChatRequestBody omits thinking param when thinking_param false" {
         .model = "some-model",
         .reasoning_effort = "high",
     };
-    const body = try buildChatRequestBody(allocator, req, "some-model", 0.7, false, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "some-model", 0.7, false, false, false, false, false);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
 }
@@ -2021,7 +2042,7 @@ test "buildChatRequestBody emits enable_thinking when configured" {
         .model = "qwen3-thinking",
         .reasoning_effort = "high",
     };
-    const body = try buildChatRequestBody(allocator, req, "qwen3-thinking", 0.7, false, false, true, false);
+    const body = try buildChatRequestBody(allocator, req, "qwen3-thinking", 0.7, false, false, true, false, false);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") != null);
 }
@@ -2034,9 +2055,22 @@ test "buildChatRequestBody emits reasoning_split when configured" {
         .model = "minimax-m2",
         .reasoning_effort = "high",
     };
-    const body = try buildChatRequestBody(allocator, req, "minimax-m2", 0.7, false, false, false, true);
+    const body = try buildChatRequestBody(allocator, req, "minimax-m2", 0.7, false, false, false, true, false);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") != null);
+}
+
+test "buildChatRequestBody emits chat_template enable_thinking when configured" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "qwen3.5-27b",
+        .reasoning_effort = "high",
+    };
+    const body = try buildChatRequestBody(allocator, req, "qwen3.5-27b", 0.7, false, false, false, false, true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"chat_template_kwargs\":{\"enable_thinking\":true}") != null);
 }
 
 test "buildChatRequestBody sends thinking disabled when reasoning_effort unset" {
@@ -2046,7 +2080,7 @@ test "buildChatRequestBody sends thinking disabled when reasoning_effort unset" 
         .messages = &msgs,
         .model = "glm-4.7-thinking",
     };
-    const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, true, true);
+    const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, true, true, false);
     defer allocator.free(body);
     // Regression: GLM defaults deep thinking to enabled unless we explicitly send disabled.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"disabled\"}") != null);
@@ -2631,7 +2665,7 @@ test "buildStreamingChatRequestBody contains stream true" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "test-model" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, false, false, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, false, false, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
@@ -2645,7 +2679,7 @@ test "buildStreamingChatRequestBody sends thinking disabled when reasoning_effor
         .messages = &msgs,
         .model = "test-model",
     };
-    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, true, true, true);
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, true, true, true, false);
     defer allocator.free(body);
     // Regression: GLM defaults deep thinking to enabled unless we explicitly send disabled.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"disabled\"}") != null);
@@ -2682,10 +2716,10 @@ test "streaming body has same messages as non-streaming" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test message")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const non_stream = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
+    const non_stream = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false, false);
     defer allocator.free(non_stream);
 
-    const stream = try buildStreamingChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
+    const stream = try buildStreamingChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false, false);
     defer allocator.free(stream);
 
     // Both should contain the message
@@ -2702,7 +2736,7 @@ test "streaming body has model field" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "custom-model" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "custom-model", 0.5, false, false, false, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "custom-model", 0.5, false, false, false, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "custom-model") != null);
@@ -2717,7 +2751,7 @@ test "buildChatRequestBody without content_parts serializes plain string" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("plain text")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false, false);
     defer allocator.free(body);
 
     // Verify it's valid JSON
@@ -2744,7 +2778,7 @@ test "buildChatRequestBody with image_url content_parts serializes OpenAI array"
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false, false);
     defer allocator.free(body);
 
     // Verify it's valid JSON
@@ -2782,7 +2816,7 @@ test "buildChatRequestBody with base64 image serializes as data URI" {
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false, false);
     defer allocator.free(body);
 
     // Should contain the data URI
@@ -2801,7 +2835,7 @@ test "buildChatRequestBody with high detail image_url" {
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -2830,7 +2864,7 @@ test "buildChatRequestBody o1 omits temperature" {
         .max_tokens = 100,
     };
 
-    const body = try buildChatRequestBody(allocator, req, "o1", 0.7, false, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "o1", 0.7, false, false, false, false, false);
     defer allocator.free(body);
 
     // Reasoning model: no temperature, uses max_completion_tokens
@@ -2849,7 +2883,7 @@ test "buildStreamingChatRequestBody reasoning model omits temperature" {
         .max_tokens = 200,
     };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "gpt-5.2", 0.5, false, false, false, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "gpt-5.2", 0.5, false, false, false, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
@@ -2869,7 +2903,7 @@ test "merge_system_into_user merges system into first user message" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -2891,7 +2925,7 @@ test "merge_system_into_user with no system messages passes through" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -2910,7 +2944,7 @@ test "merge_system_into_user false keeps system messages" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, false, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, false, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -2936,7 +2970,7 @@ test "merge_system_into_user with multiple system messages concatenates" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -2960,7 +2994,7 @@ test "merge_system_into_user preserves assistant messages" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -2987,7 +3021,7 @@ test "merge_system_into_user streaming body also merges" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "test", 0.7, true, false, false, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "test", 0.7, true, false, false, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});

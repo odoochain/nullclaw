@@ -42,6 +42,14 @@ NullClaw follows secure-by-default behavior: local bind by default, pairing auth
 - Otherwise: exact-match allowlist.
 - Discord currently differs: an omitted or empty `allow_from` disables filtering, so set explicit user IDs in `channels.discord.accounts.*.allow_from` when you want a private bot.
 
+## Pairing and Webhook Auth Boundaries
+
+- `/pair` is POST-only and expects `X-Pairing-Code`.
+- Repeated invalid pairing attempts can trigger rate limiting and a temporary lockout.
+- `/.well-known/agent.json` and `/.well-known/agent-card.json` are public discovery documents when A2A is enabled.
+- Keeping `gateway.require_pairing = true` keeps `/webhook` and `/a2a` behind bearer auth; disabling pairing removes that bearer check.
+- Channel-specific inbound webhooks keep their own auth or signature rules and should not be documented as if they all use gateway bearer auth.
+
 ## Nostr-specific Rules
 
 - `owner_pubkey` is always allowed even if `dm_allowed_pubkeys` is stricter.

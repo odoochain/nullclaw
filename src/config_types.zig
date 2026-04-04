@@ -74,6 +74,11 @@ pub const ProviderEntry = struct {
     /// Primary OpenAI-compatible protocol to use for this provider.
     /// Defaults to chat_completions for backward compatibility.
     api_mode: ApiMode = .chat_completions,
+    /// When true, include `chat_template_kwargs.enable_thinking` in
+    /// OpenAI-compatible chat requests based on `reasoning_effort`.
+    /// Useful for custom vLLM/Qwen endpoints that require chat-template
+    /// toggles instead of standard OpenAI reasoning fields.
+    chat_template_enable_thinking_param: bool = false,
     /// Maximum estimated request text bytes before the streaming path is
     /// skipped and a non-streaming POST is used instead.
     /// null means no limit — streaming is always attempted (recommended for

@@ -132,6 +132,15 @@ Example:
 }
 ```
 
+Common per-provider fields:
+
+- `api_key`: credential for that provider entry.
+- `base_url`: override for custom or self-hosted OpenAI-compatible endpoints.
+- `api_mode`: select `chat_completions` or `responses` for compatible providers.
+- `user_agent`: optional `User-Agent` header override.
+- `max_streaming_prompt_bytes`: skip streaming above this estimated prompt size.
+- `chat_template_enable_thinking_param`: for custom OpenAI-compatible vLLM/Qwen endpoints, map `reasoning_effort` to `chat_template_kwargs.enable_thinking`.
+
 ### `agents.defaults.model.primary`
 
 - Sets default model route, typically `provider/vendor/model`.
@@ -300,6 +309,37 @@ Example:
 }
 ```
 
+### `reliability`
+
+- Configures global retry and failover behavior for LLM providers.
+- `provider_retries`: Number of times to retry a failed LLM request (default: 2).
+- `provider_backoff_ms`: Initial exponential backoff delay between retries (default: 500).
+- `fallback_providers`: List of provider names to try if an unqualified model should fan out beyond the primary provider.
+- `model_fallbacks`: Mapping of a model to an ordered list of fallback models. Each fallback may be either another bare model name or an explicit `provider/model` ref.
+
+Example:
+
+```json
+{
+  "reliability": {
+    "provider_retries": 2,
+    "provider_backoff_ms": 500,
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- Failover order for bare model refs: primary provider first, then each listed `fallback_provider`.
+- Provider-qualified fallback refs such as `openai/gpt-4o` route directly to that provider and skip the generic provider fanout.
+- `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.
@@ -538,6 +578,68 @@ About `account_id`:
 - In `bindings`, `match.account_id` restricts a binding to one specific Telegram account.
 - If `match.account_id` is omitted, the binding can match any Telegram account for that channel.
 - Different account ids are only useful when the same nullclaw instance runs multiple Telegram bot accounts/tokens.
+
+### Web UI / Browser Relay
+
+Use `channels.web` for browser UI / extension traffic over WebSocket (`/ws` by default).
+
+Example:
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "127.0.0.1",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "pairing",
+          "allowed_origins": ["http://localhost:5173"]
+        }
+      }
+    }
+  }
+}
+```
+
+Practical rules:
+
+- Keep `listen = "127.0.0.1"` for the pairing-first local UX.
+- In local transport, unauthenticated WebSocket upgrade is allowed only on loopback. This is what lets a UI connect first and then send `pairing_request`.
+- If you change `listen` to `0.0.0.0` or another non-loopback address, the WebSocket upgrade must already include the channel token:
+  - `ws://host:32123/ws?token=<auth_token>`
+  - or `Authorization: Bearer <auth_token>`
+- For non-loopback bind, do not expect local `pairing_request` to work before the socket is authenticated. The pairing-first flow is loopback-only by design.
+- `message_auth_mode = "pairing"` means each `user_message` must carry the UI `access_token` returned by the pairing flow.
+- `message_auth_mode = "token"` is local-transport only and requires a stable token from config or env. In this mode, the UI sends `auth_token` on each `user_message` instead of a pairing JWT.
+- `auth_token` hardens the WebSocket upgrade and becomes mandatory for non-loopback bind.
+- Use `/ws` for the WebSocket endpoint. `/pair` belongs to the HTTP gateway API, not the web channel WebSocket flow.
+- For headless/LAN access, the safest operator path is still SSH tunnel or reverse proxy in front of a loopback-bound web channel.
+
+Remote/headless example:
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "0.0.0.0",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "token",
+          "allowed_origins": ["https://chat-ui.example.com"]
+        }
+      }
+    }
+  }
+}
+```
 
 Effect on delivery:
 

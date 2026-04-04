@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const config_paths = @import("../config_paths.zig");
 const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
 const identity_mod = @import("../identity.zig");
-const platform = @import("../platform.zig");
 const memory_root = @import("../memory/root.zig");
 const tools_mod = @import("../tools/root.zig");
 const path_prefix = @import("../path_prefix.zig");
@@ -844,13 +844,8 @@ fn appendSkillsSection(
     w: anytype,
     workspace_dir: []const u8,
 ) !void {
-    // Two-source loading: workspace skills + ~/.nullclaw/skills/
-    const home_dir = platform.getHomeDir(allocator) catch null;
-    defer if (home_dir) |h| allocator.free(h);
-    const community_base = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".nullclaw" }) catch null
-    else
-        null;
+    // Two-source loading: workspace skills + config directory skills/
+    const community_base = config_paths.defaultConfigDir(allocator) catch null;
     defer if (community_base) |cb| allocator.free(cb);
 
     // listSkillsMerged already calls checkRequirements on each skill.

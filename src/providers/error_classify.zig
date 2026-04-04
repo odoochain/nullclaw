@@ -35,6 +35,16 @@ fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn lookupMessageField(obj: anytype) ?[]const u8 {
+    if (obj.get("message")) |value| {
+        if (value == .string) return value.string;
+    }
+    if (obj.get("msg")) |value| {
+        if (value == .string) return value.string;
+    }
+    return null;
+}
+
 pub fn isRateLimitedText(text: []const u8) bool {
     if (text.len == 0) return false;
 
@@ -161,28 +171,11 @@ fn extractErrorFields(root_obj: anytype) ?struct {
             if (err_obj.get("type")) |v| {
                 if (v == .string) type_name = v.string;
             }
-            if (err_obj.get("message")) |v| {
-                if (v == .string) message = v.string;
-            }
-            if (message == null) {
-                if (err_obj.get("msg")) |v| {
-                    if (v == .string) message = v.string;
-                }
-            }
+            if (message == null) message = lookupMessageField(err_obj);
         }
     }
 
-    if (message == null) {
-        if (root_obj.get("message")) |v| {
-            if (v == .string) message = v.string;
-        }
-    }
-    // infini-ai and some other providers use "msg" instead of "message"
-    if (message == null) {
-        if (root_obj.get("msg")) |v| {
-            if (v == .string) message = v.string;
-        }
-    }
+    if (message == null) message = lookupMessageField(root_obj);
 
     if (status == null) {
         if (root_obj.get("status")) |v| {
@@ -346,25 +339,8 @@ pub fn classifyErrorObject(root_obj: anytype) ?ApiErrorKind {
         if (v == .string) type_name = v.string;
     }
 
-    var message: ?[]const u8 = null;
-    if (err_obj.get("message")) |v| {
-        if (v == .string) message = v.string;
-    }
-    if (message == null) {
-        if (err_obj.get("msg")) |v| {
-            if (v == .string) message = v.string;
-        }
-    }
-    if (message == null) {
-        if (root_obj.get("message")) |v| {
-            if (v == .string) message = v.string;
-        }
-    }
-    if (message == null) {
-        if (root_obj.get("msg")) |v| {
-            if (v == .string) message = v.string;
-        }
-    }
+    var message: ?[]const u8 = lookupMessageField(err_obj);
+    if (message == null) message = lookupMessageField(root_obj);
 
     return classifyFromFields(status, code, type_name, message);
 }
@@ -398,18 +374,7 @@ fn classifyTopLevelError(root_obj: anytype) ?ApiErrorKind {
         }
     }
 
-    var message: ?[]const u8 = null;
-    if (root_obj.get("message")) |v| {
-        if (v == .string) {
-            message = v.string;
-        }
-    }
-    // infini-ai and some other providers use "msg" instead of "message"
-    if (message == null) {
-        if (root_obj.get("msg")) |v| {
-            if (v == .string) message = v.string;
-        }
-    }
+    const message = lookupMessageField(root_obj);
 
     if (!has_error_signal) return null;
     return classifyFromFields(status, code, type_name, message);

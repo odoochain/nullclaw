@@ -19,7 +19,7 @@ const log = std.log.scoped(.gemini_cli);
 pub const GeminiCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
-    
+
     /// Persistent state
     child: ?*std.process.Child = null,
     child_argv: ?[][]const u8 = null,
@@ -157,7 +157,7 @@ pub const GeminiCliProvider = struct {
         // Higher-level security is enforced by nullclaw's own tool approval logic.
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, "yolo"));
         self.child_argv = try argv_list.toOwnedSlice(self.allocator);
-        
+
         const child = try self.allocator.create(std.process.Child);
         errdefer self.allocator.destroy(child);
         child.* = std.process.Child.init(self.child_argv.?, self.allocator);
@@ -310,27 +310,25 @@ pub const GeminiCliProvider = struct {
                     // This is our response
                     if (obj.get("result")) |res| {
                         if (res == .object) {
-                             if (res.object.get("content")) |c| {
-                                 if (c == .string) {
-                                     if (c.string.len > 0) {
-                                         result_buf.clearRetainingCapacity();
-                                         try result_buf.appendSlice(allocator, c.string);
-                                     }
-                                 }
-                             }
-                        }
-                    } else if (obj.get("error")) |err_val| {
-                        log.err("Gemini ACP prompt failed with error: {any}", .{err_val});
-                        
-                        // Record detailed error message if available
-                        if (err_val == .object) {
-                            if (err_val.object.get("message")) |err_msg_val| {
-                                if (err_msg_val == .string) {
-                                    root.setLastApiErrorDetail("gemini-cli", err_msg_val.string);
+                            if (res.object.get("content")) |c| {
+                                if (c == .string) {
+                                    if (c.string.len > 0) {
+                                        result_buf.clearRetainingCapacity();
+                                        try result_buf.appendSlice(allocator, c.string);
+                                    }
                                 }
                             }
                         }
-                        
+                    } else if (obj.get("error")) |err_val| {
+                        log.err("Gemini ACP prompt failed with error: {any}", .{err_val});
+
+                        // Record detailed error message if available
+                        if (err_val == .object) {
+                            if (lookupErrorMessage(err_val.object)) |err_msg| {
+                                root.setLastApiErrorDetail("gemini-cli", err_msg);
+                            }
+                        }
+
                         return error.ApiError;
                     }
                     break;
@@ -340,6 +338,16 @@ pub const GeminiCliProvider = struct {
 
         if (result_buf.items.len == 0) return error.NoResultInOutput;
         return try result_buf.toOwnedSlice(allocator);
+    }
+
+    fn lookupErrorMessage(obj: std.json.ObjectMap) ?[]const u8 {
+        if (obj.get("message")) |value| {
+            if (value == .string) return value.string;
+        }
+        if (obj.get("msg")) |value| {
+            if (value == .string) return value.string;
+        }
+        return null;
     }
 
     fn readLine(self: *GeminiCliProvider, allocator: std.mem.Allocator) ![]const u8 {
@@ -352,7 +360,7 @@ pub const GeminiCliProvider = struct {
                 const line_end = self.read_offset + pos;
                 const line = try allocator.dupe(u8, self.read_buffer.items[self.read_offset..line_end]);
                 errdefer allocator.free(line);
-                
+
                 self.read_offset = line_end + 1;
 
                 // Strip non-JSON prefixes
@@ -440,13 +448,15 @@ fn parseModelsJson(allocator: std.mem.Allocator, out: []const u8) ![][]const u8 
         const obj = parsed.value.object;
         const type_val = obj.get("type") orelse continue;
         if (type_val != .string) continue;
-        
+
         var text: ?[]const u8 = null;
         if (std.mem.eql(u8, type_val.string, "message") or
             std.mem.eql(u8, type_val.string, "output") or
             std.mem.eql(u8, type_val.string, "content"))
         {
-             if (obj.get("content")) |c| if (c == .string) { text = c.string; };
+            if (obj.get("content")) |c| if (c == .string) {
+                text = c.string;
+            };
         }
         if (text) |t| {
             var token_iter = std.mem.tokenizeScalar(u8, t, ' ');
@@ -541,6 +551,18 @@ test "extractLastUserMessage returns null for no user" {
 test "extractLastUserMessage empty messages" {
     const msgs = [_]ChatMessage{};
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
+}
+
+test "GeminiCliProvider.lookupErrorMessage handles message and msg fields" {
+    const message_body = "{\"message\":\"request failed\"}";
+    const parsed_message = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message_body, .{});
+    defer parsed_message.deinit();
+    try std.testing.expectEqualStrings("request failed", GeminiCliProvider.lookupErrorMessage(parsed_message.value.object).?);
+
+    const msg_body = "{\"msg\":\"request failed\"}";
+    const parsed_msg = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, msg_body, .{});
+    defer parsed_msg.deinit();
+    try std.testing.expectEqualStrings("request failed", GeminiCliProvider.lookupErrorMessage(parsed_msg.value.object).?);
 }
 
 test "checkCliVersion returns CliNotFound for missing binary" {

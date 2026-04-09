@@ -562,6 +562,34 @@ pub const Config = struct {
         try w.writeAll(trailing);
     }
 
+    fn writePrettyStringMap(w: *std.Io.Writer, base_indent: []const u8, entries: anytype) !void {
+        try w.writeAll("{");
+        if (entries.len == 0) {
+            try w.writeAll("}");
+            return;
+        }
+
+        try w.writeAll("\n");
+        for (entries, 0..) |entry, i| {
+            if (i > 0) try w.writeAll(",\n");
+            try w.writeAll(base_indent);
+            try w.writeAll("  ");
+            try writeJsonStr(w, entry.key);
+            try w.writeAll(": ");
+            try writeJsonStr(w, entry.value);
+        }
+        try w.writeAll("\n");
+        try w.writeAll(base_indent);
+        try w.writeAll("}");
+    }
+
+    fn writePrettyStringMapField(w: *std.Io.Writer, indent: []const u8, key: []const u8, entries: anytype, trailing: []const u8) !void {
+        try w.writeAll(indent);
+        try w.print("\"{s}\": ", .{key});
+        try writePrettyStringMap(w, indent, entries);
+        try w.writeAll(trailing);
+    }
+
     fn writeChannelAccounts(allocator: std.mem.Allocator, w: *std.Io.Writer, channel_name: []const u8, accounts: anytype) !void {
         try w.print("    \"{s}\": {{\n      \"accounts\": {{", .{channel_name});
         for (accounts, 0..) |account, i| {
@@ -581,44 +609,38 @@ pub const Config = struct {
     }
 
     fn writeExternalTransport(self: *const Config, w: *std.Io.Writer, transport: ExternalChannelConfig.TransportConfig) !void {
-        _ = self;
-        try w.print("{{\"command\": {f}", .{std.json.fmt(transport.command, .{})});
-
+        try w.writeAll("{\n");
+        try writePrettyField(self.allocator, w, "            ", "command", transport.command, "");
         if (transport.args.len > 0) {
-            try w.print(", \"args\": {f}", .{std.json.fmt(transport.args, .{})});
+            try w.writeAll(",\n");
+            try writePrettyField(self.allocator, w, "            ", "args", transport.args, "");
         }
         if (transport.env.len > 0) {
-            try w.print(", \"env\": {{", .{});
-            for (transport.env, 0..) |entry, index| {
-                if (index > 0) try w.print(", ", .{});
-                try w.print("{f}: {f}", .{
-                    std.json.fmt(entry.key, .{}),
-                    std.json.fmt(entry.value, .{}),
-                });
-            }
-            try w.print("}}", .{});
+            try w.writeAll(",\n");
+            try writePrettyStringMapField(w, "            ", "env", transport.env, "");
         }
         if (transport.timeout_ms != 10_000) {
-            try w.print(", \"timeout_ms\": {d}", .{transport.timeout_ms});
+            try w.writeAll(",\n");
+            try writePrettyField(self.allocator, w, "            ", "timeout_ms", transport.timeout_ms, "");
         }
-        try w.print("}}", .{});
+        try w.writeAll("\n          }");
     }
 
     fn writeExternalChannelAccount(self: *const Config, w: *std.Io.Writer, account: ExternalChannelConfig) !void {
-        try w.print("{{\"runtime_name\": {f}, \"transport\": ", .{
-            std.json.fmt(account.runtime_name, .{}),
-        });
+        try w.writeAll("{\n");
+        try writePrettyField(self.allocator, w, "          ", "runtime_name", account.runtime_name, ",\n");
+        try w.writeAll("          \"transport\": ");
         try self.writeExternalTransport(w, account.transport);
-
-        try w.print(", \"config\": ", .{});
+        try w.writeAll(",\n");
+        try w.writeAll("          \"config\": ");
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, account.plugin_config_json, .{}) catch {
-            try w.print("{f}", .{std.json.fmt(account.plugin_config_json, .{})});
-            try w.print("}}", .{});
+            try writePrettyJsonInline(self.allocator, w, account.plugin_config_json, "          ");
+            try w.writeAll("\n        }");
             return;
         };
         defer parsed.deinit();
-        try writePrettyJsonInline(self.allocator, w, parsed.value, "");
-        try w.print("}}", .{});
+        try writePrettyJsonInline(self.allocator, w, parsed.value, "          ");
+        try w.writeAll("\n        }");
     }
 
     fn writeExternalChannelAccounts(self: *const Config, w: *std.Io.Writer, accounts: []const ExternalChannelConfig) !void {
@@ -762,14 +784,9 @@ pub const Config = struct {
         try writeStringArray(w, encrypted_api_keys);
         try w.print(",\n", .{});
 
-        try w.print("    \"model_fallbacks\": [", .{});
-        for (self.reliability.model_fallbacks, 0..) |entry, i| {
-            if (i > 0) try w.print(", ", .{});
-            try w.print("{{\"model\": \"{s}\", \"fallbacks\": ", .{entry.model});
-            try writeStringArray(w, entry.fallbacks);
-            try w.print("}}", .{});
-        }
-        try w.print("]\n", .{});
+        try w.print("    \"model_fallbacks\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.reliability.model_fallbacks, "    ");
+        try w.print("\n", .{});
         try w.print("  }},\n", .{});
     }
 
@@ -780,56 +797,69 @@ pub const Config = struct {
 
             var wrote_field = false;
             if (!std.mem.eql(u8, server.transport, McpServerConfig.DEFAULT_TRANSPORT)) {
-                try w.print("\"transport\": {f}", .{std.json.fmt(server.transport, .{})});
+                try w.writeAll("\n");
+                try writePrettyField(self.allocator, w, "      ", "transport", server.transport, "");
                 wrote_field = true;
             }
             if (server.command.len > 0) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"command\": {f}", .{std.json.fmt(server.command, .{})});
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "command", server.command, "");
                 wrote_field = true;
             }
             if (server.url) |url| {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"url\": {f}", .{std.json.fmt(url, .{})});
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "url", url, "");
                 wrote_field = true;
             }
             if (server.timeout_ms != 10_000) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"timeout_ms\": {d}", .{server.timeout_ms});
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "timeout_ms", server.timeout_ms, "");
                 wrote_field = true;
             }
             if (server.args.len > 0) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"args\": {f}", .{std.json.fmt(server.args, .{})});
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "args", server.args, "");
                 wrote_field = true;
             }
             if (server.env.len > 0) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"env\": {{", .{});
-                for (server.env, 0..) |entry, env_i| {
-                    if (env_i > 0) try w.print(", ", .{});
-                    try w.print("{f}: {f}", .{
-                        std.json.fmt(entry.key, .{}),
-                        std.json.fmt(entry.value, .{}),
-                    });
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
                 }
-                try w.print("}}", .{});
+                try writePrettyStringMapField(w, "      ", "env", server.env, "");
                 wrote_field = true;
             }
             if (server.headers.len > 0) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"headers\": {{", .{});
-                for (server.headers, 0..) |entry, hdr_i| {
-                    if (hdr_i > 0) try w.print(", ", .{});
-                    try w.print("{f}: {f}", .{
-                        std.json.fmt(entry.key, .{}),
-                        std.json.fmt(entry.value, .{}),
-                    });
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
                 }
-                try w.print("}}", .{});
+                try writePrettyStringMapField(w, "      ", "headers", server.headers, "");
                 wrote_field = true;
             }
-            try w.print("}}", .{});
+            if (wrote_field) {
+                try w.writeAll("\n    }");
+            } else {
+                try w.writeAll("}");
+            }
             if (i + 1 < self.mcp_servers.len) try w.print(",", .{});
             try w.print("\n", .{});
         }
@@ -2045,10 +2075,13 @@ test "save roundtrip preserves external channel config" {
     defer allocator.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"external\": {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"runtime_name\": \"whatsapp_web\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"transport\": {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"command\": \"nullclaw-plugin-whatsapp-web\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"config\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "        \"main\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "          \"runtime_name\": \"whatsapp_web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "          \"transport\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "            \"command\": \"nullclaw-plugin-whatsapp-web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "            \"env\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "              \"TOKEN\": \"secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "          \"config\": {\n") != null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2209,6 +2242,10 @@ test "save roundtrip preserves reliability settings" {
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"model_fallbacks\": [\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "        \"model\": \"gpt-5.3-codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "        \"fallbacks\": [\n") != null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2574,6 +2611,13 @@ test "save escapes mcp_servers strings safely" {
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "  \"mcp_servers\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"ctx\\\"7\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "      \"command\": \"npx \\\"@scope/pkg\\\"\\nrun\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "      \"args\": [\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "      \"env\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "        \"OPEN\\\"KEY\": \"ab\\\\cd\\\"ef\\nz\"") != null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

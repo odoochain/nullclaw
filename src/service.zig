@@ -18,6 +18,7 @@ const WINDOWS_SERVICE_NAME = "nullclaw";
 const WINDOWS_SERVICE_DISPLAY_NAME = "nullclaw gateway runtime";
 const OPENRC_SERVICE_NAME = "nullclaw";
 const OPENRC_SERVICE_FILE = "/etc/init.d/nullclaw";
+const SYSVINIT_SERVICE_FILE = "/etc/init.d/nullclaw";
 pub const WINDOWS_SERVICE_GATEWAY_ARG = "__windows-service-gateway";
 
 const windows = std.os.windows;
@@ -91,6 +92,7 @@ pub const ServiceError = error{
 const LinuxServiceManager = enum {
     systemd_user,
     openrc,
+    sysvinit,
 };
 
 pub fn isWindowsServiceGatewayArg(arg: []const u8) bool {
@@ -160,6 +162,7 @@ fn startService(allocator: std.mem.Allocator) !void {
                 try runChecked(allocator, &.{ "systemctl", "--user", "start", "nullclaw.service" });
             },
             .openrc => try openRcRunChecked(allocator, &.{ OPENRC_SERVICE_NAME, "start" }),
+            .sysvinit => try runChecked(allocator, &.{ SYSVINIT_SERVICE_FILE, "start" }),
         }
     } else if (comptime builtin.os.tag == .windows) {
         try runChecked(allocator, &.{ "sc.exe", "start", WINDOWS_SERVICE_NAME });
@@ -181,6 +184,7 @@ fn stopService(allocator: std.mem.Allocator) !void {
                 try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
             },
             .openrc => try openRcRunChecked(allocator, &.{ OPENRC_SERVICE_NAME, "stop" }),
+            .sysvinit => runChecked(allocator, &.{ SYSVINIT_SERVICE_FILE, "stop" }) catch {},
         }
     } else if (comptime builtin.os.tag == .windows) {
         try runChecked(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
@@ -190,6 +194,15 @@ fn stopService(allocator: std.mem.Allocator) !void {
 }
 
 fn restartService(allocator: std.mem.Allocator) !void {
+    // SysVinit: delegate to the init script's own restart (includes sleep).
+    if (comptime builtin.os.tag == .linux) {
+        if (detectLinuxServiceManager(allocator) catch null) |mgr| {
+            if (mgr == .sysvinit) {
+                try runChecked(allocator, &.{ SYSVINIT_SERVICE_FILE, "restart" });
+                return;
+            }
+        }
+    }
     // Restart should still proceed when stop reports "already stopped"/"not loaded",
     // but should not mask unrelated stop failures.
     try stopServiceForRestart(allocator);
@@ -225,6 +238,7 @@ fn stopServiceForRestart(allocator: std.mem.Allocator) !void {
                 if (isOpenRcServiceMissingDetail(detail) or isOpenRcInactiveDetail(detail)) return;
                 return error.CommandFailed;
             },
+            .sysvinit => unreachable, // restartService delegates to init script directly
         }
     } else if (comptime builtin.os.tag == .windows) {
         const status = try runCaptureStatus(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
@@ -280,6 +294,21 @@ fn serviceStatus(allocator: std.mem.Allocator) !void {
                 try w.print("Script: {s}\n", .{OPENRC_SERVICE_FILE});
                 try w.flush();
             },
+            .sysvinit => {
+                if (!fileExistsAbsolute(SYSVINIT_SERVICE_FILE)) {
+                    try w.print("Service: not installed\n", .{});
+                    try w.print("Script: {s}\n", .{SYSVINIT_SERVICE_FILE});
+                    try w.flush();
+                    return;
+                }
+                const status = try runCaptureStatus(allocator, &.{ SYSVINIT_SERVICE_FILE, "status" });
+                defer allocator.free(status.stdout);
+                defer allocator.free(status.stderr);
+                const out_trimmed = std.mem.trim(u8, status.stdout, " \t\n\r");
+                try w.print("Service state: {s}\n", .{if (out_trimmed.len > 0) out_trimmed else "unknown"});
+                try w.print("Script: {s}\n", .{SYSVINIT_SERVICE_FILE});
+                try w.flush();
+            },
         }
     } else if (comptime builtin.os.tag == .windows) {
         const status = try runCaptureStatus(allocator, &.{ "sc.exe", "query", WINDOWS_SERVICE_NAME });
@@ -323,6 +352,7 @@ fn uninstall(allocator: std.mem.Allocator) !void {
                 try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
             },
             .openrc => try uninstallOpenRc(allocator),
+            .sysvinit => try uninstallSysvinit(allocator),
         }
     } else if (comptime builtin.os.tag == .windows) {
         try uninstallWindows(allocator);
@@ -430,6 +460,7 @@ fn installLinux(allocator: std.mem.Allocator) !void {
     switch (try detectLinuxServiceManager(allocator)) {
         .systemd_user => try installLinuxSystemd(allocator),
         .openrc => try installLinuxOpenRc(allocator),
+        .sysvinit => try installLinuxSysvinit(allocator),
     }
 }
 
@@ -510,6 +541,76 @@ fn installLinuxOpenRc(allocator: std.mem.Allocator) !void {
     try file.chmod(0o755);
 
     try openRcUpdateChecked(allocator, &.{ "add", OPENRC_SERVICE_NAME, "default" });
+}
+
+fn installLinuxSysvinit(allocator: std.mem.Allocator) !void {
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
+
+    const script = try std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\### BEGIN INIT INFO
+        \\# Provides:          nullclaw
+        \\# Required-Start:    $network $remote_fs
+        \\# Required-Stop:     $network $remote_fs
+        \\# Default-Start:     2 3 4 5
+        \\# Default-Stop:      0 1 6
+        \\# Description:       NullClaw AI assistant gateway
+        \\### END INIT INFO
+        \\
+        \\DAEMON="{s}"
+        \\PIDFILE=/var/run/nullclaw.pid
+        \\LOGFILE=/var/log/nullclaw.log
+        \\
+        \\case "$1" in
+        \\  start)
+        \\    echo "Starting nullclaw..."
+        \\    start-stop-daemon --start --background --make-pidfile --pidfile $PIDFILE \
+        \\      --startas /bin/sh -- -c "exec $DAEMON gateway >> $LOGFILE 2>&1"
+        \\    ;;
+        \\  stop)
+        \\    echo "Stopping nullclaw..."
+        \\    start-stop-daemon --stop --pidfile $PIDFILE --retry 5
+        \\    rm -f $PIDFILE
+        \\    ;;
+        \\  restart)
+        \\    $0 stop
+        \\    sleep 1
+        \\    $0 start
+        \\    ;;
+        \\  status)
+        \\    if [ -f $PIDFILE ] && kill -0 $(cat $PIDFILE) 2>/dev/null; then
+        \\      echo "nullclaw is running (PID $(cat $PIDFILE))"
+        \\    else
+        \\      echo "nullclaw is not running"
+        \\    fi
+        \\    ;;
+        \\  *)
+        \\    echo "Usage: $0 {{start|stop|restart|status}}"
+        \\    exit 1
+        \\    ;;
+        \\esac
+    , .{service_exe_path});
+    defer allocator.free(script);
+
+    const file = try std.fs.createFileAbsolute(SYSVINIT_SERVICE_FILE, .{});
+    defer file.close();
+    try file.writeAll(script);
+    try file.chmod(0o755);
+
+    // Enable at boot via update-rc.d if available.
+    runChecked(allocator, &.{ "update-rc.d", "nullclaw", "defaults" }) catch {};
+}
+
+fn uninstallSysvinit(allocator: std.mem.Allocator) !void {
+    runChecked(allocator, &.{ SYSVINIT_SERVICE_FILE, "stop" }) catch {};
+    runChecked(allocator, &.{ "update-rc.d", "-f", "nullclaw", "remove" }) catch {};
+    std.fs.deleteFileAbsolute(SYSVINIT_SERVICE_FILE) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn installWindows(allocator: std.mem.Allocator) !void {
@@ -751,14 +852,26 @@ fn detectLinuxServiceManager(allocator: std.mem.Allocator) !LinuxServiceManager 
     }
 
     assertLinuxSystemdUserAvailable(allocator) catch |err| switch (err) {
-        error.SystemctlUnavailable, error.SystemdUserUnavailable => {
+        error.SystemctlUnavailable, error.SystemdUserUnavailable, error.FileNotFound => {
             if (linuxHasOpenRcSupport()) return .openrc;
+            if (linuxHasSysvinitSupport()) return .sysvinit;
             return err;
         },
         else => return err,
     };
 
     return .systemd_user;
+}
+
+/// SysVinit fallback: check for /etc/init.d/ and start-stop-daemon.
+fn linuxHasSysvinitSupport() bool {
+    std.fs.accessAbsolute("/etc/init.d", .{}) catch return false;
+    // start-stop-daemon is the portable SysVinit process manager.
+    for ([_][]const u8{ "/sbin/start-stop-daemon", "/usr/sbin/start-stop-daemon" }) |path| {
+        std.fs.accessAbsolute(path, .{}) catch continue;
+        return true;
+    }
+    return false;
 }
 
 fn shellDoubleQuoted(allocator: std.mem.Allocator, input: []const u8) ![]u8 {

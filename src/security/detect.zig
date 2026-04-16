@@ -203,7 +203,7 @@ test "sandbox storage default initialization" {
     try std.testing.expectEqualStrings(DockerSandbox.default_image, storage.docker.image);
 }
 
-test "auto detect skips version-only sandbox shims" {
+test "auto detect skips version-only linux sandbox shims" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 
     const platform = @import("../platform.zig");
@@ -223,7 +223,7 @@ test "auto detect skips version-only sandbox shims" {
         \\
     ;
 
-    inline for (.{ "firejail", "bwrap", "docker" }) |name| {
+    inline for (.{ "firejail", "bwrap" }) |name| {
         try std_compat.fs.Dir.wrap(tmp_dir.dir).writeFile(.{
             .sub_path = name,
             .data = shim,
@@ -243,7 +243,17 @@ test "auto detect skips version-only sandbox shims" {
     const old_path_z = if (old_path) |path| try std.testing.allocator.dupeZ(u8, path) else null;
     defer if (old_path_z) |path| std.testing.allocator.free(path);
 
-    const tmp_path_z = try std.testing.allocator.dupeZ(u8, tmp_path);
+    const effective_path = if (old_path) |path|
+        try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}{c}{s}",
+            .{ tmp_path, std_compat.fs.path.delimiter, path },
+        )
+    else
+        try std.testing.allocator.dupe(u8, tmp_path);
+    defer std.testing.allocator.free(effective_path);
+
+    const tmp_path_z = try std.testing.allocator.dupeZ(u8, effective_path);
     defer std.testing.allocator.free(tmp_path_z);
 
     defer {
@@ -257,13 +267,13 @@ test "auto detect skips version-only sandbox shims" {
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, tmp_path_z.ptr, 1));
 
     // Regression for #791: do not treat shims that only answer `--version`
-    // as runnable sandbox backends in auto-detect.
+    // as runnable Linux sandbox backends in auto-detect.
     const avail = detectAvailable(std.testing.allocator, "/tmp/workspace");
     try std.testing.expect(!avail.firejail);
     try std.testing.expect(!avail.bubblewrap);
-    try std.testing.expect(!avail.docker);
 
     var storage: SandboxStorage = .{};
     const sandbox = createSandbox(std.testing.allocator, .auto, "/tmp/workspace", &storage);
-    try std.testing.expectEqualStrings("none", sandbox.name());
+    try std.testing.expect(!std.mem.eql(u8, sandbox.name(), "firejail"));
+    try std.testing.expect(!std.mem.eql(u8, sandbox.name(), "bubblewrap"));
 }

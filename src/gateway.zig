@@ -3,19 +3,22 @@
 //! Mirrors ZeroClaw's axum-based gateway with:
 //!   - Sliding-window rate limiting (per-IP)
 //!   - Idempotency store (deduplicates webhook requests)
-//!   - Body size limits (64KB max)
-//!   - Request timeouts (30s)
+//!   - Body size limits (configurable, default 64KB)
+//!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /pair, /logout, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const daemon = @import("daemon.zig");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
+const fs_compat = @import("fs_compat.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const http_util = @import("http_util.zig");
@@ -43,7 +46,6 @@ const buildConversationContext = @import("agent/prompt.zig").buildConversationCo
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
 const MAX_HEADER_SIZE: usize = 8_192;
-const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -83,12 +85,14 @@ fn simpleConversationContext(
     channel: []const u8,
     account_id: ?[]const u8,
     peer_id: []const u8,
+    delivery_chat_id: ?[]const u8,
     is_group: bool,
     group_id: ?[]const u8,
 ) ?ConversationContext {
     return buildConversationContext(.{
         .channel = channel,
         .account_id = account_id,
+        .delivery_chat_id = delivery_chat_id,
         .peer_id = peer_id,
         .is_group = is_group,
         .group_id = if (is_group) (group_id orelse peer_id) else null,
@@ -164,7 +168,7 @@ const GatewayTurnToolEvent = struct {
 /// Used to enrich webhook responses with tool execution summaries.
 const GatewayThreadObserver = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     next_seq: u64 = 0,
     events: std.ArrayListUnmanaged(GatewayObservedToolEvent) = .empty,
 
@@ -173,6 +177,8 @@ const GatewayThreadObserver = struct {
         .record_metric = recordMetric,
         .flush = flush,
         .name = name,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
     };
 
     pub fn init(allocator: std.mem.Allocator) GatewayThreadObserver {
@@ -247,6 +253,10 @@ const GatewayThreadObserver = struct {
 
     fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
     fn flush(_: *anyopaque) void {}
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
     fn name(_: *anyopaque) []const u8 {
         return "gateway_thread";
     }
@@ -296,7 +306,7 @@ pub const SlidingWindowRateLimiter = struct {
             .limit_per_window = limit_per_window,
             .window_ns = @as(i128, @intCast(window_secs)) * 1_000_000_000,
             .entries = .empty,
-            .last_sweep = std.time.nanoTimestamp(),
+            .last_sweep = std_compat.time.nanoTimestamp(),
         };
     }
 
@@ -312,7 +322,7 @@ pub const SlidingWindowRateLimiter = struct {
     pub fn allow(self: *SlidingWindowRateLimiter, allocator: std.mem.Allocator, key: []const u8) bool {
         if (self.limit_per_window == 0) return true;
 
-        const now = std.time.nanoTimestamp();
+        const now = std_compat.time.nanoTimestamp();
         const cutoff = now - self.window_ns;
 
         // Periodic sweep
@@ -420,7 +430,7 @@ pub const IdempotencyStore = struct {
     /// Returns true if this key is new and is now recorded.
     /// Returns false if this is a duplicate.
     pub fn recordIfNew(self: *IdempotencyStore, allocator: std.mem.Allocator, key: []const u8) bool {
-        const now = std.time.nanoTimestamp();
+        const now = std_compat.time.nanoTimestamp();
         const cutoff = now - self.ttl_ns;
 
         // Clean expired keys (simple sweep)
@@ -691,9 +701,23 @@ pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[
     return guard.isAuthenticated(token);
 }
 
+/// Revoke a currently authenticated bearer token. Returns false when pairing is
+/// unavailable, disabled, or the token is missing/invalid.
+pub fn revokeAuthorizedBearerToken(pairing_guard: ?*PairingGuard, bearer_token: ?[]const u8) bool {
+    const guard = pairing_guard orelse return false;
+    if (!guard.requirePairing()) return false;
+    const token = bearer_token orelse return false;
+    if (!guard.isAuthenticated(token)) return false;
+    return guard.revokeToken(token);
+}
+
 /// Format the /pair success payload. Returns null when buffer is too small.
-pub fn formatPairSuccessResponse(buf: []u8, token: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{{\"status\":\"paired\",\"token\":\"{s}\"}}", .{token}) catch null;
+pub fn formatPairSuccessResponse(buf: []u8, token: []const u8, expires_in_secs: u32) ?[]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"status\":\"paired\",\"token\":\"{s}\",\"expires_in\":{d}}}",
+        .{ token, expires_in_secs },
+    ) catch null;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -802,12 +826,14 @@ pub fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
 pub fn jsonWrapField(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeByte('"');
     try w.writeAll(key);
     try w.writeAll("\":\"");
     try jsonEscapeInto(w, value);
     try w.writeByte('"');
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -816,10 +842,12 @@ pub fn jsonWrapField(allocator: std.mem.Allocator, key: []const u8, value: []con
 pub fn jsonWrapResponse(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeAll("{\"status\":\"ok\",\"response\":\"");
     try jsonEscapeInto(w, response);
     try w.writeAll("\"}");
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -830,7 +858,8 @@ fn buildThreadEventsJson(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeByte('[');
 
@@ -851,6 +880,7 @@ fn buildThreadEventsJson(
     }
 
     try w.writeByte(']');
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -863,12 +893,14 @@ fn buildWebhookSuccessResponse(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeAll("{\"status\":\"ok\",\"response\":\"");
     try jsonEscapeInto(w, response_text);
     try w.writeAll("\",\"thread_events\":");
     try w.writeAll(thread_events_json);
     try w.writeByte('}');
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -877,10 +909,12 @@ fn buildWebhookSuccessResponse(
 fn jsonWrapChallenge(allocator: std.mem.Allocator, challenge: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeAll("{\"challenge\":\"");
     try jsonEscapeInto(w, challenge);
     try w.writeAll("\"}");
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1307,15 +1341,17 @@ fn verifySlackSignature(
     if (provided_hex.len != 64) return false;
 
     const ts = std.fmt.parseInt(i64, ts_trimmed, 10) catch return false;
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const delta = if (now >= ts) now - ts else ts - now;
     if (delta > 300) return false; // 5-minute replay window
 
     var base_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer base_buf.deinit(allocator);
-    const bw = base_buf.writer(allocator);
+    var base_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &base_buf);
+    const bw = &base_writer.writer;
     bw.print("v0:{s}:", .{ts_trimmed}) catch return false;
     bw.writeAll(body) catch return false;
+    base_buf = base_writer.toArrayList();
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac: [32]u8 = undefined;
@@ -1723,6 +1759,7 @@ fn webhookRouting(
             .sender_id = sender_id,
             .sender_username = sender_username,
             .sender_display_name = sender_display_name,
+            .delivery_chat_id = bus_chat_id,
             .peer_id = peer_id,
             .is_group = if (peer_kind) |kind| kind != .direct else null,
             .group_id = if (peer_kind) |kind| if (kind == .direct) null else peer_id else null,
@@ -2135,7 +2172,18 @@ fn headerEndOffset(raw: []const u8) ?usize {
     return pos + separator.len;
 }
 
-fn expectedHttpRequestSize(raw: []const u8) !?usize {
+fn maxHttpRequestSize(max_body: usize) usize {
+    return std.math.add(usize, MAX_HEADER_SIZE, max_body) catch std.math.maxInt(usize);
+}
+
+fn effectiveRequestReadTimeoutSecs(config_opt: ?*const Config) u64 {
+    if (config_opt) |cfg| {
+        if (cfg.gateway.request_timeout_secs > 0) return cfg.gateway.request_timeout_secs;
+    }
+    return REQUEST_TIMEOUT_SECS;
+}
+
+fn expectedHttpRequestSize(raw: []const u8, max_body: usize) !?usize {
     const header_end = headerEndOffset(raw) orelse {
         if (raw.len > MAX_HEADER_SIZE) return error.RequestTooLarge;
         return null;
@@ -2148,18 +2196,22 @@ fn expectedHttpRequestSize(raw: []const u8) !?usize {
     if (trimmed.len == 0) return error.InvalidContentLength;
 
     const content_length = std.fmt.parseInt(usize, trimmed, 10) catch return error.InvalidContentLength;
-    if (content_length > MAX_BODY_SIZE) return error.RequestTooLarge;
+    if (content_length > max_body) return error.RequestTooLarge;
 
+    const max_request_size = maxHttpRequestSize(max_body);
     const total = std.math.add(usize, header_end, content_length) catch return error.RequestTooLarge;
-    if (total > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
+    if (total > max_request_size) return error.RequestTooLarge;
     return total;
 }
 
-fn configureRequestReadTimeout(stream: *std.net.Stream) void {
+fn configureRequestReadTimeout(stream: *std_compat.net.Stream, timeout_secs: u64) void {
+    if (comptime builtin.os.tag == .windows) return;
     if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
 
+    const zero_timeout = std.posix.timeval{ .sec = 0, .usec = 0 };
+    const TimevalSecs = @TypeOf(zero_timeout.sec);
     const timeout = std.posix.timeval{
-        .sec = @intCast(REQUEST_TIMEOUT_SECS),
+        .sec = @intCast(@min(timeout_secs, @as(u64, std.math.maxInt(TimevalSecs)))),
         .usec = 0,
     };
     std.posix.setsockopt(
@@ -2170,25 +2222,25 @@ fn configureRequestReadTimeout(stream: *std.net.Stream) void {
     ) catch {};
 }
 
-fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
+fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype, max_body: usize) ![]u8 {
     var request_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer request_buf.deinit(allocator);
-
     var expected_total: ?usize = null;
+    const max_request_size = maxHttpRequestSize(max_body);
     var chunk: [2048]u8 = undefined;
 
     while (true) {
-        const n = reader.read(&chunk) catch |err| switch (err) {
-            error.WouldBlock, error.ConnectionTimedOut => return error.RequestTimeout,
-            else => return err,
+        const n = reader.read(&chunk) catch |err| {
+            if (err == error.Timeout or err == error.WouldBlock) return error.RequestTimeout;
+            return err;
         };
         if (n == 0) return error.IncompleteRequest;
 
         try request_buf.appendSlice(allocator, chunk[0..n]);
-        if (request_buf.items.len > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
+        if (request_buf.items.len > max_request_size) return error.RequestTooLarge;
 
         if (expected_total == null) {
-            expected_total = try expectedHttpRequestSize(request_buf.items);
+            expected_total = try expectedHttpRequestSize(request_buf.items, max_body);
         }
 
         if (expected_total) |total| {
@@ -2200,8 +2252,13 @@ fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype) ![]u
     }
 }
 
-fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream) ![]u8 {
-    return readHttpRequestFromReader(allocator, stream);
+fn readHttpRequest(allocator: std.mem.Allocator, stream: *std_compat.net.Stream, max_body: usize) ![]u8 {
+    return readHttpRequestFromReader(allocator, stream, max_body);
+}
+
+fn maybeProbeA2aVision(session_mgr: anytype, allocator: std.mem.Allocator, cfg: *const Config) void {
+    if (!cfg.a2a.enabled) return;
+    session_mgr.probeVision(allocator);
 }
 
 const CONTENT_TYPE_JSON = "application/json";
@@ -2221,14 +2278,14 @@ fn formatHttpResponseHeader(
     );
 }
 
-fn writeHttpResponse(stream: *std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
+fn writeHttpResponse(stream: *std_compat.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
     var header_buf: [512]u8 = undefined;
     const header = formatHttpResponseHeader(&header_buf, status, content_type, body.len) catch return;
     _ = stream.write(header) catch return;
     if (body.len > 0) _ = stream.write(body) catch {};
 }
 
-fn writeJsonResponse(stream: *std.net.Stream, status: []const u8, body: []const u8) void {
+fn writeJsonResponse(stream: *std_compat.net.Stream, status: []const u8, body: []const u8) void {
     writeHttpResponse(stream, status, CONTENT_TYPE_JSON, body);
 }
 
@@ -2236,10 +2293,10 @@ fn writeJsonResponse(stream: *std.net.Stream, status: []const u8, body: []const 
 /// Returns the agent's response text. Caller owns the returned memory.
 pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
     // Find our own executable path
-    var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = std.fs.selfExePath(&self_buf) catch "nullclaw";
+    var self_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const self_path = std_compat.fs.selfExePath(&self_buf) catch "nullclaw";
 
-    var child = std.process.Child.init(
+    var child = std_compat.process.Child.init(
         &[_][]const u8{ self_path, "agent", "-m", message },
         allocator,
     );
@@ -2284,7 +2341,8 @@ pub fn sendTelegramReply(
     // JSON-escape the text for the body
     var body_buf: std.ArrayList(u8) = .empty;
     defer body_buf.deinit(allocator);
-    const w = body_buf.writer(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_buf);
+    const w = &body_writer.writer;
     try w.print("{{\"chat_id\":{d},\"text\":\"", .{chat_id});
     for (text) |c| {
         switch (c) {
@@ -2301,10 +2359,11 @@ pub fn sendTelegramReply(
         try w.print(",\"message_thread_id\":{d}", .{thread_id});
     }
     try w.writeAll("}");
+    body_buf = body_writer.toArrayList();
 
     const body = body_buf.items;
 
-    var curl_child = std.process.Child.init(
+    var curl_child = std_compat.process.Child.init(
         &[_][]const u8{
             "curl", "-s",                             "-X", "POST",
             "-H",   "Content-Type: application/json", "-d", body,
@@ -3024,6 +3083,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "telegram",
                     tg_account_id,
                     cid_str,
+                    chat_target,
                     std.mem.eql(u8, peer_kind, "group"),
                     if (std.mem.eql(u8, peer_kind, "group")) cid_str else null,
                 );
@@ -3170,6 +3230,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "whatsapp",
                     wa_account_id,
                     wa_peer_id,
+                    wa_chat_target,
                     wa_is_group,
                     wa_group_id,
                 );
@@ -3233,6 +3294,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "whatsapp",
                     wa_account_id,
                     wa_peer_id,
+                    wa_chat_target_ns,
                     wa_is_group,
                     wa_group_id,
                 );
@@ -3443,6 +3505,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                         "slack",
                         slack_cfg.account_id,
                         if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                        selection.target,
                         !interactive_target.is_dm,
                         if (!interactive_target.is_dm) interactive_target.channel_id else null,
                     );
@@ -3584,6 +3647,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             "slack",
             slack_cfg.account_id,
             if (is_dm) sender_id else channel_id,
+            channel_id,
             !is_dm,
             if (!is_dm) channel_id else null,
         );
@@ -3720,6 +3784,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                         "line",
                         line_account_id,
                         line_peer.id,
+                        line_target,
                         !std.mem.eql(u8, line_peer.kind, "direct"),
                         if (!std.mem.eql(u8, line_peer.kind, "direct")) line_peer.id else null,
                     );
@@ -3847,6 +3912,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
             const conversation_context: ?ConversationContext = simpleConversationContext(
                 "lark",
                 lark_account_id,
+                msg.sender,
                 msg.sender,
                 msg.is_group,
                 if (msg.is_group) msg.sender else null,
@@ -4085,7 +4151,7 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
         const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch null;
         if (reply) |r| {
             defer ctx.root_allocator.free(r);
-            const now_secs = std.time.timestamp();
+            const now_secs = std_compat.time.timestamp();
             const xml = channels.wechat.buildPassiveTextReply(
                 ctx.req_allocator,
                 inbound.from_user,
@@ -4386,6 +4452,7 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
                 .channel = "qq",
                 .account_id = account_id,
                 .sender_id = inbound.sender_id,
+                .delivery_chat_id = inbound.chat_id,
                 .peer_id = if (peer) |resolved| resolved.id else null,
                 .is_group = if (peer) |resolved| resolved.kind != .direct else null,
                 .group_id = if (peer) |resolved| if (resolved.kind == .direct) null else resolved.id else null,
@@ -4503,6 +4570,7 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
                 "max",
                 max_cfg.account_id,
                 peer_id,
+                reply_target,
                 inbound.is_group,
                 if (inbound.is_group) reply_target else null,
             );
@@ -4687,6 +4755,7 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         .account_id = teams_cfg.account_id,
         .sender_uuid = from_id,
         .sender_name = from_name,
+        .delivery_chat_id = chat_id,
         .peer_id = peer_info.peer.id,
         .is_group = !peer_info.is_dm,
         .group_id = if (peer_info.is_dm) null else peer_info.peer.id,
@@ -4794,7 +4863,7 @@ fn isValidBotFrameworkServiceUrl(url: []const u8) bool {
 /// Store Teams conversation reference (serviceUrl + conversationId) to a JSON file
 /// for proactive messaging. Uses config_dir from the config.
 fn teamsStoreConversationRef(config: *const Config, service_url: []const u8, conversation_id: []const u8) void {
-    const config_dir = std.fs.path.dirname(config.config_path) orelse return;
+    const config_dir = std_compat.fs.path.dirname(config.config_path) orelse return;
     var path_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/teams_conversation_ref.json", .{config_dir}) catch return;
 
@@ -4805,7 +4874,7 @@ fn teamsStoreConversationRef(config: *const Config, service_url: []const u8, con
         .{ service_url, conversation_id },
     ) catch return;
 
-    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+    const file = fs_compat.createPath(path, .{}) catch |err| {
         std.log.scoped(.teams).warn("Failed to save conversation reference: {}", .{err});
         return;
     };
@@ -4824,7 +4893,7 @@ fn applyRuntimeProviderOverrides(config: *const Config) !void {
 const A2aStreamingWorker = struct {
     allocator: std.mem.Allocator,
     body: []u8,
-    stream: std.net.Stream,
+    stream: std_compat.net.Stream,
     registry: *a2a.TaskRegistry,
     session_mgr: *session_mod.SessionManager,
 
@@ -4839,7 +4908,7 @@ const A2aStreamingWorker = struct {
 fn spawnA2aStreamingWorker(
     allocator: std.mem.Allocator,
     body: []const u8,
-    stream: std.net.Stream,
+    stream: std_compat.net.Stream,
     registry: *a2a.TaskRegistry,
     session_mgr: *session_mod.SessionManager,
 ) !void {
@@ -4868,7 +4937,7 @@ fn spawnA2aStreamingWorker(
 // ── Shared scheduler state for cross-thread access ───────────────
 
 var g_shared_scheduler: ?*cron_mod.CronScheduler = null;
-var g_shared_scheduler_mutex: std.Thread.Mutex = .{};
+var g_shared_scheduler_mutex: std_compat.sync.Mutex = .{};
 
 pub fn lockSharedScheduler() void {
     g_shared_scheduler_mutex.lock();
@@ -4891,7 +4960,7 @@ pub fn clearSharedScheduler() void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -4911,6 +4980,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
     }
     defer if (owned_config) |*c| c.deinit();
+    const max_body = if (config_opt) |cfg| cfg.gateway.max_body_size_bytes else MAX_BODY_SIZE;
+    const request_timeout_secs = effectiveRequestReadTimeoutSecs(config_opt);
 
     // Provider runtime bundle (primary + reliability wrapper) must outlive the accept loop.
     var provider_bundle_opt: ?providers.runtime_bundle.RuntimeProviderBundle = null;
@@ -5064,6 +5135,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .subagent_manager = subagent_manager_opt,
                     .bootstrap_provider = bootstrap_provider_opt,
                     .backend_name = cfg.memory.backend,
+                    .sandbox_backend = cfg.security.sandbox.backend,
+                    .sandbox_enabled = cfg.sandboxEnabled(),
                 }) catch &.{};
 
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, runtime_observer.?.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
@@ -5075,6 +5148,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
                 }
                 session_mgr_opt = sm;
+                // Eagerly probe whether the model accepts image input so we can
+                // advertise multi_modal capability in the agent card accurately.
+                if (session_mgr_opt) |*mgr| maybeProbeA2aVision(mgr, allocator, cfg);
             }
         }
     } else {
@@ -5096,13 +5172,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     defer if (sec_tracker_opt) |*tracker| tracker.deinit();
 
     // Resolve the listen address
-    const addr = try std.net.Address.resolveIp(host, port);
+    const addr = try std_compat.net.Address.resolveIp(host, port);
     const daemon_mode = event_bus != null;
 
     // Best-effort probe to detect if the port is already in use.
     // A TOCTOU gap exists between probe and listen(), but listen() will still
     // fail with AddressInUse if another process binds the port in that window.
-    const probe_conn = std.net.tcpConnectToAddress(addr) catch null;
+    const probe_conn = std_compat.net.tcpConnectToAddress(addr) catch null;
     if (probe_conn) |conn| {
         conn.close();
         return error.AddressInUse;
@@ -5117,7 +5193,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     defer server.deinit();
 
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();
@@ -5143,14 +5219,14 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
         var conn = server.accept() catch |err| switch (err) {
             error.WouldBlock => {
-                std.Thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
+                std_compat.thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
                 continue;
             },
             else => continue,
         };
         var close_conn = true;
         defer if (close_conn) conn.stream.close();
-        configureRequestReadTimeout(&conn.stream);
+        configureRequestReadTimeout(&conn.stream, request_timeout_secs);
 
         // Per-request arena — all request-scoped allocations freed in one shot
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -5158,7 +5234,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const req_allocator = arena.allocator();
 
         // Read full HTTP request (headers + optional body).
-        const raw = readHttpRequest(req_allocator, &conn.stream) catch |err| {
+        const raw = readHttpRequest(req_allocator, &conn.stream, max_body) catch |err| {
             switch (err) {
                 error.RequestTooLarge => writeJsonResponse(&conn.stream, "413 Payload Too Large", "{\"error\":\"request too large\"}"),
                 error.InvalidContentLength => writeJsonResponse(&conn.stream, "400 Bad Request", "{\"error\":\"invalid content-length\"}"),
@@ -5176,12 +5252,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const target = parts.next() orelse continue;
 
         // Simple routing — control endpoints + descriptor-driven channel webhooks.
-        const ControlRoute = enum { health, ready, webhook, pair };
+        const ControlRoute = enum { health, ready, webhook, pair, logout };
         const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
             .{ "/webhook", .webhook },
             .{ "/pair", .pair },
+            .{ "/logout", .logout },
         });
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const is_post = std.mem.eql(u8, method_str, "POST");
@@ -5264,7 +5341,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             // A2A Agent Card discovery (public, no auth).
             if (config_opt) |cfg| {
                 if (cfg.a2a.enabled) {
-                    const card = a2a.handleAgentCard(req_allocator, cfg);
+                    const vision_capable = if (session_mgr_opt) |sm| sm.vision_capable else null;
+                    const card = a2a.handleAgentCard(req_allocator, cfg, vision_capable);
                     response_status = card.status;
                     response_body = card.body;
                 } else {
@@ -5413,7 +5491,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         switch (guard.attemptPair(pairing_code)) {
                             .paired => |token| {
                                 defer allocator.free(token);
-                                if (formatPairSuccessResponse(&pair_response_buf, token)) |pair_resp| {
+                                if (formatPairSuccessResponse(&pair_response_buf, token, guard.tokenExpiresInSecs())) |pair_resp| {
                                     response_body = pair_resp;
                                 } else {
                                     response_status = "500 Internal Server Error";
@@ -5448,6 +5526,22 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     } else {
                         response_status = "500 Internal Server Error";
                         response_body = "{\"error\":\"pairing unavailable\"}";
+                    }
+                }
+            },
+            .logout => {
+                if (!is_post) {
+                    response_status = "405 Method Not Allowed";
+                    response_body = "{\"error\":\"method not allowed\"}";
+                } else {
+                    const auth_header = extractHeader(raw, "Authorization");
+                    const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                    const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                    if (!revokeAuthorizedBearerToken(pairing_guard, bearer)) {
+                        response_status = "401 Unauthorized";
+                        response_body = "{\"error\":\"unauthorized\"}";
+                    } else {
+                        response_body = "{\"status\":\"revoked\"}";
                     }
                 }
             },
@@ -5994,8 +6088,12 @@ test "rate limiter window_ns calculation" {
     try std.testing.expectEqual(@as(i128, 120_000_000_000), limiter.window_ns);
 }
 
-test "MAX_BODY_SIZE is 64KB" {
+test "MAX_BODY_SIZE is 64KB (default)" {
     try std.testing.expectEqual(@as(usize, 64 * 1024), MAX_BODY_SIZE);
+}
+
+test "maxHttpRequestSize saturates on overflow" {
+    try std.testing.expectEqual(std.math.maxInt(usize), maxHttpRequestSize(std.math.maxInt(usize)));
 }
 
 test "RATE_LIMIT_WINDOW_SECS is 60" {
@@ -6004,6 +6102,20 @@ test "RATE_LIMIT_WINDOW_SECS is 60" {
 
 test "REQUEST_TIMEOUT_SECS is 30" {
     try std.testing.expectEqual(@as(u64, 30), REQUEST_TIMEOUT_SECS);
+}
+
+test "effectiveRequestReadTimeoutSecs uses configured value and defaults zero to 30" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    cfg.gateway.request_timeout_secs = 45;
+    try std.testing.expectEqual(@as(u64, 45), effectiveRequestReadTimeoutSecs(&cfg));
+
+    cfg.gateway.request_timeout_secs = 0;
+    try std.testing.expectEqual(@as(u64, REQUEST_TIMEOUT_SECS), effectiveRequestReadTimeoutSecs(&cfg));
 }
 
 test "rate limiter different keys do not interfere" {
@@ -6115,18 +6227,37 @@ test "isWebhookAuthorized requires valid bearer token when pairing enabled" {
     try std.testing.expect(!isWebhookAuthorized(&guard, "zc_invalid"));
 }
 
+test "revokeAuthorizedBearerToken removes authenticated token" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(revokeAuthorizedBearerToken(&guard, "zc_valid"));
+    try std.testing.expect(!guard.isAuthenticated("zc_valid"));
+}
+
+test "revokeAuthorizedBearerToken rejects missing or invalid tokens" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(!revokeAuthorizedBearerToken(&guard, null));
+    try std.testing.expect(!revokeAuthorizedBearerToken(&guard, "zc_invalid"));
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+}
+
 test "formatPairSuccessResponse includes paired token" {
     var buf: [256]u8 = undefined;
-    const response = formatPairSuccessResponse(&buf, "zc_token_123") orelse unreachable;
+    const response = formatPairSuccessResponse(&buf, "zc_token_123", 3600) orelse unreachable;
     try std.testing.expectEqualStrings(
-        "{\"status\":\"paired\",\"token\":\"zc_token_123\"}",
+        "{\"status\":\"paired\",\"token\":\"zc_token_123\",\"expires_in\":3600}",
         response,
     );
 }
 
 test "formatPairSuccessResponse fails when buffer is too small" {
     var buf: [8]u8 = undefined;
-    try std.testing.expect(formatPairSuccessResponse(&buf, "zc_token_123") == null);
+    try std.testing.expect(formatPairSuccessResponse(&buf, "zc_token_123", 3600) == null);
 }
 
 // ── extractHeader tests ──────────────────────────────────────────
@@ -7686,7 +7817,26 @@ test "webhookRouting uses route engine when standardized peer metadata is presen
     try std.testing.expect(std.mem.indexOf(u8, routing.metadata_json.?, "\"peer_id\":\"session-1\"") != null);
     try std.testing.expect(routing.conversation_context != null);
     try std.testing.expectEqualStrings("web", routing.conversation_context.?.channel.?);
+    try std.testing.expectEqualStrings("session-1", routing.conversation_context.?.delivery_chat_id.?);
     try std.testing.expectEqualStrings("session-1", routing.conversation_context.?.peer_id.?);
+}
+
+test "simpleConversationContext keeps delivery target separate from routing peer" {
+    const context = simpleConversationContext(
+        "slack",
+        "slack-main",
+        "user-42",
+        "D123456",
+        false,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("slack", context.channel.?);
+    try std.testing.expectEqualStrings("slack-main", context.account_id.?);
+    try std.testing.expectEqualStrings("D123456", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("user-42", context.peer_id.?);
+    try std.testing.expect(!context.is_group.?);
+    try std.testing.expect(context.group_id == null);
 }
 
 // ── extractBody tests ────────────────────────────────────────────
@@ -7710,34 +7860,48 @@ test "extractBody returns null for no separator" {
 
 test "expectedHttpRequestSize returns null when headers are incomplete" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
-    try std.testing.expect(try expectedHttpRequestSize(raw) == null);
+    try std.testing.expect(try expectedHttpRequestSize(raw, MAX_BODY_SIZE) == null);
 }
 
 test "expectedHttpRequestSize rejects oversized incomplete headers" {
     const raw = try std.testing.allocator.alloc(u8, MAX_HEADER_SIZE + 1);
     defer std.testing.allocator.free(raw);
     for (raw) |*byte| byte.* = 'a';
-    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw, MAX_BODY_SIZE));
 }
 
 test "expectedHttpRequestSize returns header length for requests without body" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw)).?);
+    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw, MAX_BODY_SIZE)).?);
 }
 
 test "expectedHttpRequestSize includes content length payload" {
     const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
-    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw)).?);
+    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw, MAX_BODY_SIZE)).?);
 }
 
 test "expectedHttpRequestSize rejects invalid content length" {
     const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\nhello";
-    try std.testing.expectError(error.InvalidContentLength, expectedHttpRequestSize(raw));
+    try std.testing.expectError(error.InvalidContentLength, expectedHttpRequestSize(raw, MAX_BODY_SIZE));
 }
 
 test "expectedHttpRequestSize rejects oversized content length" {
     const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999\r\n\r\n";
-    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw, MAX_BODY_SIZE));
+}
+
+test "expectedHttpRequestSize honors configured max body size" {
+    // Regression: gateway.max_body_size_bytes must raise the inbound cap for A2A inlineData uploads.
+    const content_length: usize = MAX_BODY_SIZE + 1;
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n",
+        .{content_length},
+    );
+    defer std.testing.allocator.free(raw);
+
+    const expected = (try expectedHttpRequestSize(raw, content_length)).?;
+    try std.testing.expectEqual((headerEndOffset(raw).? + content_length), expected);
 }
 
 test "readHttpRequestFromReader assembles fragmented request" {
@@ -7770,9 +7934,60 @@ test "readHttpRequestFromReader assembles fragmented request" {
     };
     var reader = ChunkedReader{ .chunks = chunks[0..] };
 
-    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader);
+    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE);
     defer std.testing.allocator.free(raw);
     try std.testing.expectEqualStrings(expected, raw);
+}
+
+test "readHttpRequestFromReader honors configured max body size above default" {
+    const ChunkedReader = struct {
+        chunks: []const []const u8,
+        chunk_idx: usize = 0,
+        offset_in_chunk: usize = 0,
+
+        fn read(self: *@This(), out: []u8) !usize {
+            while (self.chunk_idx < self.chunks.len and self.offset_in_chunk >= self.chunks[self.chunk_idx].len) {
+                self.chunk_idx += 1;
+                self.offset_in_chunk = 0;
+            }
+            if (self.chunk_idx >= self.chunks.len) return 0;
+
+            const chunk = self.chunks[self.chunk_idx];
+            const remaining = chunk[self.offset_in_chunk..];
+            const n = @min(out.len, remaining.len);
+            std.mem.copyForwards(u8, out[0..n], remaining[0..n]);
+            self.offset_in_chunk += n;
+            return n;
+        }
+    };
+
+    // Regression: requests larger than 64 KiB must succeed when config raises the limit.
+    const body_len = MAX_BODY_SIZE + 1;
+    const body = try std.testing.allocator.alloc(u8, body_len);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'a');
+
+    const header = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n",
+        .{body_len},
+    );
+    defer std.testing.allocator.free(header);
+
+    const request = try std.mem.concat(std.testing.allocator, u8, &.{ header, body });
+    defer std.testing.allocator.free(request);
+
+    const split = header.len + 1024;
+    const chunks = [_][]const u8{
+        request[0..header.len],
+        request[header.len..split],
+        request[split..],
+    };
+    var reader = ChunkedReader{ .chunks = chunks[0..] };
+
+    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader, body_len);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqualStrings(request, raw);
 }
 
 test "readHttpRequestFromReader returns IncompleteRequest for truncated body" {
@@ -7801,7 +8016,7 @@ test "readHttpRequestFromReader returns IncompleteRequest for truncated body" {
         "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\nabc",
     };
     var reader = ChunkedReader{ .chunks = chunks[0..] };
-    try std.testing.expectError(error.IncompleteRequest, readHttpRequestFromReader(std.testing.allocator, &reader));
+    try std.testing.expectError(error.IncompleteRequest, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
 }
 
 test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
@@ -7814,7 +8029,60 @@ test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
     };
 
     var reader = TimeoutReader{};
-    try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader));
+    try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
+}
+
+test "readHttpRequestFromReader maps Timeout to RequestTimeout" {
+    const TimeoutReader = struct {
+        const ReadError = error{ Timeout, ConnectionTimedOut };
+
+        fn read(_: *@This(), _: []u8) ReadError!usize {
+            return error.Timeout;
+        }
+    };
+
+    var reader = TimeoutReader{};
+    try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
+}
+
+test "maybeProbeA2aVision skips probe when a2a is disabled" {
+    const ProbeSpy = struct {
+        calls: usize = 0,
+
+        fn probeVision(self: *@This(), _: std.mem.Allocator) void {
+            self.calls += 1;
+        }
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var spy = ProbeSpy{};
+    maybeProbeA2aVision(&spy, std.testing.allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 0), spy.calls);
+}
+
+test "maybeProbeA2aVision runs probe when a2a is enabled" {
+    const ProbeSpy = struct {
+        calls: usize = 0,
+
+        fn probeVision(self: *@This(), _: std.mem.Allocator) void {
+            self.calls += 1;
+        }
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.a2a.enabled = true;
+
+    var spy = ProbeSpy{};
+    maybeProbeA2aVision(&spy, std.testing.allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), spy.calls);
 }
 
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {
@@ -8045,13 +8313,15 @@ test "verifySlackSignature accepts valid signature" {
     const secret = "slack_signing_secret";
 
     var ts_buf: [32]u8 = undefined;
-    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch unreachable;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp()}) catch unreachable;
 
     var signed: std.ArrayListUnmanaged(u8) = .empty;
     defer signed.deinit(std.testing.allocator);
-    const sw = signed.writer(std.testing.allocator);
+    var signed_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &signed);
+    const sw = &signed_writer.writer;
     try sw.print("v0:{s}:", .{ts});
     try sw.writeAll(body);
+    signed = signed_writer.toArrayList();
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac: [HmacSha256.mac_length]u8 = undefined;
@@ -8073,13 +8343,15 @@ test "verifySlackSignature rejects stale timestamp" {
     const secret = "slack_signing_secret";
 
     var ts_buf: [32]u8 = undefined;
-    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp() - 900}) catch unreachable;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp() - 900}) catch unreachable;
 
     var signed: std.ArrayListUnmanaged(u8) = .empty;
     defer signed.deinit(std.testing.allocator);
-    const sw = signed.writer(std.testing.allocator);
+    var signed_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &signed);
+    const sw = &signed_writer.writer;
     try sw.print("v0:{s}:", .{ts});
     try sw.writeAll(body);
+    signed = signed_writer.toArrayList();
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac: [HmacSha256.mac_length]u8 = undefined;
@@ -8135,7 +8407,7 @@ test "hasSlackHttpEndpoint respects mode and webhook_path" {
 
 test "findSlackConfigForRequest selects account by verified signature" {
     const body = "{\"type\":\"event_callback\",\"event\":{\"type\":\"message\",\"channel\":\"C1\",\"user\":\"U1\",\"text\":\"hi\"}}";
-    const ts_val = std.time.timestamp();
+    const ts_val = std_compat.time.timestamp();
     var ts_buf: [32]u8 = undefined;
     const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{ts_val}) catch unreachable;
 
@@ -8144,9 +8416,11 @@ test "findSlackConfigForRequest selects account by verified signature" {
 
     var signed: std.ArrayListUnmanaged(u8) = .empty;
     defer signed.deinit(std.testing.allocator);
-    const sw = signed.writer(std.testing.allocator);
+    var signed_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &signed);
+    const sw = &signed_writer.writer;
     try sw.print("v0:{s}:", .{ts});
     try sw.writeAll(body);
+    signed = signed_writer.toArrayList();
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac_b: [HmacSha256.mac_length]u8 = undefined;
@@ -8329,8 +8603,10 @@ test "GatewayState event_bus defaults to null" {
 fn escapeToString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try jsonEscapeInto(w, input);
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -8569,7 +8845,7 @@ test "jsonWrapChallenge escapes malicious challenge value" {
 
 test "run returns AddressInUse when port is already bound" {
     // Find an available port by binding to port 0
-    const test_addr = try std.net.Address.resolveIp("127.0.0.1", 0);
+    const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
     var listener = try test_addr.listen(.{ .reuse_address = true });
     defer listener.deinit();
 

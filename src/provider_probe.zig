@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const config_mod = @import("config.zig");
 const codex_support = @import("codex_support.zig");
 const net_security = @import("net_security.zig");
@@ -37,7 +38,7 @@ fn isLocalEndpoint(url: []const u8) bool {
     return net_security.isLocalHost(host);
 }
 
-fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
+pub fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
     return switch (providers.classifyProvider(provider_name)) {
         .ollama_provider, .claude_cli_provider, .codex_cli_provider, .gemini_cli_provider, .openai_codex_provider => false,
         .compatible_provider => blk: {
@@ -61,7 +62,7 @@ fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool
 }
 
 fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8, timeout_secs: u64) !void {
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
@@ -73,7 +74,7 @@ fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8, timeo
     const WatchdogCtx = struct {
         finished: *std.atomic.Value(bool),
         timed_out: *std.atomic.Value(bool),
-        child: *std.process.Child,
+        child: *std_compat.process.Child,
         timeout_secs: u64,
     };
     const watchdog = struct {
@@ -86,7 +87,7 @@ fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8, timeo
                 if (ctx.finished.load(.acquire)) return;
                 const remaining = timeout_ns - elapsed_ns;
                 const step = if (remaining < tick_ns) remaining else tick_ns;
-                std.Thread.sleep(step);
+                std_compat.thread.sleep(step);
                 elapsed_ns += step;
             }
             if (ctx.finished.load(.acquire)) return;
@@ -113,7 +114,7 @@ fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8, timeo
     finished.store(true, .release);
     if (timed_out.load(.acquire)) return error.ComponentProbeTimeout;
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CliProcessFailed,
+        .exited => |code| if (code != 0) return error.CliProcessFailed,
         else => return error.CliProcessFailed,
     }
 }
@@ -217,7 +218,7 @@ fn probeCliProvider(
 
 fn writeProbeResult(result: ProbeResult) !void {
     var stdout_buf: [2048]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const out = &bw.interface;
 
     try out.writeAll("{\"provider\":");
@@ -366,6 +367,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         cfg.getProviderApiMode(provider),
         cfg.getProviderMaxStreamingPromptBytes(provider),
         cfg.getProviderChatTemplateEnableThinkingParam(provider),
+        cfg.getProviderExtraBodyParams(provider),
     );
     defer holder.deinit();
 

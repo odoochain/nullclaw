@@ -33,41 +33,63 @@ const OllamaChatResponse = struct {
 
 /// Extract actual tool name and arguments from potentially quirky tool call formats.
 ///
-/// Handles 3 patterns local models commonly produce:
+/// Handles local-model tool-name quirks before the agent dispatcher sees them:
 /// 1. Nested wrapper: {"name":"tool_call","arguments":{"name":"shell","arguments":{...}}}
 /// 2. Prefixed names: "tool.shell" -> "shell"
-/// 3. Normal: return as-is
+/// 3. Known alias spellings: "scheduler_tool" -> "schedule"
+/// 4. Normal: return as-is
+fn stripToolPrefixes(name: []const u8) []const u8 {
+    var normalized = name;
+    while (true) {
+        if (std.mem.eql(u8, normalized, "tool.call")) break;
+        if (std.mem.startsWith(u8, normalized, "tools.")) {
+            normalized = normalized["tools.".len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, normalized, "tool.")) {
+            normalized = normalized["tool.".len..];
+            continue;
+        }
+        break;
+    }
+
+    return normalized;
+}
+
+fn normalizeToolName(name: []const u8) []const u8 {
+    const normalized = stripToolPrefixes(name);
+    if (std.mem.eql(u8, normalized, "scheduler_tool") or std.mem.eql(u8, normalized, "schedule_tool")) {
+        return "schedule";
+    }
+
+    return normalized;
+}
+
 fn extractToolNameAndArgs(
     allocator: std.mem.Allocator,
     name: []const u8,
     arguments: std.json.Value,
 ) struct { name: []const u8, args: std.json.Value } {
+    _ = allocator;
+    const stripped_name = stripToolPrefixes(name);
+
     // Pattern 1: Nested tool_call wrapper
-    if (std.mem.eql(u8, name, "tool_call") or
-        std.mem.eql(u8, name, "tool.call") or
-        std.mem.startsWith(u8, name, "tool_call>") or
-        std.mem.startsWith(u8, name, "tool_call<"))
+    if (std.mem.eql(u8, stripped_name, "tool_call") or
+        std.mem.eql(u8, stripped_name, "tool.call") or
+        std.mem.startsWith(u8, stripped_name, "tool_call>") or
+        std.mem.startsWith(u8, stripped_name, "tool_call<"))
     {
         if (arguments == .object) {
             if (arguments.object.get("name")) |nested_name_val| {
                 if (nested_name_val == .string) {
-                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-                    return .{ .name = nested_name_val.string, .args = nested_args };
+                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = .empty };
+                    return .{ .name = normalizeToolName(nested_name_val.string), .args = nested_args };
                 }
             }
         }
     }
 
-    // Pattern 2: Prefixed tool name (tool.shell -> shell, tools.shell -> shell)
-    if (std.mem.startsWith(u8, name, "tools.")) {
-        return .{ .name = name["tools.".len..], .args = arguments };
-    }
-    if (std.mem.startsWith(u8, name, "tool.")) {
-        return .{ .name = name["tool.".len..], .args = arguments };
-    }
-
-    // Pattern 3: Normal
-    return .{ .name = name, .args = arguments };
+    return .{ .name = normalizeToolName(stripped_name), .args = arguments };
 }
 
 /// Convert Ollama native tool calls to the JSON format expected by the agent loop.
@@ -565,6 +587,21 @@ test "extractToolNameAndArgs with tools. prefix" {
     try std.testing.expectEqualStrings("file_read", result.name);
 }
 
+test "extractToolNameAndArgs normalizes scheduler_tool alias" {
+    const result = extractToolNameAndArgs(std.testing.allocator, "scheduler_tool", .null);
+    try std.testing.expectEqualStrings("schedule", result.name);
+}
+
+test "extractToolNameAndArgs normalizes schedule_tool alias" {
+    const result = extractToolNameAndArgs(std.testing.allocator, "schedule_tool", .null);
+    try std.testing.expectEqualStrings("schedule", result.name);
+}
+
+test "extractToolNameAndArgs normalizes prefixed schedule alias" {
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool.schedule_tool", .null);
+    try std.testing.expectEqualStrings("schedule", result.name);
+}
+
 test "ollama buildChatRequestBody with images" {
     const alloc = std.testing.allocator;
     const cp = &[_]root.ContentPart{
@@ -744,6 +781,30 @@ test "extractToolNameAndArgs with tool.call wrapper" {
     try std.testing.expectEqualStrings("file_read", result.name);
 }
 
+test "extractToolNameAndArgs with tool.call wrapper normalizes scheduler alias" {
+    // Regression: nested wrapper aliases must normalize before dispatch.
+    const json_str =
+        \\{"name":"scheduler_tool","arguments":{"action":"list"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool.call", parsed.value);
+    try std.testing.expectEqualStrings("schedule", result.name);
+}
+
+test "extractToolNameAndArgs with prefixed tool_call wrapper normalizes scheduler alias" {
+    // Regression: prefix stripping must happen before wrapper detection.
+    const json_str =
+        \\{"name":"scheduler_tool","arguments":{"action":"list"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = extractToolNameAndArgs(std.testing.allocator, "tool.tool_call", parsed.value);
+    try std.testing.expectEqualStrings("schedule", result.name);
+}
+
 test "formatToolCallsForLoop with single tool call" {
     const alloc = std.testing.allocator;
     const json_str =
@@ -856,6 +917,30 @@ test "parseResponse with tool_call nested wrapper unwraps correctly" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
     // And should NOT have "tool_call" as the function name
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"tool_call\"") == null);
+}
+
+test "parseResponse normalizes scheduler_tool alias to schedule" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"scheduler_tool","arguments":{"action":"list"}}}]}}
+    ;
+    const result = try OllamaProvider.parseResponse(alloc, body);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"scheduler_tool\"") == null);
+}
+
+test "parseResponse normalizes wrapped scheduler_tool alias to schedule" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"scheduler_tool","arguments":{"action":"list"}}}}]}}
+    ;
+    const result = try OllamaProvider.parseResponse(alloc, body);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"scheduler_tool\"") == null);
 }
 
 test "jsonEscapeString escapes quotes and backslashes" {

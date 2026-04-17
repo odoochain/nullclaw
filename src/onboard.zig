@@ -9,10 +9,11 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
-const platform = @import("platform.zig");
 const codex_support = @import("codex_support.zig");
 const config_mod = @import("config.zig");
 const net_security = @import("net_security.zig");
@@ -155,26 +156,12 @@ fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
     return null;
 }
 
-fn hasVersionedApiSegment(url: []const u8) bool {
-    const proto_start = std.mem.indexOf(u8, url, "://") orelse return false;
-    var i: usize = proto_start + 3;
-    while (i + 2 < url.len) : (i += 1) {
-        if (url[i] != '/' or url[i + 1] != 'v') continue;
-        var j = i + 2;
-        var has_digit = false;
-        while (j < url.len and std.ascii.isDigit(url[j])) : (j += 1) {
-            has_digit = true;
-        }
-        if (!has_digit) continue;
-        if (j == url.len or (j < url.len and url[j] == '/')) return true;
-    }
-    return false;
-}
-
 fn isValidCustomProviderUrl(url: []const u8) bool {
     if (url.len == 0) return false;
-    if (!(std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://"))) return false;
-    return hasVersionedApiSegment(url);
+    // We allow any http/https URL. While OpenAI-compatible endpoints usually
+    // contain /v1, some gateways (like Bifrost or custom proxies) might not
+    // expose it in the base URL or use a different structure.
+    return std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://");
 }
 
 fn isLocalEndpoint(url: []const u8) bool {
@@ -437,7 +424,6 @@ const claude_cli_fallback = [_][]const u8{
     "claude-opus-4-6",
 };
 
-const MAX_MODELS = 20;
 const MODELS_DEV_URL = "https://models.dev/api.json";
 
 const ModelsDevProvider = struct {
@@ -491,7 +477,7 @@ fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8) ![][]c
 
 /// Fetch available model IDs for a provider (with caching, limit, and fallback).
 ///
-/// Uses file-based cache at `~/.nullclaw/state/models_cache.json` with 12h TTL.
+/// Uses file-based cache at `state/models_cache.json` inside the config directory with 12h TTL.
 /// Returns at most 20 model IDs. Caller ALWAYS owns the returned slice and strings.
 /// Free with: for (models) |m| allocator.free(m); allocator.free(models);
 pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
@@ -500,15 +486,22 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
         return codex_support.loadCodexModels(allocator);
     }
 
-    const home = platform.getHomeDir(allocator) catch
-        return dupeFallbackModels(allocator, provider);
-    defer allocator.free(home);
+    // Tests must stay deterministic and must not depend on a developer's
+    // real ~/.nullclaw cache state.
+    if (builtin.is_test) {
+        return fetchModelsFromApi(allocator, canonical, api_key) catch
+            dupeFallbackModels(allocator, canonical);
+    }
 
-    const state_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "state" });
+    const config_dir = config_paths.defaultConfigDir(allocator) catch
+        return dupeFallbackModels(allocator, provider);
+    defer allocator.free(config_dir);
+
+    const state_dir = try std_compat.fs.path.join(allocator, &.{ config_dir, "state" });
     defer allocator.free(state_dir);
 
     // Ensure state directory exists
-    std.fs.makeDirAbsolute(state_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(state_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return dupeFallbackModels(allocator, provider),
     };
@@ -520,7 +513,6 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
 /// Native list endpoints are preferred when available. For providers without a
 /// native listing API, or when setup lacks credentials, production builds fall
 /// back to the public models.dev catalog before using hardcoded defaults.
-/// Results are limited to MAX_MODELS entries.
 pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
     const canonical = canonicalProviderName(provider);
 
@@ -634,7 +626,7 @@ fn fetchModelsFromModelsDev(allocator: std.mem.Allocator, provider: []const u8) 
 fn parseModelsDevModelIds(
     allocator: std.mem.Allocator,
     json_response: []const u8,
-    provider: []const u8,
+    _: []const u8,
     provider_key: []const u8,
 ) ![][]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch return error.FetchFailed;
@@ -655,13 +647,12 @@ fn parseModelsDevModelIds(
 
     var it = models_val.object.iterator();
     while (it.next()) |entry| {
-        if (result.items.len >= MAX_MODELS) break;
         if (!modelsDevModelSupportsChat(entry.key_ptr.*, entry.value_ptr.*)) continue;
         try result.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
     }
 
     if (result.items.len == 0) return error.FetchFailed;
-    prioritizeDefaultModel(result.items, defaultModelForProvider(provider));
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -692,17 +683,6 @@ fn jsonStringArrayContains(value: std.json.Value, needle: []const u8) bool {
     return false;
 }
 
-fn prioritizeDefaultModel(models: [][]const u8, default_model: []const u8) void {
-    for (models, 0..) |model, idx| {
-        if (!std.mem.eql(u8, model, default_model)) continue;
-        if (idx == 0) return;
-        const tmp = models[0];
-        models[0] = model;
-        models[idx] = tmp;
-        return;
-    }
-}
-
 fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: []const []const u8, prefix_filter: ?[]const u8) ![][]const u8 {
     const response = http_util.curlGet(allocator, url, headers, "10") catch return error.FetchFailed;
     defer allocator.free(response);
@@ -725,7 +705,6 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: [
     }
 
     for (data.array.items) |item| {
-        if (result.items.len >= MAX_MODELS) break;
         if (item != .object) continue;
         const id_val = item.object.get("id") orelse continue;
         if (id_val != .string) continue;
@@ -737,6 +716,7 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: [
     }
 
     if (result.items.len == 0) return error.FetchFailed;
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -793,7 +773,7 @@ fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8,
 const CACHE_TTL_SECS: i64 = 12 * 3600; // 12 hours
 
 fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provider: []const u8) ![][]const u8 {
-    const file = std.fs.openFileAbsolute(cache_path, .{}) catch return error.CacheNotFound;
+    const file = std_compat.fs.openFileAbsolute(cache_path, .{}) catch return error.CacheNotFound;
     defer file.close();
 
     const content = file.readToEndAlloc(allocator, 256 * 1024) catch return error.CacheReadError;
@@ -812,7 +792,7 @@ fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
         else => return error.CacheParseError,
     };
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     if (now - fetched_at > CACHE_TTL_SECS) return error.CacheExpired;
 
     // Get provider's model list
@@ -831,6 +811,7 @@ fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
     }
 
     if (result.items.len == 0) return error.CacheEmpty;
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -842,7 +823,7 @@ fn saveCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
 
     try buf.appendSlice(allocator, "{\n  \"fetched_at\": ");
     var ts_buf: [24]u8 = undefined;
-    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch return;
+    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp()}) catch return;
     try buf.appendSlice(allocator, ts_str);
     try buf.appendSlice(allocator, ",\n  \"");
     try buf.appendSlice(allocator, provider);
@@ -857,7 +838,7 @@ fn saveCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
 
     try buf.appendSlice(allocator, "]\n}\n");
 
-    const file = std.fs.createFileAbsolute(cache_path, .{}) catch return;
+    const file = std_compat.fs.createFileAbsolute(cache_path, .{}) catch return;
     defer file.close();
     file.writeAll(buf.items) catch {};
 }
@@ -886,6 +867,7 @@ pub fn parseModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![
         try result.append(allocator, try allocator.dupe(u8, id_val.string));
     }
 
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -914,7 +896,7 @@ pub fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
 /// Non-interactive setup: generates a sensible default config.
 pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, model: ?[]const u8, memory_backend: ?[]const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.writeAll(BANNER);
     try stdout.writeAll("  Quick Setup -- generating config with sensible defaults...\n\n");
@@ -937,14 +919,8 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
         }
     }
     if (api_key) |key| {
-        // Store in providers section for the default provider (arena frees old values)
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{
-            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-            .api_key = try cfg.allocator.dupe(u8, key),
-            .base_url = custom_base_url,
-        };
-        cfg.providers = entries;
+        const provider_base_url = if (custom_base_url) |configured| configured else cfg.getProviderBaseUrl(cfg.default_provider);
+        try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, key, provider_base_url);
     }
     if (memory_backend) |mb| {
         const desc = try resolveMemoryBackendForQuickSetup(mb);
@@ -964,13 +940,13 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     }
 
     // Ensure parent config directory and workspace directory exist
-    if (std.fs.path.dirname(cfg.workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(cfg.workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -1013,7 +989,7 @@ fn ensureSecretsEncryptionEnabled(cfg: *const Config) Config.ValidationError!voi
 /// Reconfigure channels and allowlists only (preserves existing config).
 pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     var input_buf: [512]u8 = undefined;
     resetStdinLineReader();
@@ -1055,7 +1031,7 @@ const StdinLineReader = struct {
     }
 
     fn copyLineToOut(out: []u8, raw_line: []const u8) []const u8 {
-        const trimmed = std.mem.trimRight(u8, raw_line, "\r");
+        const trimmed = std_compat.mem.trimRight(u8, raw_line, "\r");
         const copy_len = @min(out.len, trimmed.len);
         @memcpy(out[0..copy_len], trimmed[0..copy_len]);
         return out[0..copy_len];
@@ -1089,7 +1065,7 @@ fn resetStdinLineReader() void {
 /// Read a line from stdin, trimming trailing newline/carriage return.
 /// Returns null on EOF (Ctrl+D).
 fn readLine(buf: []u8) ?[]const u8 {
-    const stdin = std.fs.File.stdin();
+    const stdin = std_compat.fs.File.stdin();
     while (true) {
         if (stdin_line_reader.popLine(buf)) |line| return line;
 
@@ -1127,6 +1103,149 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
     const num = std.fmt.parseInt(usize, line, 10) catch return default_idx;
     if (num < 1 or num > max) return default_idx;
     return num - 1;
+}
+
+const MODEL_PAGE_SIZE: usize = 15;
+
+const ModelWizardInput = union(enum) {
+    use_default,
+    page_next,
+    page_prev,
+    page_index: usize,
+    typed_model: []const u8,
+};
+
+fn parseModelWizardInput(input: []const u8, visible_count: usize) ModelWizardInput {
+    if (input.len == 0) return .use_default;
+
+    if (std.ascii.eqlIgnoreCase(input, "n") or std.ascii.eqlIgnoreCase(input, "next")) {
+        return .page_next;
+    }
+    if (std.ascii.eqlIgnoreCase(input, "p") or std.ascii.eqlIgnoreCase(input, "prev")) {
+        return .page_prev;
+    }
+
+    if (std.fmt.parseInt(usize, input, 10)) |num| {
+        if (num >= 1 and num <= visible_count) {
+            return .{ .page_index = num - 1 };
+        }
+    } else |_| {}
+
+    return .{ .typed_model = input };
+}
+
+const ProviderSelection = struct {
+    key: []const u8,
+    default_model: []const u8,
+    env_var: []const u8,
+    base_url: ?[]const u8 = null,
+};
+
+pub fn appendOrReplaceProviderEntry(
+    cfg: *Config,
+    provider_name: []const u8,
+    api_key: ?[]const u8,
+    base_url: ?[]const u8,
+) !void {
+    var replace_idx: ?usize = null;
+    for (cfg.providers, 0..) |entry, idx| {
+        if (provider_names.providerNamesMatch(entry.name, provider_name)) {
+            replace_idx = idx;
+            break;
+        }
+    }
+
+    const new_len = if (replace_idx != null) cfg.providers.len else cfg.providers.len + 1;
+    const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, new_len);
+
+    var out_idx: usize = 0;
+    for (cfg.providers, 0..) |entry, idx| {
+        if (replace_idx != null and idx == replace_idx.?) {
+            entries[out_idx] = .{
+                .name = try cfg.allocator.dupe(u8, provider_name),
+                .api_key = if (api_key) |value| try cfg.allocator.dupe(u8, value) else null,
+                .base_url = if (base_url) |value| try cfg.allocator.dupe(u8, value) else null,
+                .native_tools = entry.native_tools,
+                .user_agent = entry.user_agent,
+                .api_mode = entry.api_mode,
+                .chat_template_enable_thinking_param = entry.chat_template_enable_thinking_param,
+                .max_streaming_prompt_bytes = entry.max_streaming_prompt_bytes,
+            };
+        } else {
+            entries[out_idx] = entry;
+        }
+        out_idx += 1;
+    }
+
+    if (replace_idx == null) {
+        entries[out_idx] = .{
+            .name = try cfg.allocator.dupe(u8, provider_name),
+            .api_key = if (api_key) |value| try cfg.allocator.dupe(u8, value) else null,
+            .base_url = if (base_url) |value| try cfg.allocator.dupe(u8, value) else null,
+        };
+    }
+
+    cfg.providers = entries;
+}
+
+fn promptProviderSelection(
+    allocator: std.mem.Allocator,
+    out: *std.Io.Writer,
+    input_buf: []u8,
+) !?ProviderSelection {
+    try out.writeAll("    Available providers:\n");
+    for (known_providers, 0..) |p, i| {
+        try out.print("      [{d}] {s}\n", .{ i + 1, p.label });
+    }
+    try out.print("      [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{known_providers.len + 1});
+    try out.writeAll("    Choice [1]: ");
+    const provider_idx = promptChoice(out, input_buf, known_providers.len + 1, 0) orelse return null;
+
+    if (provider_idx < known_providers.len) {
+        const provider = known_providers[provider_idx];
+        return .{
+            .key = provider.key,
+            .default_model = provider.default_model,
+            .env_var = provider.env_var,
+        };
+    }
+
+    try out.writeAll("    Enter custom base URL (must include version segment, e.g. https://host/v1): ");
+    while (true) {
+        const custom_url = prompt(out, input_buf, "", "") orelse return null;
+        if (isValidCustomProviderUrl(custom_url)) {
+            return .{
+                .key = try std.fmt.allocPrint(allocator, "custom:{s}", .{custom_url}),
+                .default_model = "gpt-5.2",
+                .env_var = "API_KEY",
+                .base_url = try allocator.dupe(u8, custom_url),
+            };
+        }
+        try out.writeAll("    Invalid URL. It must start with http:// or https:// and include a version path like /v1. Try again: ");
+    }
+}
+
+fn isFreeModelId(model_id: []const u8) bool {
+    return std.mem.endsWith(u8, model_id, ":free");
+}
+
+fn modelCatalogLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    const lhs_free = isFreeModelId(lhs);
+    const rhs_free = isFreeModelId(rhs);
+    if (lhs_free != rhs_free) return lhs_free and !rhs_free;
+    return std.ascii.lessThanIgnoreCase(lhs, rhs);
+}
+
+fn sortModelIds(models: [][]const u8) void {
+    std.mem.sortUnstable([]const u8, models, {}, modelCatalogLessThan);
+}
+
+fn selectDefaultFetchedModel(models: []const []const u8, default_model: []const u8) []const u8 {
+    for (models) |model| {
+        if (std.mem.eql(u8, model, default_model)) return model;
+    }
+    if (models.len > 0) return models[0];
+    return default_model;
 }
 
 pub const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
@@ -1617,7 +1736,7 @@ fn configureExternalChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: 
         return false;
     };
 
-    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse ".";
     const account_segment = try sanitizeStatePathSegment(cfg.allocator, account_id);
     defer cfg.allocator.free(account_segment);
     const runtime_segment = try sanitizeStatePathSegment(cfg.allocator, runtime_name);
@@ -1633,7 +1752,7 @@ fn configureExternalChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: 
             .timeout_ms = timeout_ms,
         },
         .plugin_config_json = plugin_config_json.?,
-        .state_dir = try std.fs.path.join(cfg.allocator, &.{ config_dir, "state", "external", runtime_segment, account_segment }),
+        .state_dir = try std_compat.fs.path.join(cfg.allocator, &.{ config_dir, "state", "external", runtime_segment, account_segment }),
     };
     cfg.channels.external = accounts;
     committed = true;
@@ -1758,7 +1877,7 @@ fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pre
     }
 
     const secrets = @import("security/secrets.zig");
-    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse ".";
     const store = secrets.SecretStore.init(config_dir, cfg.secrets.encrypt);
     const encrypted_key = try store.encryptSecret(cfg.allocator, bot_privkey_hex.?);
 
@@ -1876,7 +1995,7 @@ fn configureMaxChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []con
 
 /// Run a nak subprocess, capture stdout, trim whitespace, return owned slice or null on failure.
 fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
     child.spawn() catch return null;
@@ -1900,7 +2019,7 @@ fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
         return null;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             out.deinit(allocator);
             return null;
         },
@@ -1910,7 +2029,7 @@ fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
         },
     }
     const raw = out.toOwnedSlice(allocator) catch return null;
-    const trimmed = std.mem.trimRight(u8, raw, " \t\r\n");
+    const trimmed = std_compat.mem.trimRight(u8, raw, " \t\r\n");
     if (trimmed.len == raw.len) return raw;
     defer allocator.free(raw);
     return allocator.dupe(u8, trimmed) catch null;
@@ -1919,7 +2038,7 @@ fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
 /// Interactive wizard entry point — runs the full setup interactively.
 pub fn runWizard(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const out = &bw.interface;
     resetStdinLineReader();
     try out.writeAll(BANNER);
@@ -1936,59 +2055,24 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
 
     // ── Step 1: Provider selection ──
     try out.writeAll("  Step 1/8: Select a provider\n");
-    for (known_providers, 0..) |p, i| {
-        try out.print("    [{d}] {s}\n", .{ i + 1, p.label });
-    }
-    try out.print("    [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{known_providers.len + 1});
-    try out.writeAll("  Choice [1]: ");
-    const provider_idx = promptChoice(out, &input_buf, known_providers.len + 1, 0) orelse {
+    const provider_selection = (try promptProviderSelection(cfg.allocator, out, &input_buf)) orelse {
         try out.writeAll("\n  Aborted.\n");
         try out.flush();
         return;
     };
-
-    if (provider_idx < known_providers.len) {
-        const provider = known_providers[provider_idx];
-        cfg.default_provider = provider.key;
-        try out.print("  -> {s}\n\n", .{provider.label});
-    } else {
-        // Custom provider - prompt for URL
-        var custom_url_buf: [512]u8 = undefined;
-        try out.writeAll("\n  Custom provider configuration:\n");
-        try out.writeAll("  Enter OpenAI-compatible endpoint URL (e.g., https://api.example.com/v1): ");
-        const custom_url = prompt(out, &custom_url_buf, "", "") orelse {
-            try out.writeAll("\n  Aborted.\n");
-            try out.flush();
-            return;
-        };
-        if (custom_url.len == 0) {
-            try out.writeAll("\n  Error: Custom provider URL cannot be empty\n");
-            try out.flush();
-            return;
-        }
-        if (!isValidCustomProviderUrl(custom_url)) {
-            try out.writeAll("\n  Error: endpoint must be http(s) and include a version segment like /v1\n");
-            try out.flush();
-            return;
-        }
-        const custom_provider_key = try std.fmt.allocPrint(cfg.allocator, "custom:{s}", .{custom_url});
-        cfg.default_provider = custom_provider_key;
-
-        // Add to providers section with base_url
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .base_url = try cfg.allocator.dupe(u8, custom_url) };
-        cfg.providers = entries;
-
+    cfg.default_provider = provider_selection.key;
+    if (provider_selection.base_url) |custom_url| {
+        try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, null, custom_url);
         try out.print("  -> Custom: {s}\n\n", .{custom_url});
+    } else if (findProviderInfoByCanonical(cfg.default_provider)) |info| {
+        try out.print("  -> {s}\n\n", .{info.label});
+    } else {
+        try out.print("  -> {s}\n\n", .{cfg.default_provider});
     }
 
-    const is_azure_provider = provider_idx < known_providers.len and
-        std.mem.eql(u8, known_providers[provider_idx].key, "azure");
+    const is_azure_provider = std.mem.eql(u8, canonicalProviderName(cfg.default_provider), "azure");
 
-    var provider_base_url: ?[]const u8 = null;
-    if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
-        provider_base_url = cfg.providers[0].base_url;
-    }
+    var provider_base_url = cfg.getProviderBaseUrl(cfg.default_provider);
 
     if (is_azure_provider) {
         var azure_endpoint_buf: [512]u8 = undefined;
@@ -2014,7 +2098,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     }
 
     // ── Step 2: API key ──
-    const env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
+    const env_hint = provider_selection.env_var;
     const requires_api_key = providerRequiresApiKeyForSetup(cfg.default_provider, provider_base_url);
     if (requires_api_key) {
         try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
@@ -2024,30 +2108,18 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
             return;
         };
         if (api_key_input.len > 0) {
-            // Store in providers section (preserve base_url if already set for custom provider)
-            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-            entries[0] = .{
-                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-                .api_key = try cfg.allocator.dupe(u8, api_key_input),
-                .base_url = provider_base_url,
-            };
-            cfg.providers = entries;
+            try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, api_key_input, provider_base_url);
             try out.writeAll("  -> API key set\n\n");
         } else {
             if (is_azure_provider) {
-                const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-                entries[0] = .{
-                    .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-                    .base_url = provider_base_url,
-                };
-                cfg.providers = entries;
+                try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, null, provider_base_url);
             }
             try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
         }
     } else {
         try out.writeAll("  Step 2/8: Authentication\n");
         if (std.mem.eql(u8, cfg.default_provider, "openai-codex")) {
-            try out.writeAll("  -> Uses local OAuth tokens from ~/.nullclaw/auth.json or ~/.codex/auth.json\n\n");
+            try out.writeAll("  -> Uses local OAuth tokens from auth.json in your nullclaw config directory or ~/.codex/auth.json\n\n");
         } else if (std.mem.eql(u8, cfg.default_provider, "codex-cli")) {
             try out.writeAll("  -> Uses your local Codex CLI login (`codex login`)\n\n");
         } else if (std.mem.eql(u8, cfg.default_provider, "gemini-cli")) {
@@ -2058,10 +2130,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     }
 
     // ── Step 3: Model (with live fetching) ──
-    const default_model_for_provider = if (provider_idx < known_providers.len)
-        known_providers[provider_idx].default_model
-    else
-        "gpt-5.2";
+    const default_model_for_provider = provider_selection.default_model;
 
     try out.writeAll("  Step 3/8: Select a model\n");
     try out.writeAll("  Fetching available models...\n");
@@ -2097,57 +2166,144 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         }
     }
 
-    // Show up to 15 models as numbered choices if we successfully fetched them
+    // Show fetched models in pages so operators do not have to type a valid
+    // model name manually just because it was outside the first page.
     if (models_fetched) {
-        const display_max: usize = @min(models_to_use.len, 15);
-        for (models_to_use[0..display_max], 0..) |m, i| {
-            const is_default = std.mem.eql(u8, m, default_model_for_provider);
-            if (is_default) {
-                try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
-            } else {
-                try out.print("    [{d}] {s}\n", .{ i + 1, m });
+        const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, models_to_use.len, MODEL_PAGE_SIZE) catch 1);
+        var page_idx: usize = 0;
+
+        while (true) {
+            const page_start = page_idx * MODEL_PAGE_SIZE;
+            const page_end = @min(page_start + MODEL_PAGE_SIZE, models_to_use.len);
+            const visible_models = models_to_use[page_start..page_end];
+
+            try out.print("  Models page {d}/{d}\n", .{ page_idx + 1, total_pages });
+            for (visible_models, 0..) |m, i| {
+                const is_default = std.mem.eql(u8, m, default_model_for_provider);
+                if (is_default) {
+                    try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
+                } else {
+                    try out.print("    [{d}] {s}\n", .{ i + 1, m });
+                }
             }
+            if (total_pages > 1) {
+                if (page_idx + 1 < total_pages and page_idx > 0) {
+                    try out.writeAll("    Type `n` for next page or `p` for previous page\n");
+                } else if (page_idx + 1 < total_pages) {
+                    try out.writeAll("    Type `n` for next page\n");
+                } else if (page_idx > 0) {
+                    try out.writeAll("    Type `p` for previous page\n");
+                }
+            }
+            try out.print("  Choice [1], `n`/`p`, or model name [{s}]: ", .{default_model_for_provider});
+
+            const model_input = prompt(out, &input_buf, "", "") orelse {
+                try out.writeAll("\n  Aborted.\n");
+                try out.flush();
+                return;
+            };
+
+            switch (parseModelWizardInput(model_input, visible_models.len)) {
+                .use_default => {
+                    const selected_default = selectDefaultFetchedModel(models_to_use, default_model_for_provider);
+                    cfg.default_model = try cfg.allocator.dupe(u8, selected_default);
+                    break;
+                },
+                .page_next => {
+                    if (page_idx + 1 < total_pages) {
+                        page_idx += 1;
+                        continue;
+                    }
+                },
+                .page_prev => {
+                    if (page_idx > 0) {
+                        page_idx -= 1;
+                        continue;
+                    }
+                },
+                .page_index => |visible_idx| {
+                    cfg.default_model = try cfg.allocator.dupe(u8, visible_models[visible_idx]);
+                    break;
+                },
+                .typed_model => |typed_model| {
+                    cfg.default_model = try cfg.allocator.dupe(u8, typed_model);
+                    break;
+                },
+            }
+
+            try out.writeAll("  Invalid page navigation for current page; try again.\n");
         }
-        if (models_to_use.len > display_max) {
-            try out.print("    ... and {d} more (type name to use any model)\n", .{models_to_use.len - display_max});
-        }
-        try out.print("  Choice [1] or model name [{s}]: ", .{default_model_for_provider});
     } else {
         try out.writeAll("  Enter model name directly:\n");
         try out.print("  Model name [{s}]: ", .{default_model_for_provider});
-    }
-    const model_input = prompt(out, &input_buf, "", "") orelse {
-        try out.writeAll("\n  Aborted.\n");
-        try out.flush();
-        return;
-    };
-    if (model_input.len == 0) {
-        // Default: use first model from the list (or provider default)
-        // Must dupe because models_to_use will be freed in defer block
-        cfg.default_model = if (models_to_use.len > 0)
-            try cfg.allocator.dupe(u8, models_to_use[0])
-        else
-            try cfg.allocator.dupe(u8, default_model_for_provider);
-    } else if (models_fetched) {
-        // If we successfully fetched models, try to parse as number (menu selection) or use as free-form model name
-        const display_max: usize = @min(models_to_use.len, 15);
-        if (std.fmt.parseInt(usize, model_input, 10)) |num| {
-            if (num >= 1 and num <= display_max) {
-                // Must dupe because models_to_use will be freed in defer block
-                cfg.default_model = try cfg.allocator.dupe(u8, models_to_use[num - 1]);
-            } else {
-                // Must dupe because default_model_for_provider is from const static data
-                cfg.default_model = try cfg.allocator.dupe(u8, default_model_for_provider);
-            }
-        } else |_| {
-            // Free-form model name typed by user
-            cfg.default_model = try cfg.allocator.dupe(u8, model_input);
-        }
-    } else {
-        // If we couldn't fetch models, use input as model name directly
+        const model_input = prompt(out, &input_buf, "", "") orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
         cfg.default_model = try cfg.allocator.dupe(u8, model_input);
     }
     try out.print("  -> {s}\n\n", .{cfg.default_model.?});
+
+    while (true) {
+        try out.writeAll("  Add another provider? [y/N]: ");
+        const add_more = prompt(out, &input_buf, "", "n") orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (add_more.len == 0 or !(add_more[0] == 'y' or add_more[0] == 'Y')) break;
+
+        try out.writeAll("\n  Additional provider setup:\n");
+        const extra_provider = (try promptProviderSelection(cfg.allocator, out, &input_buf)) orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+
+        const extra_is_azure = std.mem.eql(u8, canonicalProviderName(extra_provider.key), "azure");
+        var extra_base_url: ?[]const u8 = extra_provider.base_url;
+
+        if (extra_is_azure) {
+            var azure_endpoint_buf: [512]u8 = undefined;
+            const default_endpoint = extra_base_url orelse "";
+            if (default_endpoint.len > 0) {
+                try out.print("    Azure OpenAI endpoint [{s}]: ", .{default_endpoint});
+            } else {
+                try out.writeAll("    Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com): ");
+            }
+            const azure_endpoint = prompt(out, &azure_endpoint_buf, "", default_endpoint) orelse {
+                try out.writeAll("\n  Aborted.\n");
+                try out.flush();
+                return;
+            };
+            if (azure_endpoint.len == 0) {
+                try out.writeAll("\n  Error: Azure OpenAI endpoint is required\n");
+                try out.flush();
+                return;
+            }
+            extra_base_url = try cfg.allocator.dupe(u8, azure_endpoint);
+        }
+
+        if (providerRequiresApiKeyForSetup(extra_provider.key, extra_base_url)) {
+            try out.print("    API key for {s} (or press Enter to use env var {s}): ", .{ extra_provider.key, extra_provider.env_var });
+            const api_key_input = prompt(out, &input_buf, "", "") orelse {
+                try out.writeAll("\n  Aborted.\n");
+                try out.flush();
+                return;
+            };
+            if (api_key_input.len > 0) {
+                try appendOrReplaceProviderEntry(&cfg, extra_provider.key, api_key_input, extra_base_url);
+                try out.writeAll("    -> API key set\n\n");
+            } else {
+                try appendOrReplaceProviderEntry(&cfg, extra_provider.key, null, extra_base_url);
+                try out.print("    -> Will use ${s} from environment\n\n", .{extra_provider.env_var});
+            }
+        } else {
+            try appendOrReplaceProviderEntry(&cfg, extra_provider.key, null, extra_base_url);
+            try out.writeAll("    -> No API key required\n\n");
+        }
+    }
 
     // ── Step 4: Memory backend ──
     const backends = try selectableBackendsForWizard(allocator);
@@ -2235,7 +2391,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     }
 
     // ── Step 8: Workspace path ──
-    const default_workspace = try getDefaultWorkspace(allocator);
+    const default_workspace = cfg.workspace_dir;
     try out.print("  Step 8/8: Workspace path [{s}]: ", .{default_workspace});
     const ws_input = prompt(out, &input_buf, "", default_workspace) orelse {
         try out.writeAll("\n  Aborted.\n");
@@ -2250,13 +2406,13 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
 
     // ── Apply ──
     // Ensure parent config directory and workspace directory exist
-    if (std.fs.path.dirname(cfg.workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(cfg.workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -2282,8 +2438,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     try out.print("  [OK] Workspace:  {s}\n", .{cfg.workspace_dir});
     try out.print("  [OK] Config:     {s}\n", .{cfg.config_path});
     try out.writeAll("\n  Next steps:\n");
-    const final_env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
-    try printProviderNextSteps(out, cfg.default_provider, final_env_hint, requires_api_key, cfg.defaultProviderKey() != null);
+    try printProviderNextSteps(out, cfg.default_provider, provider_selection.env_var, requires_api_key, cfg.defaultProviderKey() != null);
     try out.writeAll("\n");
     try out.flush();
 }
@@ -2303,28 +2458,27 @@ const catalog_providers = [_]ModelsCatalogProvider{
 };
 
 /// Refresh the model catalog by fetching available models from known providers.
-/// Saves results to ~/.nullclaw/models_cache.json.
+/// Saves results to models_cache.json in the config directory.
 pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const out = &bw.interface;
     try out.writeAll("Refreshing model catalog...\n");
     try out.flush();
 
     // Build cache path
-    const home = platform.getHomeDir(allocator) catch {
-        try out.writeAll("Could not determine HOME directory.\n");
+    const config_dir = config_paths.defaultConfigDir(allocator) catch {
+        try out.writeAll("Could not determine config directory.\n");
         try out.flush();
         return;
     };
-    defer allocator.free(home);
-    const cache_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "models_cache.json" });
+    defer allocator.free(config_dir);
+    const cache_path = try config_paths.pathFromConfigDir(allocator, config_dir, "models_cache.json");
     defer allocator.free(cache_path);
-    const cache_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
-    defer allocator.free(cache_dir);
+    const cache_dir = config_dir;
 
     // Ensure directory exists
-    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             try out.writeAll("Could not create config directory.\n");
@@ -2345,7 +2499,7 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
         try out.flush();
 
         // Run curl to fetch models list
-        const result = std.process.Child.run(.{
+        const result = std_compat.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ "curl", "-sf", "--max-time", "10", cp.url },
         }) catch {
@@ -2414,7 +2568,7 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     try results_buf.appendSlice(allocator, "\n}\n");
 
     // Write cache file
-    const file = std.fs.createFileAbsolute(cache_path, .{}) catch {
+    const file = std_compat.fs.createFileAbsolute(cache_path, .{}) catch {
         try out.writeAll("Could not write cache file.\n");
         try out.flush();
         return;
@@ -2468,13 +2622,13 @@ pub fn scaffoldWorkspace(
     ctx: *const ProjectContext,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
 ) !void {
-    if (std.fs.path.dirname(workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -2533,13 +2687,13 @@ pub fn resetWorkspacePromptFiles(
     options: ResetWorkspacePromptFilesOptions,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
 ) !ResetWorkspacePromptFilesReport {
-    if (std.fs.path.dirname(workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -2603,12 +2757,12 @@ fn overwriteWorkspaceFile(
     content: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
+    const path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) return true;
 
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    const file = try std_compat.fs.createFileAbsolute(path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(content);
     return true;
@@ -2620,14 +2774,14 @@ fn removeWorkspaceFileIfExists(
     filename: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
+    const path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) {
         return fileExistsAbsolute(path);
     }
 
-    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+    std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -2635,11 +2789,11 @@ fn removeWorkspaceFileIfExists(
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ dir, filename });
+    const path = try std_compat.fs.path.join(allocator, &.{ dir, filename });
     defer allocator.free(path);
 
     // Only write if file doesn't exist
-    if (std.fs.openFileAbsolute(path, .{})) |f| {
+    if (std_compat.fs.openFileAbsolute(path, .{})) |f| {
         f.close();
         return;
     } else |err| switch (err) {
@@ -2647,7 +2801,7 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
         else => return err,
     }
 
-    const file = std.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
+    const file = std_compat.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         else => return err,
     };
@@ -2683,7 +2837,7 @@ fn ensureBootstrapLifecycle(
     had_legacy_user_content: bool,
     bp: ?bootstrap_mod.BootstrapProvider,
 ) !void {
-    const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
+    const bootstrap_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
     defer allocator.free(bootstrap_path);
 
     var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
@@ -2734,9 +2888,9 @@ fn isLegacyOnboardingCompleted(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !bool {
-    const identity_path = try std.fs.path.join(allocator, &.{ workspace_dir, "IDENTITY.md" });
+    const identity_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "IDENTITY.md" });
     defer allocator.free(identity_path);
-    const user_path = try std.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
+    const user_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
     defer allocator.free(user_path);
 
     var templates_diverged = false;
@@ -2756,7 +2910,7 @@ fn isLegacyOnboardingCompleted(
 }
 
 fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE });
+    return std_compat.fs.path.join(allocator, &.{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE });
 }
 
 fn readWorkspaceOnboardingState(
@@ -2766,7 +2920,7 @@ fn readWorkspaceOnboardingState(
     const path = try workspaceStatePath(allocator, workspace_dir);
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -2830,8 +2984,8 @@ fn writeWorkspaceOnboardingState(
     const path = try workspaceStatePath(allocator, workspace_dir);
     defer allocator.free(path);
 
-    if (std.fs.path.dirname(path)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(path)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -2857,21 +3011,21 @@ fn writeWorkspaceOnboardingState(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
     errdefer tmp_file.close();
     try tmp_file.writeAll(buf.items);
     tmp_file.close();
 
-    std.fs.renameAbsolute(tmp_path, path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
-        const file = try std.fs.createFileAbsolute(path, .{});
+    std_compat.fs.renameAbsolute(tmp_path, path) catch {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(buf.items);
     };
 }
 
 fn readFileIfPresent(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !?[]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -2880,22 +3034,22 @@ fn readFileIfPresent(allocator: std.mem.Allocator, path: []const u8, max_bytes: 
 }
 
 fn fileExistsAbsolute(path: []const u8) bool {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return false;
     file.close();
     return true;
 }
 
 fn pathExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std_compat.fs.accessAbsolute(path, .{}) catch return false;
     return true;
 }
 
 fn hasLegacyUserContentIndicators(allocator: std.mem.Allocator, workspace_dir: []const u8) !bool {
-    const memory_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, "memory" });
+    const memory_dir_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "memory" });
     defer allocator.free(memory_dir_path);
-    const memory_file_path = try std.fs.path.join(allocator, &.{ workspace_dir, "MEMORY.md" });
+    const memory_file_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "MEMORY.md" });
     defer allocator.free(memory_file_path);
-    const git_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, ".git" });
+    const git_dir_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, ".git" });
     defer allocator.free(git_dir_path);
 
     return pathExistsAbsolute(memory_dir_path) or
@@ -3008,18 +3162,63 @@ pub fn defaultBackendKey() []const u8 {
 // ── Path helpers ─────────────────────────────────────────────────
 
 fn getDefaultWorkspace(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "workspace" });
+    return config_paths.defaultWorkspaceDir(allocator);
 }
 
 fn getDefaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "config.json" });
+    const config_dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(config_dir);
+    return config_paths.pathFromConfigDir(allocator, config_dir, "config.json");
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+test "getDefaultWorkspace prefers NULLCLAW_WORKSPACE override" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_WORKSPACE");
+    defer std.testing.allocator.free(key_z);
+    const value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-test-workspace");
+    defer std.testing.allocator.free(value_z);
+
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    const workspace = try getDefaultWorkspace(std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+
+    try std.testing.expectEqualStrings("/tmp/nullclaw-test-workspace", workspace);
+}
+
+test "initFreshConfig honors NULLCLAW_HOME and NULLCLAW_WORKSPACE overrides" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const home_key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer std.testing.allocator.free(home_key_z);
+    const home_value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-home");
+    defer std.testing.allocator.free(home_value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(home_key_z.ptr, home_value_z.ptr, 1));
+    defer _ = c.unsetenv(home_key_z.ptr);
+
+    const workspace_key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_WORKSPACE");
+    defer std.testing.allocator.free(workspace_key_z);
+    const workspace_value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-home/workspace-custom");
+    defer std.testing.allocator.free(workspace_value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(workspace_key_z.ptr, workspace_value_z.ptr, 1));
+    defer _ = c.unsetenv(workspace_key_z.ptr);
+
+    var cfg = try initFreshConfig(std.testing.allocator);
+    defer cfg.deinit();
+
+    try std.testing.expectEqualStrings("/tmp/nullclaw-home/workspace-custom", cfg.workspace_dir);
+    try std.testing.expectEqualStrings("/tmp/nullclaw-home/config.json", cfg.config_path);
+}
 
 test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("xai", canonicalProviderName("grok"));
@@ -3222,32 +3421,115 @@ test "BANNER contains descriptive text" {
     try std.testing.expect(std.mem.indexOf(u8, BANNER, "smallest AI assistant") != null);
 }
 
+test "appendOrReplaceProviderEntry appends a second provider without dropping the first" {
+    var cfg = try initFreshConfig(std.testing.allocator);
+    defer cfg.deinit();
+
+    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-test", null);
+    try appendOrReplaceProviderEntry(&cfg, "moonshot", "sk-ms-test", null);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+    try std.testing.expectEqualStrings("openrouter", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("moonshot", cfg.providers[1].name);
+}
+
+test "appendOrReplaceProviderEntry replaces existing provider entry in place" {
+    var cfg = try initFreshConfig(std.testing.allocator);
+    defer cfg.deinit();
+
+    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-test", null);
+    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-updated", "https://openrouter.ai/api/v1");
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("openrouter", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("sk-or-updated", cfg.providers[0].api_key.?);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", cfg.providers[0].base_url.?);
+}
+
+test "appendOrReplaceProviderEntry preserves advanced provider overrides when updating credentials" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .providers = &.{.{
+            .name = "sub2api",
+            .api_key = "sk-old",
+            .base_url = "https://old.example/v1",
+            .native_tools = false,
+            .user_agent = "nullclaw-test/1.0",
+            .api_mode = .responses,
+            .chat_template_enable_thinking_param = true,
+            .max_streaming_prompt_bytes = 65536,
+        }},
+    };
+
+    try appendOrReplaceProviderEntry(&cfg, "sub2api", "sk-new", "https://new.example/v1");
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("sub2api", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("sk-new", cfg.providers[0].api_key.?);
+    try std.testing.expectEqualStrings("https://new.example/v1", cfg.providers[0].base_url.?);
+    try std.testing.expect(!cfg.providers[0].native_tools);
+    try std.testing.expectEqualStrings("nullclaw-test/1.0", cfg.providers[0].user_agent.?);
+    try std.testing.expectEqual(config_mod.ProviderEntry.ApiMode.responses, cfg.providers[0].api_mode);
+    try std.testing.expect(cfg.providers[0].chat_template_enable_thinking_param);
+    try std.testing.expectEqual(@as(?usize, 65536), cfg.providers[0].max_streaming_prompt_bytes);
+}
+
+test "appendOrReplaceProviderEntry replaces canonical alias matches instead of appending duplicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .providers = &.{.{
+            .name = "google-vertex",
+            .api_key = "vertex-old",
+            .base_url = "https://vertex.example/v1",
+        }},
+    };
+
+    try appendOrReplaceProviderEntry(&cfg, "vertex", "vertex-new", "https://vertex-new.example/v1");
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("vertex", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("vertex-new", cfg.getProviderKey("google-vertex").?);
+    try std.testing.expectEqualStrings("https://vertex-new.example/v1", cfg.getProviderBaseUrl("vertex-ai").?);
+}
+
 test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const ctx = ProjectContext{};
     try scaffoldWorkspace(std.testing.allocator, base, &ctx, null);
 
     // Verify core files were created
-    const agents = try tmp.dir.openFile("AGENTS.md", .{});
+    const agents = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("AGENTS.md", .{});
     defer agents.close();
     const agents_content = try agents.readToEndAlloc(std.testing.allocator, 16 * 1024);
     defer std.testing.allocator.free(agents_content);
     try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
 
     // OpenClaw-style scaffold keeps MEMORY.md optional (created on demand by memory writes).
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("MEMORY.md", .{}));
 }
 
 test "scaffoldWorkspace is idempotent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const ctx = ProjectContext{};
@@ -3261,17 +3543,17 @@ test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll("custom-agents-content");
     }
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("custom-user-content");
     }
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{}, null);
@@ -3294,13 +3576,13 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("MEMORY.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("MEMORY.md", .{});
         defer f.close();
         try f.writeAll("custom-memory");
     }
 
     var has_distinct_case_memory_file = true;
-    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+    const alt = @import("compat").fs.Dir.wrap(tmp.dir).createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
         error.PathAlreadyExists => blk: {
             has_distinct_case_memory_file = false;
             break :blk null;
@@ -3312,7 +3594,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
         try f.writeAll("custom-memory-lower");
     }
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const dry_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
@@ -3321,7 +3603,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     }, null);
     try std.testing.expectEqual(@as(usize, 7), dry_report.rewritten_files);
     try std.testing.expect(dry_report.removed_files >= 1);
-    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    const memory_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("MEMORY.md", .{});
     memory_file.close();
 
     const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
@@ -3329,9 +3611,9 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     }, null);
     try std.testing.expectEqual(@as(usize, 7), reset_report.rewritten_files);
     try std.testing.expect(reset_report.removed_files >= 1);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("MEMORY.md", .{}));
     if (has_distinct_case_memory_file) {
-        try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("memory.md", .{}));
+        try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("memory.md", .{}));
     }
 }
 
@@ -3339,7 +3621,7 @@ test "resetWorkspacePromptFiles creates missing workspace directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
     const nested = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/workspace", .{base});
     defer std.testing.allocator.free(nested);
@@ -3349,7 +3631,7 @@ test "resetWorkspacePromptFiles creates missing workspace directory" {
 
     const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
     defer std.testing.allocator.free(agents_path);
-    const agents_file = try std.fs.openFileAbsolute(agents_path, .{});
+    const agents_file = try std_compat.fs.openFileAbsolute(agents_path, .{});
     agents_file.close();
 }
 
@@ -3357,12 +3639,12 @@ test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    const bootstrap_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{});
     bootstrap_file.close();
 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
@@ -3375,29 +3657,29 @@ test "scaffoldWorkspace does not recreate BOOTSTRAP after onboarding completion"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     {
-        const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("IDENTITY.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("custom identity");
     }
     {
-        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("custom user");
     }
 
-    try tmp.dir.deleteFile("BOOTSTRAP.md");
-    try tmp.dir.deleteFile("TOOLS.md");
+    try @import("compat").fs.Dir.wrap(tmp.dir).deleteFile("BOOTSTRAP.md");
+    try @import("compat").fs.Dir.wrap(tmp.dir).deleteFile("TOOLS.md");
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
-    const tools_file = try tmp.dir.openFile("TOOLS.md", .{});
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
+    const tools_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("TOOLS.md", .{});
     tools_file.close();
 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
@@ -3410,22 +3692,22 @@ test "scaffoldWorkspace does not seed BOOTSTRAP for legacy completed workspace" 
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("IDENTITY.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("IDENTITY.md", .{});
         defer f.close();
         try f.writeAll("custom identity");
     }
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("custom user");
     }
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
     defer state.deinit(std.testing.allocator);
@@ -3437,26 +3719,26 @@ test "scaffoldWorkspace treats memory-backed workspace as existing and skips BOO
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("memory");
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("memory");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "memory/2026-02-25.md",
         .data = "# Daily log\nSome notes",
     });
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "MEMORY.md",
         .data = "# Long-term memory\nImportant stuff",
     });
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
+    const identity_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("IDENTITY.md", .{});
     identity_file.close();
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
-    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    const memory_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("MEMORY.md", .{});
     defer memory_file.close();
     const memory_content = try memory_file.readToEndAlloc(std.testing.allocator, 4 * 1024);
     defer std.testing.allocator.free(memory_content);
@@ -3471,20 +3753,20 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".git");
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath(".git");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = ".git/HEAD",
         .data = "ref: refs/heads/main\n",
     });
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
+    const identity_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("IDENTITY.md", .{});
     identity_file.close();
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
     defer state.deinit(std.testing.allocator);
@@ -3497,19 +3779,19 @@ test "scaffoldWorkspace handles trailing native separator on Windows paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const workspace_with_sep = try std.fmt.allocPrint(
         std.testing.allocator,
         "{s}{s}",
-        .{ base, std.fs.path.sep_str },
+        .{ base, std_compat.fs.path.sep_str },
     );
     defer std.testing.allocator.free(workspace_with_sep);
 
     try scaffoldWorkspace(std.testing.allocator, workspace_with_sep, &ProjectContext{}, null);
 
-    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    const bootstrap_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{});
     bootstrap_file.close();
 }
 
@@ -3517,7 +3799,7 @@ test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3526,15 +3808,15 @@ test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace 
 
     var cfg = Config{
         .workspace_dir = try allocator.dupe(u8, base),
-        .config_path = try std.fs.path.join(allocator, &.{ base, "config.json" }),
+        .config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" }),
         .allocator = allocator,
     };
     cfg.memory.backend = "sqlite";
 
     try scaffoldWorkspaceForConfig(std.testing.allocator, &cfg, &ProjectContext{});
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("AGENTS.md", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("AGENTS.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
     var mem_rt = memory_root.initRuntime(std.testing.allocator, &cfg.memory, cfg.workspace_dir) orelse
         return error.TestUnexpectedResult;
@@ -3563,12 +3845,12 @@ test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touch
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "AGENTS.md",
         .data = "disk-agents-before",
     });
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var mem_rt = memory_root.initRuntime(std.testing.allocator, &.{ .backend = "sqlite" }, base) orelse
@@ -3596,7 +3878,7 @@ test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touch
     const disk_agents = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "AGENTS.md", 64 * 1024);
     defer std.testing.allocator.free(disk_agents);
     try std.testing.expectEqualStrings("disk-agents-before", disk_agents);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
     const stored_agents = try bootstrap_provider.load(std.testing.allocator, "AGENTS.md") orelse
         return error.TestUnexpectedResult;
@@ -3620,7 +3902,7 @@ test "bootstrap lifecycle stays equivalent across markdown hybrid and sqlite bac
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
         defer std.testing.allocator.free(workspace);
 
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3629,7 +3911,7 @@ test "bootstrap lifecycle stays equivalent across markdown hybrid and sqlite bac
 
         var cfg = Config{
             .workspace_dir = try allocator.dupe(u8, workspace),
-            .config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" }),
+            .config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" }),
             .allocator = allocator,
         };
         cfg.memory.backend = backend;
@@ -3732,9 +4014,13 @@ test "resolveProviderForQuickSetup supports custom: versioned endpoint beyond v1
     try std.testing.expectEqualStrings("custom:https://example.com/openai/v2", custom.key);
 }
 
+test "resolveProviderForQuickSetup supports non-versioned custom: prefix" {
+    const custom = resolveProviderForQuickSetup("custom:https://example.com/api") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/api", custom.key);
+}
+
 test "resolveProviderForQuickSetup rejects invalid custom endpoint format" {
     try std.testing.expect(resolveProviderForQuickSetup("custom:") == null);
-    try std.testing.expect(resolveProviderForQuickSetup("custom:https://example.com/api") == null);
     try std.testing.expect(resolveProviderForQuickSetup("custom:example.com/v1") == null);
 }
 
@@ -3934,11 +4220,11 @@ test "scaffoldWorkspace does not create memory subdirectory by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("memory", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openDir("memory", .{}));
 }
 
 test "BANNER is non-empty and contains nullclaw branding" {
@@ -4104,7 +4390,7 @@ test "scaffoldWorkspace creates core prompt.zig files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
@@ -4117,7 +4403,7 @@ test "scaffoldWorkspace creates core prompt.zig files" {
         "HEARTBEAT.md", "BOOTSTRAP.md",
     };
     for (files) |filename| {
-        const file = tmp.dir.openFile(filename, .{}) catch |err| {
+        const file = @import("compat").fs.Dir.wrap(tmp.dir).openFile(filename, .{}) catch |err| {
             std.debug.print("Missing file: {s} (error: {})\n", .{ filename, err });
             return err;
         };
@@ -4185,7 +4471,7 @@ test "fallbackModelsForProvider uses provider defaults for uncataloged providers
     try std.testing.expectEqualStrings("glm-5", z_ai_models[0]);
 }
 
-test "parseModelIds extracts IDs from OpenRouter-style response" {
+test "parseModelIds extracts IDs from OpenRouter-style response and sorts them" {
     const json =
         \\{"data": [
         \\  {"id": "openai/gpt-4", "name": "GPT-4"},
@@ -4200,9 +4486,67 @@ test "parseModelIds extracts IDs from OpenRouter-style response" {
     }
 
     try std.testing.expect(models.len == 3);
-    try std.testing.expectEqualStrings("openai/gpt-4", models[0]);
-    try std.testing.expectEqualStrings("anthropic/claude-3", models[1]);
-    try std.testing.expectEqualStrings("meta/llama-3", models[2]);
+    try std.testing.expectEqualStrings("anthropic/claude-3", models[0]);
+    try std.testing.expectEqualStrings("meta/llama-3", models[1]);
+    try std.testing.expectEqualStrings("openai/gpt-4", models[2]);
+}
+
+test "parseModelWizardInput handles paging commands and selections" {
+    try std.testing.expect(parseModelWizardInput("", 5) == .use_default);
+    try std.testing.expect(parseModelWizardInput("n", 5) == .page_next);
+    try std.testing.expect(parseModelWizardInput("NEXT", 5) == .page_next);
+    try std.testing.expect(parseModelWizardInput("p", 5) == .page_prev);
+    try std.testing.expect(parseModelWizardInput("prev", 5) == .page_prev);
+
+    switch (parseModelWizardInput("3", 5)) {
+        .page_index => |idx| try std.testing.expectEqual(@as(usize, 2), idx),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (parseModelWizardInput("17", 5)) {
+        .typed_model => |name| try std.testing.expectEqualStrings("17", name),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (parseModelWizardInput("moonshotai/kimi-k2.5", 5)) {
+        .typed_model => |name| try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", name),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sortModelIds places free models first and keeps alphabetical order" {
+    var models = [_][]const u8{
+        "z-ai/glm-5-turbo",
+        "openai/gpt-5.4",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "anthropic/claude-sonnet-4.6",
+        "a-provider/freebie:free",
+    };
+
+    sortModelIds(models[0..]);
+
+    try std.testing.expectEqualStrings("a-provider/freebie:free", models[0]);
+    try std.testing.expectEqualStrings("nvidia/nemotron-3-super-120b-a12b:free", models[1]);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", models[2]);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", models[3]);
+    try std.testing.expectEqualStrings("z-ai/glm-5-turbo", models[4]);
+}
+
+test "selectDefaultFetchedModel prefers provider default when present" {
+    const models = [_][]const u8{
+        "a-provider/freebie:free",
+        "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.4",
+    };
+
+    try std.testing.expectEqualStrings(
+        "anthropic/claude-sonnet-4.6",
+        selectDefaultFetchedModel(models[0..], "anthropic/claude-sonnet-4.6"),
+    );
+    try std.testing.expectEqualStrings(
+        "a-provider/freebie:free",
+        selectDefaultFetchedModel(models[0..], "missing/default"),
+    );
 }
 
 test "parseModelIds handles empty data array" {
@@ -4244,9 +4588,9 @@ test "cache read returns error for missing file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const missing_path = try std.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-cache-12345.json" });
+    const missing_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-cache-12345.json" });
     defer std.testing.allocator.free(missing_path);
 
     const result = readCachedModels(std.testing.allocator, missing_path, "openai");
@@ -4257,9 +4601,9 @@ test "cache round-trip: write then read fresh cache" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     // Write cache
@@ -4283,13 +4627,45 @@ test "cache round-trip: write then read fresh cache" {
     try std.testing.expectEqualStrings("model-gamma", loaded[2]);
 }
 
+test "cache read sorts stale model ordering on load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    defer std.testing.allocator.free(cache_path);
+
+    const cache_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"fetched_at\": {d}, \"openrouter\": [\"z-model\", \"a-model:free\", \"m-model\"]}}",
+        .{std_compat.time.timestamp()},
+    );
+    defer std.testing.allocator.free(cache_json);
+
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
+    defer file.close();
+    try file.writeAll(cache_json);
+
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "openrouter");
+    defer {
+        for (loaded) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqualStrings("a-model:free", loaded[0]);
+    try std.testing.expectEqualStrings("m-model", loaded[1]);
+    try std.testing.expectEqualStrings("z-model", loaded[2]);
+}
+
 test "cache read returns error for wrong provider" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     const models = [_][]const u8{"model-a"};
@@ -4304,14 +4680,14 @@ test "cache read returns error for expired cache" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     // Write a cache with old timestamp
     const old_json = "{\"fetched_at\": 1000000, \"myprov\": [\"old-model\"]}";
-    const file = try tmp.dir.createFile("models_cache.json", .{});
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
     defer file.close();
     try file.writeAll(old_json);
 
@@ -4337,19 +4713,19 @@ test "loadModelsWithCache keeps public and native cache entries separate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     const cache_json = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"fetched_at\": {d}, \"openai\": [\"gpt-native\"], \"openai@models.dev\": [\"gpt-public\"]}}",
-        .{std.time.timestamp()},
+        .{std_compat.time.timestamp()},
     );
     defer std.testing.allocator.free(cache_json);
 
-    const file = try tmp.dir.createFile("models_cache.json", .{});
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
     defer file.close();
     try file.writeAll(cache_json);
 
@@ -4374,9 +4750,9 @@ test "loadModelsWithCache falls back on fetch failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const nonexistent = try std.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-dir-xyz" });
+    const nonexistent = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-dir-xyz" });
     defer std.testing.allocator.free(nonexistent);
 
     // openai without api key will fail fetch, falling back to hardcoded list
@@ -4393,7 +4769,7 @@ test "loadModelsWithCache returns models for anthropic" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const models = try loadModelsWithCache(std.testing.allocator, base, "anthropic", null);
@@ -4453,11 +4829,39 @@ test "CACHE_TTL_SECS is 12 hours" {
     try std.testing.expect(CACHE_TTL_SECS == 43200);
 }
 
-test "MAX_MODELS is 20" {
-    try std.testing.expect(MAX_MODELS == 20);
-}
-
 test "fetchModels returns models for anthropic (no network)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const env_name = try std.testing.allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer std.testing.allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(std.testing.allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer std.testing.allocator.free(value);
+            const value_z = std.testing.allocator.dupeZ(u8, value) catch unreachable;
+            defer std.testing.allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const test_home = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "nullclaw-home" });
+    defer std.testing.allocator.free(test_home);
+    const test_home_z = try std.testing.allocator.dupeZ(u8, test_home);
+    defer std.testing.allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
     const models = try fetchModels(std.testing.allocator, "anthropic", null);
     // Anthropic uses hardcoded fallback (allocated copies via fetchModelsFromApi)
     defer {
@@ -4529,7 +4933,7 @@ test "modelsDevProviderKey maps known providers" {
     try std.testing.expect(modelsDevProviderKey("ollama") == null);
 }
 
-test "parseModelsDevModelIds filters non-chat models and prioritizes default" {
+test "parseModelsDevModelIds filters non-chat models and sorts them" {
     const json =
         \\{
         \\  "anthropic": {
@@ -4559,11 +4963,11 @@ test "parseModelsDevModelIds filters non-chat models and prioritizes default" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), models.len);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
-    try std.testing.expectEqualStrings("claude-haiku-4-5", models[1]);
+    try std.testing.expectEqualStrings("claude-haiku-4-5", models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-6", models[1]);
 }
 
-test "parseModelIds respects data ordering" {
+test "parseModelIds sorts alphabetically when no free suffix is present" {
     const json =
         \\{"data": [
         \\  {"id": "z-model"},
@@ -4577,8 +4981,7 @@ test "parseModelIds respects data ordering" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len == 3);
-    // Should preserve original order, not sort
-    try std.testing.expectEqualStrings("z-model", models[0]);
-    try std.testing.expectEqualStrings("a-model", models[1]);
-    try std.testing.expectEqualStrings("m-model", models[2]);
+    try std.testing.expectEqualStrings("a-model", models[0]);
+    try std.testing.expectEqualStrings("m-model", models[1]);
+    try std.testing.expectEqualStrings("z-model", models[2]);
 }

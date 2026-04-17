@@ -86,6 +86,29 @@ pub const ProviderEntry = struct {
     /// When set, 0 forces the non-streaming path for every request and any
     /// positive value applies that byte threshold. Example: 524288 for 512 KiB.
     max_streaming_prompt_bytes: ?usize = null,
+    /// Optional compact JSON string of additional key-value pairs to merge into
+    /// request bodies for OpenAI-compatible providers. The encoded value must
+    /// be a JSON object.
+    extra_body_params: ?[]const u8 = null,
+
+    /// Provider base URLs must be absolute http(s) URLs with no query/fragment.
+    /// Plain HTTP is accepted only for local/private hosts so intentional
+    /// loopback and LAN providers keep working.
+    pub fn isValidBaseUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n?#") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        if (uri.query != null or uri.fragment != null) return false;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+        if (!is_https and !is_http) return false;
+
+        const host = net_security.extractHost(trimmed) orelse return false;
+        if (is_http and !net_security.isLocalHost(host)) return false;
+        return true;
+    }
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────
@@ -134,6 +157,64 @@ pub const DiagnosticsConfig = struct {
     token_usage_ledger_max_bytes: u64 = 0,
     /// Maximum number of JSONL rows before reset. 0 disables row-limit reset.
     token_usage_ledger_max_lines: u64 = 0,
+
+    /// OTLP endpoint must be an absolute HTTPS URL, or a local/private HTTP URL
+    /// when exporting to a collector on the same machine, private network, or
+    /// container runtime bridge.
+    pub fn isValidOtelEndpoint(raw: []const u8) bool {
+        var trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
+            trimmed = trimmed[0 .. trimmed.len - 1];
+        }
+        if (trimmed.len == 0) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+        if (!is_https and !is_http) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+        if (host[0] == ':') return false;
+
+        if (is_http and !isPrivateOtelCollectorHost(host)) return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
+        if (uri.query != null or uri.fragment != null) return false;
+        if (uri.port) |port| if (port == 0) return false;
+        return true;
+    }
+
+    fn isPrivateOtelCollectorHost(host: []const u8) bool {
+        if (net_security.isLocalHost(host)) return true;
+
+        const bare = if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]"))
+            host[1 .. host.len - 1]
+        else
+            host;
+        if (bare.len == 0) return false;
+
+        // Container networks commonly expose services by a single-label DNS
+        // name such as `otel`. Keep the plaintext OTEL exception scoped to
+        // runtime-local service names rather than broader dotted domains.
+        if (std.mem.indexOfScalar(u8, bare, '.') == null and std.mem.indexOfScalar(u8, bare, ':') == null) {
+            return true;
+        }
+
+        return false;
+    }
 };
 
 pub const AutonomyConfig = struct {
@@ -180,6 +261,14 @@ pub const ReliabilityConfig = struct {
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},
+};
+
+pub const InboundMessagesConfig = struct {
+    debounce_ms: u32 = 3_000,
+};
+
+pub const MessagesConfig = struct {
+    inbound: InboundMessagesConfig = .{},
 };
 
 pub const SchedulerConfig = struct {
@@ -380,8 +469,12 @@ pub const TelegramConfig = struct {
     interactive: TelegramInteractiveConfig = .{},
     /// When true, only respond to messages that @mention the bot (in groups).
     require_mention: bool = false,
-    /// Stream partial responses to users via sendMessageDraft before the final message.
+    /// Enable streaming response generation for Telegram. When combined with
+    /// `draft_previews=true`, partial responses are shown via sendMessageDraft.
     streaming: bool = true,
+    /// Show ephemeral sendMessageDraft previews while the reply is still being generated.
+    /// Disabled by default because Telegram drafts can disappear and reappear in a confusing way.
+    draft_previews: bool = false,
     /// Show task lifecycle on the triggering user message via Telegram reactions.
     status_reactions: bool = false,
     /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.
@@ -526,6 +619,7 @@ pub const LarkConfig = struct {
     allow_from: []const []const u8 = &.{},
     receive_mode: LarkReceiveMode = .websocket,
     port: ?u16 = null,
+    reaction_emojis: []const []const u8 = &.{},
 };
 
 pub const DingTalkConfig = struct {
@@ -1052,6 +1146,8 @@ pub const MemoryConfig = struct {
     /// Apply profile defaults. Only sets fields that are still at their default values,
     /// so explicit user overrides always win (profile is applied AFTER parsing).
     pub fn applyProfileDefaults(self: *MemoryConfig) void {
+        const rollout_off = "off";
+        const rollout_on = "on";
         const p = MemoryProfile.fromString(self.profile);
         switch (p) {
             .hybrid_keyword => {
@@ -1061,7 +1157,10 @@ pub const MemoryConfig = struct {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
             },
             .markdown_only => {
-                // Base default is already markdown.
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "markdown";
+                if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
+                if (!self.search.query.hybrid.temporal_decay.enabled) self.search.query.hybrid.temporal_decay.enabled = true;
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .postgres_keyword => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
@@ -1071,14 +1170,14 @@ pub const MemoryConfig = struct {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
                 if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
-                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .postgres_hybrid => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
                 if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
                 if (std.mem.eql(u8, self.search.store.kind, "auto")) self.search.store.kind = "pgvector";
-                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .minimal_none => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "none";
@@ -1310,6 +1409,14 @@ pub const GatewayConfig = struct {
     webhook_rate_limit_per_minute: u32 = 60,
     idempotency_ttl_secs: u64 = 300,
     paired_tokens: []const []const u8 = &.{},
+    /// Maximum HTTP request body size in bytes.
+    /// Default 65536 (64 KB). Raise this when the gateway is configured
+    /// for multi-modal use and needs to accept image payloads.
+    max_body_size_bytes: usize = 65_536,
+    /// Socket read timeout for incoming HTTP requests in seconds.
+    /// Default 30s. Raise this when accepting large payloads (e.g. images)
+    /// over slow or high-latency connections.
+    request_timeout_secs: u64 = 30,
 };
 
 // ── A2A (Agent-to-Agent) protocol config ────────────────────────
@@ -1320,6 +1427,9 @@ pub const A2aConfig = struct {
     description: []const u8 = "AI assistant",
     url: []const u8 = "",
     version: []const u8 = "1.0.0",
+    /// When true, the agent card advertises multi_modal capability,
+    /// signalling that the gateway's model accepts image/file attachments.
+    multi_modal: bool = false,
 };
 
 // ── Composio config ─────────────────────────────────────────────
@@ -1721,6 +1831,7 @@ test "WebConfig defaults" {
 test "security defaults stay least-privilege" {
     const diagnostics = DiagnosticsConfig{};
     try std.testing.expect(diagnostics.api_error_max_chars == null);
+    try std.testing.expect(diagnostics.otel_endpoint == null);
 
     const autonomy = AutonomyConfig{};
     try std.testing.expectEqual(AutonomyLevel.supervised, autonomy.level);
@@ -1752,6 +1863,8 @@ test "McpServerConfig http url validation" {
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://localhost:6000/mcp"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://foo.localhost:6000/mcp"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://mcp.local:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://host.docker.internal:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://host.containers.internal:6000/mcp"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://127.0.0.1:6000/mcp"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://10.0.0.1:8080/rpc"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://192.168.1.1:8080/rpc"));
@@ -1764,6 +1877,26 @@ test "McpServerConfig http url validation" {
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://100.127.255.254:6000/mcp"));
     try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://100.128.0.1:8080/rpc"));
     try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://100.63.0.1:8080/rpc"));
+}
+
+test "DiagnosticsConfig otel endpoint validation" {
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com/collector"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com/"));
+
+    // Regression: OTEL exporters must not allow remote plaintext collectors.
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://localhost:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://127.0.0.1:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://10.0.0.5:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://otel:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://host.docker.internal:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://host.containers.internal:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("http://otel.example.com:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("http://otel.example.internal:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com?x=1"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com#frag"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("ftp://otel.example.com"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://"));
 }
 
 test "McpServerConfig timeout defaults" {
@@ -1791,6 +1924,16 @@ test "HttpRequestConfig proxy URL validation" {
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://:8080"));
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com/path"));
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com?x=1"));
+}
+
+test "ProviderEntry base URL validation keeps local providers and rejects remote http" {
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("https://api.example.com/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://localhost:1234/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://127.0.0.1:1234/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://192.168.1.10:1234/v1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("http://api.example.com/v1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("https://api.example.com/v1?x=1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("ftp://api.example.com/v1"));
 }
 
 test "WebConfig normalizePath trims and normalizes" {
@@ -1889,6 +2032,8 @@ test "HttpRequestConfig search base URL validation" {
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/search/"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://192.168.1.10:8888/search"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.local/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://host.docker.internal:8888/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://host.containers.internal:8888/search"));
 
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("ftp://searx.example.com"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://"));
@@ -1934,4 +2079,38 @@ test "ProviderEntry.max_streaming_prompt_bytes defaults to null" {
 test "ProviderEntry.api_mode defaults to chat_completions" {
     const pe = ProviderEntry{ .name = "test" };
     try std.testing.expectEqual(ProviderEntry.ApiMode.chat_completions, pe.api_mode);
+}
+
+test "markdown_only profile enables markdown retrieval defaults" {
+    var cfg = MemoryConfig{
+        .profile = "markdown_only",
+    };
+
+    cfg.applyProfileDefaults();
+
+    try std.testing.expectEqualStrings("markdown", cfg.backend);
+    try std.testing.expect(cfg.search.query.hybrid.enabled);
+    try std.testing.expect(cfg.search.query.hybrid.temporal_decay.enabled);
+    try std.testing.expectEqual(@as(u32, 30), cfg.search.query.hybrid.temporal_decay.half_life_days);
+    try std.testing.expectEqualStrings("on", cfg.reliability.rollout_mode);
+}
+
+test "markdown_only profile preserves explicit half-life override" {
+    var cfg = MemoryConfig{
+        .profile = "markdown_only",
+        .search = .{
+            .query = .{
+                .hybrid = .{
+                    .temporal_decay = .{
+                        .half_life_days = 0,
+                    },
+                },
+            },
+        },
+    };
+
+    cfg.applyProfileDefaults();
+
+    // Regression: markdown_only should not clobber an explicit half-life override.
+    try std.testing.expectEqual(@as(u32, 0), cfg.search.query.hybrid.temporal_decay.half_life_days);
 }

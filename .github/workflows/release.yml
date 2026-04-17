@@ -4,7 +4,7 @@ env:
   ANDROID_API_LEVEL: 24
   ANDROID_NDK_VERSION: 29.0.14206865
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
 
 on:
   push:
@@ -85,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.16.0
         run: bash .github/scripts/install-zig.sh "${ZIG_VERSION}"
 
       - name: Resolve build version
@@ -182,6 +182,20 @@ jobs:
           mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
           mv nullclaw-windows-aarch64/nullclaw.exe nullclaw-windows-aarch64.exe
 
+      - name: Package Windows archives
+        run: |
+          mkdir -p release-zips/windows-x86_64 release-zips/windows-aarch64
+          cp nullclaw-windows-x86_64.exe release-zips/windows-x86_64/nullclaw.exe
+          cp nullclaw-windows-aarch64.exe release-zips/windows-aarch64/nullclaw.exe
+          (
+            cd release-zips/windows-x86_64
+            zip -9 ../../nullclaw-windows-x86_64.zip nullclaw.exe
+          )
+          (
+            cd release-zips/windows-aarch64
+            zip -9 ../../nullclaw-windows-aarch64.zip nullclaw.exe
+          )
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -198,6 +212,8 @@ jobs:
             nullclaw-macos-x86_64.bin
             nullclaw-windows-x86_64.exe
             nullclaw-windows-aarch64.exe
+            nullclaw-windows-x86_64.zip
+            nullclaw-windows-aarch64.zip
           generate_release_notes: true
 
   docker:

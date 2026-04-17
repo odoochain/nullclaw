@@ -57,9 +57,9 @@ nullclaw gateway
 建议在长期运行场景使用 service 子命令：
 
 - macOS 走 `launchctl`。
-- Linux 环境会优先使用 `systemd --user`，在 Alpine / OpenRC 系统上会自动切换为 OpenRC。
+- Linux 环境会优先使用 `systemd --user`，在检测到 OpenRC 或 SysVinit 运行环境时自动切换到对应实现。
 - Windows 走 Service Control Manager。
-- 如果 Linux 上既没有可用的 `systemd --user`，也缺少必需的 OpenRC 命令，这组子命令会失败；此时应改用前台 `nullclaw gateway` 或其他外部 supervisor。
+- 如果 Linux 上既没有可用的 `systemd --user`，也缺少必需的 OpenRC / SysVinit 支持，这组子命令会失败；此时应改用前台 `nullclaw gateway` 或其他外部 supervisor。
 
 ```bash
 nullclaw service install
@@ -122,7 +122,7 @@ nullclaw onboard --interactive
 重点检查：
 
 - `channels.<name>.accounts.*` 的 token / webhook / account 字段是否正确。
-- `allow_from` 是否误设为空数组。
+- 是否存在渠道级 allowlist / gating 配置不匹配（如 `allow_from`、`group_allow_from`、`require_mention` 等）。空 `allow_from` 不是通用的“拒绝所有”开关。
 - `nullclaw channel status` 是否有 unhealthy 标记。
 - 如果是 DingTalk，进一步看
   [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)。
@@ -162,6 +162,20 @@ nullclaw onboard --interactive
 ```
 
 如果同一 provider 有多把 key，可以配置 `reliability.api_keys` 让 NullClaw 在限流时轮转。
+
+### 6) 本地 Ollama 模型提示没有 `scheduler_tool` 权限
+
+这通常意味着：
+
+- NullClaw 里的规范工具名其实是 `schedule`。
+- 某些通过 Ollama 提供的本地模型会输出 `scheduler_tool` 或 `schedule_tool`。
+- 新版 NullClaw 会在分发前把这些 Ollama 别名规范化回 `schedule`。
+
+建议检查：
+
+- 确认当前运行的版本已经包含 Ollama 工具别名规范化修复。
+- 如果仍然看到 scheduler 相关名字触发 `Unknown tool`，用 `nullclaw agent --verbose` 复现一次。
+- 如果还在使用旧二进制，先升级再排查 scheduler 配置；大多数情况下问题是工具名漂移，不是 scheduler 没开。
 
 ## 变更后回归检查清单
 

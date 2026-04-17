@@ -1,10 +1,13 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const bus = @import("../bus.zig");
+const channel_outbox = @import("outbox.zig");
 const outbound = @import("../outbound.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 const thread_stacks = @import("../thread_stacks.zig");
+const builtin = @import("builtin");
 
 /// Message dispatch — routes incoming ChannelMessages to the agent,
 /// routes agent responses back to the originating channel.
@@ -186,6 +189,16 @@ pub fn runOutboundDispatcher(
     registry: *const ChannelRegistry,
     stats: *DispatchStats,
 ) void {
+    runOutboundDispatcherWithOutbox(allocator, event_bus, registry, stats, null);
+}
+
+pub fn runOutboundDispatcherWithOutbox(
+    allocator: Allocator,
+    event_bus: *bus.Bus,
+    registry: *const ChannelRegistry,
+    stats: *DispatchStats,
+    delivery_outbox: ?*channel_outbox.DeliveryOutbox,
+) void {
     var draft_messages: DraftMessageMap = .empty;
     defer deinitDraftMessages(allocator, &draft_messages);
 
@@ -198,7 +211,18 @@ pub fn runOutboundDispatcher(
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
-            dispatchOutboundMessage(allocator, channel, msg, &draft_messages) catch {
+            if (delivery_outbox) |outbox| {
+                if (shouldPersistFinalOutbound(msg)) {
+                    if (outbox.enqueueFinal(msg)) |_| {
+                        _ = stats.dispatched.fetchAdd(1, .monotonic);
+                        continue;
+                    } else |_| {
+                        // Fall back to the legacy direct path so a persistence
+                        // failure does not drop the final reply entirely.
+                    }
+                }
+            }
+            dispatchOutboundMessageWithRetry(allocator, channel, msg, &draft_messages) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -209,10 +233,106 @@ pub fn runOutboundDispatcher(
     }
 }
 
+const OUTBOX_IDLE_POLL_MS: u64 = if (builtin.is_test) 1 else 250;
+
+const DeliveryFailureClass = enum {
+    transient,
+    permanent,
+};
+
+const MAX_FINAL_SEND_ATTEMPTS: usize = 3;
+const FINAL_SEND_RETRY_BACKOFF_MS = if (builtin.is_test)
+    [_]u64{ 0, 0 }
+else
+    [_]u64{ 250, 1000 };
+
+fn classifyOutboundFailure(err: anyerror) DeliveryFailureClass {
+    return switch (err) {
+        error.NotSupported,
+        error.InvalidTarget,
+        error.InvalidMessageRef,
+        => .permanent,
+        else => .transient,
+    };
+}
+
+fn shouldRetryOutboundMessage(channel: root.Channel, msg: bus.OutboundMessage, err: anyerror) bool {
+    return msg.stage == .final and
+        !shouldUseTrackedDraftDispatch(channel, msg) and
+        classifyOutboundFailure(err) == .transient;
+}
+
+fn dispatchOutboundMessageWithRetry(
+    allocator: Allocator,
+    channel: root.Channel,
+    msg: bus.OutboundMessage,
+    draft_messages: *DraftMessageMap,
+) !void {
+    var attempt: usize = 1;
+    while (true) {
+        dispatchOutboundMessage(allocator, channel, msg, draft_messages) catch |err| {
+            if (!shouldRetryOutboundMessage(channel, msg, err) or attempt >= MAX_FINAL_SEND_ATTEMPTS) return err;
+            const backoff_idx = @min(attempt - 1, FINAL_SEND_RETRY_BACKOFF_MS.len - 1);
+            const backoff_ms = FINAL_SEND_RETRY_BACKOFF_MS[backoff_idx];
+            if (backoff_ms > 0) std_compat.thread.sleep(backoff_ms * std.time.ns_per_ms);
+            attempt += 1;
+            continue;
+        };
+        return;
+    }
+}
+
+pub fn runDurableOutboundWorker(
+    allocator: Allocator,
+    delivery_outbox: *channel_outbox.DeliveryOutbox,
+    registry: *const ChannelRegistry,
+) void {
+    while (!delivery_outbox.isClosed()) {
+        const processed = drainDurableOutboundOutboxOnce(allocator, delivery_outbox, registry) catch false;
+        if (!processed) std_compat.thread.sleep(OUTBOX_IDLE_POLL_MS * std.time.ns_per_ms);
+    }
+}
+
+pub fn drainDurableOutboundOutboxOnce(
+    allocator: Allocator,
+    delivery_outbox: *channel_outbox.DeliveryOutbox,
+    registry: *const ChannelRegistry,
+) !bool {
+    if (try delivery_outbox.purgePersistedDelivered() > 0) return true;
+
+    const now_ns: i64 = @intCast(std_compat.time.nanoTimestamp());
+    var claimed = (try delivery_outbox.claimNextReady(allocator, now_ns)) orelse return false;
+    defer claimed.deinit(allocator);
+
+    const channel = if (claimed.account_id) |account_id|
+        registry.findByNameAccount(claimed.channel, account_id)
+    else
+        registry.findByName(claimed.channel);
+
+    if (channel) |resolved_channel| {
+        dispatchClaimedOutboundDirect(resolved_channel, claimed) catch |err| {
+            try delivery_outbox.recordFailure(claimed.id, @errorName(err), now_ns);
+            return true;
+        };
+        try delivery_outbox.recordDelivered(claimed.id, now_ns);
+        try delivery_outbox.purgeDelivered(claimed.id);
+        return true;
+    }
+
+    try delivery_outbox.recordFailure(claimed.id, "ChannelNotFound", now_ns);
+    return true;
+}
+
 fn deinitDraftMessages(allocator: Allocator, draft_messages: *DraftMessageMap) void {
     var it = draft_messages.valueIterator();
     while (it.next()) |state| state.deinit(allocator);
     draft_messages.deinit(allocator);
+}
+
+fn shouldUseTrackedDraftDispatch(channel: root.Channel, msg: bus.OutboundMessage) bool {
+    return msg.draft_id != 0 and
+        !channel.supportsStreamingOutbound() and
+        supportsDraftStreaming(channel);
 }
 
 fn draftMessageKey(allocator: Allocator, msg: bus.OutboundMessage) ![]u8 {
@@ -259,10 +379,7 @@ fn dispatchOutboundMessage(
     msg: bus.OutboundMessage,
     draft_messages: *DraftMessageMap,
 ) !void {
-    if (msg.draft_id != 0 and
-        !channel.supportsStreamingOutbound() and
-        supportsDraftStreaming(channel))
-    {
+    if (shouldUseTrackedDraftDispatch(channel, msg)) {
         switch (msg.stage) {
             .chunk => return dispatchDraftChunk(allocator, channel, msg, draft_messages),
             .final => {
@@ -361,6 +478,27 @@ fn dispatchOutboundDirect(channel: root.Channel, msg: bus.OutboundMessage) !void
         return;
     }
     return channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage);
+}
+
+fn dispatchClaimedOutboundDirect(channel: root.Channel, job: channel_outbox.DeliveryOutbox.ClaimedJob) !void {
+    if (job.media.len == 0 and
+        job.choices.len > 0 and
+        !outbound.has_legacy_attachment_markers(job.content))
+    {
+        channel.sendRich(job.chat_id, .{
+            .text = job.content,
+            .choices = job.choices,
+        }) catch |err| switch (err) {
+            error.NotSupported => return channel.sendEvent(job.chat_id, job.content, &.{}, .final),
+            else => return err,
+        };
+        return;
+    }
+    return channel.sendEvent(job.chat_id, job.content, job.media, .final);
+}
+
+fn shouldPersistFinalOutbound(msg: bus.OutboundMessage) bool {
+    return msg.stage == .final and msg.draft_id == 0;
 }
 
 /// Get names of all enabled (registered) channels.
@@ -531,6 +669,8 @@ const MockChannel = struct {
     sent_count: Atomic(u64) = Atomic(u64).init(0),
     chunk_count: Atomic(u64) = Atomic(u64).init(0),
     should_fail: bool = false,
+    fail_first_final: bool = false,
+    final_attempts: Atomic(u64) = Atomic(u64).init(0),
 
     const vtable = root.Channel.VTable{
         .start = mockStart,
@@ -550,6 +690,8 @@ const MockChannel = struct {
     fn mockSend(ctx: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {
         const self: *MockChannel = @ptrCast(@alignCast(ctx));
         if (self.should_fail) return error.SendFailed;
+        const attempt = self.final_attempts.fetchAdd(1, .monotonic) + 1;
+        if (self.fail_first_final and attempt == 1) return error.SendFailed;
         _ = self.sent_count.fetchAdd(1, .monotonic);
     }
     fn mockSendEvent(
@@ -563,7 +705,11 @@ const MockChannel = struct {
         if (self.should_fail) return error.SendFailed;
         switch (stage) {
             .chunk => _ = self.chunk_count.fetchAdd(1, .monotonic),
-            .final => _ = self.sent_count.fetchAdd(1, .monotonic),
+            .final => {
+                const attempt = self.final_attempts.fetchAdd(1, .monotonic) + 1;
+                if (self.fail_first_final and attempt == 1) return error.SendFailed;
+                _ = self.sent_count.fetchAdd(1, .monotonic);
+            },
         }
     }
     fn mockName(ctx: *anyopaque) []const u8 {
@@ -616,10 +762,12 @@ const MockDraftChannel = struct {
     allocator: Allocator,
     name_str: []const u8,
     supports_drafts: bool = true,
+    fail_first_delete: bool = false,
     sent_count: Atomic(u64) = Atomic(u64).init(0),
     tracked_count: Atomic(u64) = Atomic(u64).init(0),
     edit_count: Atomic(u64) = Atomic(u64).init(0),
     delete_count: Atomic(u64) = Atomic(u64).init(0),
+    delete_attempts: Atomic(u64) = Atomic(u64).init(0),
     last_tracked_text: ?[]u8 = null,
     last_edit_text: ?[]u8 = null,
 
@@ -672,6 +820,8 @@ const MockDraftChannel = struct {
     }
     fn mockDeleteMessage(ctx: *anyopaque, _: root.Channel.MessageRef) anyerror!void {
         const self: *MockDraftChannel = @ptrCast(@alignCast(ctx));
+        const attempt = self.delete_attempts.fetchAdd(1, .monotonic) + 1;
+        if (self.fail_first_delete and attempt == 1) return error.SendFailed;
         _ = self.delete_count.fetchAdd(1, .monotonic);
     }
     fn mockName(ctx: *anyopaque) []const u8 {
@@ -917,6 +1067,43 @@ test "dispatcher deletes tracked draft on empty final" {
     try std.testing.expectEqual(@as(u64, 1), mock_external.tracked_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), mock_external.edit_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), mock_external.delete_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_external.sent_count.load(.monotonic));
+}
+
+// Regression: retry logic must not turn a failed tracked-draft delete into a fresh outbound send.
+test "dispatcher does not retry tracked draft final delete failures" {
+    const allocator = std.testing.allocator;
+
+    var mock_external = MockDraftChannel{
+        .allocator = allocator,
+        .name_str = "external",
+        .fail_first_delete = true,
+    };
+    defer mock_external.deinit();
+
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_external.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    var chunk = try bus.makeOutboundChunk(allocator, "external", "chat1", "Hello");
+    chunk.draft_id = 22;
+    try event_bus.publishOutbound(chunk);
+
+    var final = try bus.makeOutbound(allocator, "external", "chat1", "");
+    final.draft_id = 22;
+    try event_bus.publishOutbound(final);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 1), stats.getErrors());
+    try std.testing.expectEqual(@as(u64, 1), mock_external.tracked_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_external.delete_attempts.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_external.delete_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), mock_external.sent_count.load(.monotonic));
 }
 
@@ -1198,6 +1385,171 @@ test "dispatcher increments errors on channel.send failure" {
     try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
 }
 
+// Regression: transient final-send failures must not drop the reply permanently.
+test "dispatcher retries transient final send once" {
+    const allocator = std.testing.allocator;
+
+    var mock_retry = MockChannel{ .name_str = "qq", .fail_first_final = true };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_retry.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutbound(allocator, "qq", "c1", "hello");
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
+    try std.testing.expectEqual(@as(u64, 1), mock_retry.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), mock_retry.final_attempts.load(.monotonic));
+}
+
+test "dispatcher classifies permanent and transient outbound failures" {
+    try std.testing.expectEqual(DeliveryFailureClass.permanent, classifyOutboundFailure(error.InvalidTarget));
+    try std.testing.expectEqual(DeliveryFailureClass.permanent, classifyOutboundFailure(error.NotSupported));
+    try std.testing.expectEqual(DeliveryFailureClass.transient, classifyOutboundFailure(error.QQApiError));
+    try std.testing.expectEqual(DeliveryFailureClass.transient, classifyOutboundFailure(error.SendFailed));
+}
+
+test "dispatcher can enqueue final outbound into durable outbox" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
+    defer allocator.free(outbox_path);
+
+    var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
+    defer outbox.deinit();
+
+    var mock_tg = MockChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+    const msg = try bus.makeOutbound(allocator, "telegram", "chat1", "hello");
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcherWithOutbox(allocator, &event_bus, &reg, &stats, &outbox);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(usize, 1), outbox.pendingCount());
+    try std.testing.expectEqual(@as(u64, 0), mock_tg.sent_count.load(.monotonic));
+}
+
+// Regression: a durable enqueue failure must not drop the final reply.
+test "dispatcher falls back to direct send when durable enqueue fails" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "missing", "delivery.json" });
+    defer allocator.free(outbox_path);
+
+    var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
+    defer outbox.deinit();
+
+    var mock_tg = MockChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutbound(allocator, "telegram", "chat1", "hello");
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcherWithOutbox(allocator, &event_bus, &reg, &stats, &outbox);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
+    try std.testing.expectEqual(@as(usize, 0), outbox.pendingCount());
+    try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+}
+
+test "durable outbound worker retries persisted final delivery" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
+    defer allocator.free(outbox_path);
+
+    var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
+    defer outbox.deinit();
+
+    var mock_tg = MockChannel{
+        .name_str = "telegram",
+        .fail_first_final = true,
+    };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    var msg = try bus.makeOutbound(allocator, "telegram", "chat1", "hello");
+    defer msg.deinit(allocator);
+    _ = try outbox.enqueueFinal(msg);
+
+    try std.testing.expect(try drainDurableOutboundOutboxOnce(allocator, &outbox, &reg));
+    try std.testing.expectEqual(@as(usize, 1), outbox.pendingCount());
+    try std.testing.expectEqual(@as(u64, 1), mock_tg.final_attempts.load(.monotonic));
+
+    try std.testing.expect(try drainDurableOutboundOutboxOnce(allocator, &outbox, &reg));
+    try std.testing.expectEqual(@as(usize, 0), outbox.pendingCount());
+    try std.testing.expectEqual(@as(u64, 2), mock_tg.final_attempts.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+}
+
+// Regression: if the process crashes after send success but before durable cleanup,
+// the restarted worker must purge the acknowledged job instead of redelivering it.
+test "durable outbound worker purges acknowledged persisted delivery without resend" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
+    defer allocator.free(outbox_path);
+
+    var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
+    defer outbox.deinit();
+
+    var msg = try bus.makeOutbound(allocator, "telegram", "chat1", "hello");
+    defer msg.deinit(allocator);
+    const id = try outbox.enqueueFinal(msg);
+
+    var claimed = (try outbox.claimNextReady(allocator, 0)).?;
+    claimed.deinit(allocator);
+    try outbox.recordDelivered(id, 42);
+
+    var mock_tg = MockChannel{ .name_str = "telegram" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_tg.channel());
+
+    try std.testing.expect(try drainDurableOutboundOutboxOnce(allocator, &outbox, &reg));
+    try std.testing.expectEqual(@as(usize, 0), outbox.pendingCount());
+    try std.testing.expectEqual(@as(u64, 0), mock_tg.final_attempts.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_tg.sent_count.load(.monotonic));
+}
+
 test "dispatcher handles multiple messages" {
     const allocator = std.testing.allocator;
 
@@ -1296,7 +1648,7 @@ test "dispatcher runs in a separate thread" {
     try event_bus.publishOutbound(msg);
 
     // Small delay then close bus to let dispatcher process
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
     event_bus.close();
     thread.join();
 
@@ -1340,7 +1692,7 @@ test "dispatcher concurrent producers + single dispatcher" {
     // Wait for all producers, then close bus
     for (&producers) |*p| p.join();
     // Small delay for dispatcher to drain
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    std_compat.thread.sleep(20 * std.time.ns_per_ms);
     event_bus.close();
     dispatcher.join();
 

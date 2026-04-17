@@ -1,10 +1,11 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const Atomic = @import("portable_atomic.zig").Atomic;
 const fs_compat = @import("fs_compat.zig");
 
 /// Events the observer can record.
 pub const ObserverEvent = union(enum) {
-    agent_start: struct { provider: []const u8, model: []const u8 },
+    agent_start: struct { provider: []const u8, model: []const u8, channel: ?[]const u8 = null, bot_account: ?[]const u8 = null },
     llm_request: struct { provider: []const u8, model: []const u8, messages_count: usize, detail: ?[]const u8 = null },
     llm_response: struct {
         provider: []const u8,
@@ -31,6 +32,9 @@ pub const ObserverEvent = union(enum) {
     channel_message: struct { channel: []const u8, direction: []const u8 },
     heartbeat_tick: void,
     err: struct { component: []const u8, message: []const u8 },
+    subagent_start: struct { agent_name: []const u8, task: []const u8 },
+    cron_job_start: struct { task: []const u8, channel: ?[]const u8 = null, bot_account: ?[]const u8 = null },
+    skill_load: struct { name: []const u8, duration_ms: u64 },
 };
 
 /// Numeric metrics.
@@ -51,6 +55,8 @@ pub const Observer = struct {
         record_metric: *const fn (ptr: *anyopaque, metric: *const ObserverMetric) void,
         flush: *const fn (ptr: *anyopaque) void,
         name: *const fn (ptr: *anyopaque) []const u8,
+        get_trace_id: *const fn (ptr: *anyopaque) ?[32]u8,
+        set_trace_id: *const fn (ptr: *anyopaque, trace_id: [32]u8) void,
     };
 
     pub fn recordEvent(self: Observer, event: *const ObserverEvent) void {
@@ -68,10 +74,19 @@ pub const Observer = struct {
     pub fn getName(self: Observer) []const u8 {
         return self.vtable.name(self.ptr);
     }
+
+    pub fn getTraceId(self: Observer) ?[32]u8 {
+        return self.vtable.get_trace_id(self.ptr);
+    }
+
+    pub fn setTraceId(self: Observer, trace_id: [32]u8) void {
+        self.vtable.set_trace_id(self.ptr, trace_id);
+    }
 };
 
 const MAX_TOOL_CALL_DETAIL_LEN: usize = 1024;
 const MAX_LLM_DETAIL_LEN: usize = 2048;
+const MAX_EVENT_DETAIL_LEN: usize = 1024;
 
 fn truncateForObserver(detail: ?[]const u8, max_len: usize) ?[]const u8 {
     const raw = detail orelse return null;
@@ -88,6 +103,10 @@ fn llmDetailForObserver(detail: ?[]const u8) ?[]const u8 {
     return truncateForObserver(detail, MAX_LLM_DETAIL_LEN);
 }
 
+fn eventDetailForObserver(detail: ?[]const u8) ?[]const u8 {
+    return truncateForObserver(detail, MAX_EVENT_DETAIL_LEN);
+}
+
 // ── NoopObserver ─────────────────────────────────────────────────────
 
 /// Zero-overhead observer — all methods are no-ops.
@@ -97,6 +116,8 @@ pub const NoopObserver = struct {
         .record_metric = noopRecordMetric,
         .flush = noopFlush,
         .name = noopName,
+        .get_trace_id = noopGetTraceId,
+        .set_trace_id = noopSetTraceId,
     };
 
     pub fn observer(self: *NoopObserver) Observer {
@@ -112,6 +133,10 @@ pub const NoopObserver = struct {
     fn noopName(_: *anyopaque) []const u8 {
         return "noop";
     }
+    fn noopGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn noopSetTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 
 // ── LogObserver ──────────────────────────────────────────────────────
@@ -123,6 +148,8 @@ pub const LogObserver = struct {
         .record_metric = logRecordMetric,
         .flush = logFlush,
         .name = logName,
+        .get_trace_id = logGetTraceId,
+        .set_trace_id = logSetTraceId,
     };
 
     pub fn observer(self: *LogObserver) Observer {
@@ -134,7 +161,19 @@ pub const LogObserver = struct {
 
     fn logRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
         switch (event.*) {
-            .agent_start => |e| std.log.info("agent.start provider={s} model={s}", .{ e.provider, e.model }),
+            .agent_start => |e| {
+                if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        std.log.info("agent.start provider={s} model={s} channel={s} bot_account={s}", .{ e.provider, e.model, ch, bot });
+                    } else {
+                        std.log.info("agent.start provider={s} model={s} channel={s}", .{ e.provider, e.model, ch });
+                    }
+                } else if (e.bot_account) |bot| {
+                    std.log.info("agent.start provider={s} model={s} bot_account={s}", .{ e.provider, e.model, bot });
+                } else {
+                    std.log.info("agent.start provider={s} model={s}", .{ e.provider, e.model });
+                }
+            },
             .llm_request => |e| std.log.info("llm.request provider={s} model={s} messages={d}", .{ e.provider, e.model, e.messages_count }),
             .llm_response => |e| std.log.info("llm.response provider={s} model={s} duration_ms={d} success={}", .{ e.provider, e.model, e.duration_ms, e.success }),
             .agent_end => |e| std.log.info("agent.end duration_ms={d}", .{e.duration_ms}),
@@ -151,6 +190,39 @@ pub const LogObserver = struct {
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
             .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
+            .subagent_start => |e| {
+                if (eventDetailForObserver(e.task)) |task| {
+                    std.log.info("subagent.start agent_name={s} task={s}", .{ e.agent_name, task });
+                } else {
+                    std.log.info("subagent.start agent_name={s}", .{e.agent_name});
+                }
+            },
+            .cron_job_start => |e| {
+                if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        if (eventDetailForObserver(e.task)) |task| {
+                            std.log.info("cron.job.start channel={s} bot_account={s} task={s}", .{ ch, bot, task });
+                        } else {
+                            std.log.info("cron.job.start channel={s} bot_account={s}", .{ ch, bot });
+                        }
+                    } else if (eventDetailForObserver(e.task)) |task| {
+                        std.log.info("cron.job.start channel={s} task={s}", .{ ch, task });
+                    } else {
+                        std.log.info("cron.job.start channel={s}", .{ch});
+                    }
+                } else if (e.bot_account) |bot| {
+                    if (eventDetailForObserver(e.task)) |task| {
+                        std.log.info("cron.job.start bot_account={s} task={s}", .{ bot, task });
+                    } else {
+                        std.log.info("cron.job.start bot_account={s}", .{bot});
+                    }
+                } else if (eventDetailForObserver(e.task)) |task| {
+                    std.log.info("cron.job.start task={s}", .{task});
+                } else {
+                    std.log.info("cron.job.start", .{});
+                }
+            },
+            .skill_load => |e| std.log.info("skill.load name={s} duration_ms={d}", .{ e.name, e.duration_ms }),
         }
     }
 
@@ -167,6 +239,10 @@ pub const LogObserver = struct {
     fn logName(_: *anyopaque) []const u8 {
         return "log";
     }
+    fn logGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn logSetTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 
 // ── VerboseObserver ──────────────────────────────────────────────────
@@ -178,6 +254,8 @@ pub const VerboseObserver = struct {
         .record_metric = verboseRecordMetric,
         .flush = verboseFlush,
         .name = verboseName,
+        .get_trace_id = verboseGetTraceId,
+        .set_trace_id = verboseSetTraceId,
     };
 
     pub fn observer(self: *VerboseObserver) Observer {
@@ -189,7 +267,7 @@ pub const VerboseObserver = struct {
 
     fn verboseRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
         var buf: [4096]u8 = undefined;
-        var bw = std.fs.File.stderr().writer(&buf);
+        var bw = std_compat.fs.File.stderr().writer(&buf);
         const stderr = &bw.interface;
         switch (event.*) {
             .llm_request => |e| {
@@ -212,6 +290,19 @@ pub const VerboseObserver = struct {
             .turn_complete => {
                 stderr.print("< Complete\n", .{}) catch {};
             },
+            .subagent_start => |e| {
+                stderr.print("> Subagent {s}\n", .{e.agent_name}) catch {};
+            },
+            .cron_job_start => |e| {
+                if (e.channel) |ch| {
+                    stderr.print("> Cron Job (channel={s})\n", .{ch}) catch {};
+                } else {
+                    stderr.print("> Cron Job\n", .{}) catch {};
+                }
+            },
+            .skill_load => |e| {
+                stderr.print("> Skill {s} loaded in {d}ms\n", .{ e.name, e.duration_ms }) catch {};
+            },
             else => {},
         }
     }
@@ -221,6 +312,10 @@ pub const VerboseObserver = struct {
     fn verboseName(_: *anyopaque) []const u8 {
         return "verbose";
     }
+    fn verboseGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn verboseSetTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 
 // ── MultiObserver ────────────────────────────────────────────────────
@@ -234,6 +329,8 @@ pub const MultiObserver = struct {
         .record_metric = multiRecordMetric,
         .flush = multiFlush,
         .name = multiName,
+        .get_trace_id = multiGetTraceId,
+        .set_trace_id = multiSetTraceId,
     };
 
     pub fn observer(s: *MultiObserver) Observer {
@@ -268,11 +365,24 @@ pub const MultiObserver = struct {
     fn multiName(_: *anyopaque) []const u8 {
         return "multi";
     }
+
+    fn multiGetTraceId(ptr: *anyopaque) ?[32]u8 {
+        for (resolve(ptr).observers) |obs| {
+            if (obs.getTraceId()) |id| return id;
+        }
+        return null;
+    }
+
+    fn multiSetTraceId(ptr: *anyopaque, trace_id: [32]u8) void {
+        for (resolve(ptr).observers) |obs| {
+            obs.setTraceId(trace_id);
+        }
+    }
 };
 
 // ── FileObserver ─────────────────────────────────────────────────────
 
-var file_observer_mutex: std.Thread.Mutex = .{};
+var file_observer_mutex: std_compat.sync.Mutex = .{};
 
 /// Appends events as JSONL to a log file.
 pub const FileObserver = struct {
@@ -283,6 +393,8 @@ pub const FileObserver = struct {
         .record_metric = fileRecordMetric,
         .flush = fileFlush,
         .name = fileName,
+        .get_trace_id = fileGetTraceId,
+        .set_trace_id = fileSetTraceId,
     };
 
     pub fn observer(self: *FileObserver) Observer {
@@ -301,27 +413,14 @@ pub const FileObserver = struct {
         defer file_observer_mutex.unlock();
 
         self.ensureParentDirExists();
-
-        const file = std.fs.cwd().openFile(self.path, .{ .mode = .write_only }) catch {
-            // Try creating the file if it doesn't exist
-            const new_file = std.fs.cwd().createFile(self.path, .{ .truncate = false }) catch return;
-            defer new_file.close();
-            new_file.seekFromEnd(0) catch return;
-            new_file.writeAll(line) catch {};
-            new_file.writeAll("\n") catch {};
-            return;
-        };
-        defer file.close();
-        file.seekFromEnd(0) catch return;
-        file.writeAll(line) catch {};
-        file.writeAll("\n") catch {};
+        fs_compat.appendLine(self.path, line) catch return;
     }
 
     fn ensureParentDirExists(self: *FileObserver) void {
-        const parent = std.fs.path.dirname(self.path) orelse return;
+        const parent = std_compat.fs.path.dirname(self.path) orelse return;
         if (parent.len == 0) return;
 
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => fs_compat.makePath(parent) catch {},
         };
@@ -331,7 +430,15 @@ pub const FileObserver = struct {
         const self = resolve(ptr);
         var buf: [2048]u8 = undefined;
         const line = switch (event.*) {
-            .agent_start => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"agent_start\",\"provider\":{f},\"model\":{f}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}) }) catch return,
+            .agent_start => |e| blk: {
+                if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"agent_start\",\"provider\":{f},\"model\":{f},\"channel\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}), std.json.fmt(ch, .{}), std.json.fmt(bot, .{}) }) catch return;
+                    }
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"agent_start\",\"provider\":{f},\"model\":{f},\"channel\":{f}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}), std.json.fmt(ch, .{}) }) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"agent_start\",\"provider\":{f},\"model\":{f}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}) }) catch return;
+            },
             .llm_request => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"llm_request\",\"provider\":{f},\"model\":{f},\"messages_count\":{d}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}), e.messages_count }) catch return,
             .llm_response => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"llm_response\",\"provider\":{f},\"model\":{f},\"duration_ms\":{d},\"success\":{}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}), e.duration_ms, e.success }) catch return,
             .agent_end => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"agent_end\",\"duration_ms\":{d}}}", .{e.duration_ms}) catch return,
@@ -351,6 +458,38 @@ pub const FileObserver = struct {
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":{f},\"direction\":{f}}}", .{ std.json.fmt(e.channel, .{}), std.json.fmt(e.direction, .{}) }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
             .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":{f},\"message\":{f}}}", .{ std.json.fmt(e.component, .{}), std.json.fmt(e.message, .{}) }) catch return,
+            .subagent_start => |e| blk: {
+                if (eventDetailForObserver(e.task)) |task| {
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"subagent_start\",\"agent_name\":{f},\"task\":{f}}}", .{ std.json.fmt(e.agent_name, .{}), std.json.fmt(task, .{}) }) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"subagent_start\",\"agent_name\":{f}}}", .{std.json.fmt(e.agent_name, .{})}) catch return;
+            },
+            .cron_job_start => |e| blk: {
+                const task = eventDetailForObserver(e.task);
+                if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        if (task) |task_detail| {
+                            break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"channel\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(ch, .{}), std.json.fmt(bot, .{}) }) catch return;
+                        }
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"channel\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(ch, .{}), std.json.fmt(bot, .{}) }) catch return;
+                    }
+                    if (task) |task_detail| {
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"channel\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(ch, .{}) }) catch return;
+                    }
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"channel\":{f}}}", .{std.json.fmt(ch, .{})}) catch return;
+                }
+                if (e.bot_account) |bot| {
+                    if (task) |task_detail| {
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(bot, .{}) }) catch return;
+                    }
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"bot_account\":{f}}}", .{std.json.fmt(bot, .{})}) catch return;
+                }
+                if (task) |task_detail| {
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f}}}", .{std.json.fmt(task_detail, .{})}) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\"}}", .{}) catch return;
+            },
+            .skill_load => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"skill_load\",\"name\":{f},\"duration_ms\":{d}}}", .{ std.json.fmt(e.name, .{}), e.duration_ms }) catch return,
         };
         self.appendToFile(line);
     }
@@ -374,6 +513,11 @@ pub const FileObserver = struct {
     fn fileName(_: *anyopaque) []const u8 {
         return "file";
     }
+
+    fn fileGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn fileSetTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 
 /// Factory: create observer from config backend string.
@@ -434,7 +578,7 @@ pub const OtelObserver = struct {
     headers: []const []const u8,
     spans: std.ArrayListUnmanaged(OtelSpan),
     trace_contexts: std.AutoHashMapUnmanaged(std.Thread.Id, TraceContext),
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
     requests_total: Atomic(u64),
     errors_total: Atomic(u64),
 
@@ -445,12 +589,14 @@ pub const OtelObserver = struct {
         .record_metric = otelRecordMetric,
         .flush = otelFlush,
         .name = otelName,
+        .get_trace_id = otelGetTraceId,
+        .set_trace_id = otelSetTraceId,
     };
 
     pub fn init(allocator: std.mem.Allocator, endpoint: ?[]const u8, service_name: ?[]const u8) OtelObserver {
         return .{
             .allocator = allocator,
-            .endpoint = endpoint orelse "http://localhost:4318",
+            .endpoint = endpoint orelse "https://localhost:4318",
             .service_name = service_name orelse "nullclaw",
             .headers = &.{},
             .spans = .empty,
@@ -519,7 +665,7 @@ pub const OtelObserver = struct {
     fn randomHex(buf: []u8) void {
         var raw: [16]u8 = undefined;
         const needed = buf.len / 2;
-        std.crypto.random.bytes(raw[0..needed]);
+        std_compat.crypto.random.bytes(raw[0..needed]);
         const hex = "0123456789abcdef";
         for (0..needed) |i| {
             buf[i * 2] = hex[raw[i] >> 4];
@@ -528,7 +674,7 @@ pub const OtelObserver = struct {
     }
 
     fn nowNs() u64 {
-        return @intCast(std.time.nanoTimestamp());
+        return @intCast(std_compat.time.nanoTimestamp());
     }
 
     fn contextForCurrentThread(self: *OtelObserver, now: u64) ?*TraceContext {
@@ -554,6 +700,28 @@ pub const OtelObserver = struct {
 
     fn clearCurrentTrace(self: *OtelObserver) void {
         _ = self.trace_contexts.fetchRemove(std.Thread.getCurrentId());
+    }
+
+    fn otelGetTraceId(ptr: *anyopaque) ?[32]u8 {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.contextForCurrentThread(nowNs())) |ctx| {
+            if (ctx.active) return ctx.trace_id;
+        }
+        return null;
+    }
+
+    fn otelSetTraceId(ptr: *anyopaque, trace_id: [32]u8) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = nowNs();
+        if (self.contextForCurrentThread(now)) |ctx| {
+            ctx.trace_id = trace_id;
+            ctx.start_ns = now;
+            ctx.active = true;
+        }
     }
 
     fn addSpan(self: *OtelObserver, name: []const u8, start_ns: u64, end_ns: u64, attrs: []const OtelAttribute) void {
@@ -610,10 +778,21 @@ pub const OtelObserver = struct {
         switch (event.*) {
             .agent_start => |e| {
                 self.startCurrentTrace(now);
-                self.addSpan("agent.start", now, now, &.{
-                    .{ .key = "provider", .value = e.provider },
-                    .{ .key = "model", .value = e.model },
-                });
+                var attrs: [4]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "provider", .value = e.provider };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "model", .value = e.model };
+                attr_len += 1;
+                if (e.channel) |ch| {
+                    attrs[attr_len] = .{ .key = "channel", .value = ch };
+                    attr_len += 1;
+                }
+                if (e.bot_account) |bot| {
+                    attrs[attr_len] = .{ .key = "bot_account", .value = bot };
+                    attr_len += 1;
+                }
+                self.addSpan("agent.start", now, now, attrs[0..attr_len]);
             },
             .agent_end => |e| {
                 const start = if (self.contextForCurrentThread(now)) |ctx| ctx.start_ns else now;
@@ -749,6 +928,43 @@ pub const OtelObserver = struct {
                     .{ .key = "message", .value = e.message },
                 });
             },
+            .subagent_start => |e| {
+                var attrs: [2]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "agent_name", .value = e.agent_name };
+                attr_len += 1;
+                if (eventDetailForObserver(e.task)) |task| {
+                    attrs[attr_len] = .{ .key = "task", .value = task };
+                    attr_len += 1;
+                }
+                self.addSpan("subagent.start", now, now, attrs[0..attr_len]);
+            },
+            .cron_job_start => |e| {
+                self.startCurrentTrace(now);
+                var attrs: [3]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                if (eventDetailForObserver(e.task)) |task| {
+                    attrs[attr_len] = .{ .key = "task", .value = task };
+                    attr_len += 1;
+                }
+                if (e.channel) |ch| {
+                    attrs[attr_len] = .{ .key = "channel", .value = ch };
+                    attr_len += 1;
+                }
+                if (e.bot_account) |bot| {
+                    attrs[attr_len] = .{ .key = "bot_account", .value = bot };
+                    attr_len += 1;
+                }
+                self.addSpan("cron.job.start", now, now, attrs[0..attr_len]);
+            },
+            .skill_load => |e| {
+                var dur_buf: [20]u8 = undefined;
+                const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
+                self.addSpan("skill.load", now -| (e.duration_ms * 1_000_000), now, &.{
+                    .{ .key = "name", .value = e.name },
+                    .{ .key = "duration_ms", .value = dur_str },
+                });
+            },
         }
     }
 
@@ -795,7 +1011,8 @@ pub const OtelObserver = struct {
     pub fn serializeSpans(self: *OtelObserver) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        const w = &buf_writer.writer;
 
         try w.writeAll("{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"");
         try w.writeAll(self.service_name);
@@ -828,6 +1045,7 @@ pub const OtelObserver = struct {
 
         try w.writeAll("]}]}]}");
 
+        buf = buf_writer.toArrayList();
         return buf.toOwnedSlice(self.allocator);
     }
 
@@ -1156,6 +1374,9 @@ test "FileObserver handles all event types" {
         .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
         .{ .heartbeat_tick = {} },
         .{ .err = .{ .component = "test", .message = "error" } },
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
     };
     for (&events) |*event| {
         obs.recordEvent(event);
@@ -1167,9 +1388,9 @@ test "FileObserver tool_call detail is persisted as JSON string" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/obs_tool_detail.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_tool_detail.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1182,7 +1403,7 @@ test "FileObserver tool_call detail is persisted as JSON string" {
     } };
     obs.recordEvent(&event);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);
@@ -1196,9 +1417,9 @@ test "FileObserver serializes concurrent appends" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/obs_parallel.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_parallel.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1223,7 +1444,7 @@ test "FileObserver serializes concurrent appends" {
     thread_a.join();
     thread_b.join();
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 16 * 1024);
     defer allocator.free(content);
@@ -1240,9 +1461,9 @@ test "FileObserver creates parent directories on first write" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/nested/diagnostics/obs.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "nested", "diagnostics", "obs.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1250,7 +1471,7 @@ test "FileObserver creates parent directories on first write" {
     const event = ObserverEvent{ .heartbeat_tick = {} };
     obs.recordEvent(&event);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);
@@ -1263,9 +1484,9 @@ test "FileObserver emits valid escaped JSONL" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/obs_escaped.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_escaped.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1276,12 +1497,12 @@ test "FileObserver emits valid escaped JSONL" {
     } };
     obs.recordEvent(&event);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);
 
-    const line = std.mem.trimRight(u8, content, "\n");
+    const line = std_compat.mem.trimRight(u8, content, "\n");
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
 
@@ -1289,6 +1510,42 @@ test "FileObserver emits valid escaped JSONL" {
     try std.testing.expectEqualStrings("error", parsed.value.object.get("event").?.string);
     try std.testing.expectEqualStrings("provider\"alpha", parsed.value.object.get("component").?.string);
     try std.testing.expectEqualStrings("line1\nline2\\tail", parsed.value.object.get("message").?.string);
+}
+
+test "FileObserver persists task details for subagent and cron events" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_task_events.jsonl" });
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const subagent = ObserverEvent{ .subagent_start = .{
+        .agent_name = "delegate",
+        .task = "inspect scheduler telemetry",
+    } };
+    const cron = ObserverEvent{ .cron_job_start = .{
+        .task = "send daily digest",
+        .channel = "telegram",
+        .bot_account = "bot-main",
+    } };
+    obs.recordEvent(&subagent);
+    obs.recordEvent(&cron);
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"subagent_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"task\":\"inspect scheduler telemetry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"cron_job_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"channel\":\"telegram\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_account\":\"bot-main\"") != null);
 }
 
 // ── Additional observability tests ──────────────────────────────
@@ -1317,6 +1574,9 @@ test "VerboseObserver handles all event types" {
         .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
         .{ .heartbeat_tick = {} },
         .{ .err = .{ .component = "test", .message = "error" } },
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
     };
     for (&events) |*event| {
         obs.recordEvent(event);
@@ -1500,15 +1760,15 @@ test "OtelObserver name" {
 test "OtelObserver init defaults" {
     var otel = OtelObserver.init(std.testing.allocator, null, null);
     defer otel.deinit();
-    try std.testing.expectEqualStrings("http://localhost:4318", otel.endpoint);
+    try std.testing.expectEqualStrings("https://localhost:4318", otel.endpoint);
     try std.testing.expectEqualStrings("nullclaw", otel.service_name);
     try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
 }
 
 test "OtelObserver init custom endpoint" {
-    var otel = OtelObserver.init(std.testing.allocator, "http://otel:4318", "myservice");
+    var otel = OtelObserver.init(std.testing.allocator, "https://otel:4318", "myservice");
     defer otel.deinit();
-    try std.testing.expectEqualStrings("http://otel:4318", otel.endpoint);
+    try std.testing.expectEqualStrings("https://otel:4318", otel.endpoint);
     try std.testing.expectEqualStrings("myservice", otel.service_name);
 }
 
@@ -1662,6 +1922,56 @@ test "OtelObserver span attributes" {
     try std.testing.expectEqualStrings("openrouter", span.attributes.items[0].value);
     try std.testing.expectEqualStrings("model", span.attributes.items[1].key);
     try std.testing.expectEqualStrings("claude", span.attributes.items[1].value);
+}
+
+test "OtelObserver subagent and cron spans include task attribution" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const subagent = ObserverEvent{ .subagent_start = .{
+        .agent_name = "delegate",
+        .task = "inspect scheduler telemetry",
+    } };
+    const cron = ObserverEvent{ .cron_job_start = .{
+        .task = "send daily digest",
+        .channel = "telegram",
+        .bot_account = "bot-main",
+    } };
+    obs.recordEvent(&subagent);
+    obs.recordEvent(&cron);
+
+    try std.testing.expectEqual(@as(usize, 2), otel.spans.items.len);
+    try std.testing.expectEqualStrings("subagent.start", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("task", otel.spans.items[0].attributes.items[1].key);
+    try std.testing.expectEqualStrings("inspect scheduler telemetry", otel.spans.items[0].attributes.items[1].value);
+    try std.testing.expectEqualStrings("cron.job.start", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("task", otel.spans.items[1].attributes.items[0].key);
+    try std.testing.expectEqualStrings("send daily digest", otel.spans.items[1].attributes.items[0].value);
+    try std.testing.expectEqualStrings("channel", otel.spans.items[1].attributes.items[1].key);
+    try std.testing.expectEqualStrings("telegram", otel.spans.items[1].attributes.items[1].value);
+    try std.testing.expectEqualStrings("bot_account", otel.spans.items[1].attributes.items[2].key);
+    try std.testing.expectEqualStrings("bot-main", otel.spans.items[1].attributes.items[2].value);
+}
+
+test "OtelObserver spans build on observability extension event types" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const events = [_]ObserverEvent{
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
+    };
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), otel.spans.items.len);
+    try std.testing.expectEqualStrings("subagent.start", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("cron.job.start", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("skill.load", otel.spans.items[2].name);
 }
 
 test "OtelObserver tool_call includes detail attribute" {

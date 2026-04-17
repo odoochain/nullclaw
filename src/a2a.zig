@@ -8,6 +8,7 @@
 //! Task state machine: submitted -> working -> completed | failed | canceled | rejected | input-required | auth-required
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
 const gateway = @import("gateway.zig");
@@ -125,7 +126,7 @@ fn sortTaskSnapshotsByRecency(tasks: []TaskSnapshot) void {
 
 pub const TaskRegistry = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     tasks: std.StringHashMapUnmanaged(*TaskRecord) = .empty,
     next_id: u64 = 1,
 
@@ -177,7 +178,7 @@ pub const TaskRegistry = struct {
         const empty_agent = try self.allocator.dupe(u8, "");
         errdefer self.allocator.free(empty_agent);
 
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
 
         const task = try self.allocator.create(TaskRecord);
         errdefer self.allocator.destroy(task);
@@ -222,7 +223,7 @@ pub const TaskRegistry = struct {
         const task = self.tasks.get(task_id) orelse return false;
         if (isTerminalState(task.state) and task.state != new_state) return false;
         task.state = new_state;
-        task.updated_at = std.time.timestamp();
+        task.updated_at = std_compat.time.timestamp();
         return true;
     }
 
@@ -249,7 +250,7 @@ pub const TaskRegistry = struct {
         }
 
         task.state = final_state;
-        task.updated_at = std.time.timestamp();
+        task.updated_at = std_compat.time.timestamp();
         return try self.snapshotLocked(allocator, task);
     }
 
@@ -260,7 +261,7 @@ pub const TaskRegistry = struct {
         const task = self.tasks.get(task_id) orelse return null;
         if (!isTerminalState(task.state)) {
             task.state = .canceled;
-            task.updated_at = std.time.timestamp();
+            task.updated_at = std_compat.time.timestamp();
         }
         return try self.snapshotLocked(allocator, task);
     }
@@ -381,14 +382,18 @@ pub const A2aResponse = struct {
 
 // ── Handler: Agent Card ─────────────────────────────────────────
 
-pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config) A2aResponse {
+/// Build the A2A agent card JSON response.
+/// vision_capable: probe result from SessionManager.probeVision(); null = not confirmed.
+/// Operators may still force advertising via cfg.a2a.multi_modal when needed.
+pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config, vision_capable: ?bool) A2aResponse {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     const endpoint_url = buildEndpointUrl(allocator, cfg.a2a.url) catch return errorResponse();
     defer allocator.free(endpoint_url);
 
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     w.writeAll("{\"name\":\"") catch return errorResponse();
     gateway.jsonEscapeInto(w, cfg.a2a.name) catch return errorResponse();
     w.writeAll("\",\"description\":\"") catch return errorResponse();
@@ -415,13 +420,19 @@ pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config) A2aResp
         w.writeAll("https://github.com/nullclaw/nullclaw") catch return errorResponse();
     }
     w.writeAll("\"}") catch return errorResponse();
-    w.writeAll(",\"capabilities\":{\"streaming\":true}") catch return errorResponse();
+    const effective_multi_modal = cfg.a2a.multi_modal or vision_capable == true;
+    if (effective_multi_modal) {
+        w.writeAll(",\"capabilities\":{\"streaming\":true,\"multi_modal\":true}") catch return errorResponse();
+    } else {
+        w.writeAll(",\"capabilities\":{\"streaming\":true}") catch return errorResponse();
+    }
     w.writeAll(",\"securitySchemes\":{\"bearerAuth\":{\"type\":\"http\",\"scheme\":\"bearer\",\"description\":\"Use a pairing token from /pair as the bearer token.\"}}") catch return errorResponse();
     w.writeAll(",\"security\":[{\"bearerAuth\":[]}]") catch return errorResponse();
     w.writeAll(",\"defaultInputModes\":[\"text/plain\"],\"defaultOutputModes\":[\"text/plain\"]") catch return errorResponse();
     w.writeAll(",\"skills\":[{\"id\":\"chat\",\"name\":\"General Chat\",\"description\":\"General-purpose AI assistant\",\"tags\":[\"chat\",\"general\"]}]") catch return errorResponse();
     w.writeAll("}") catch return errorResponse();
 
+    buf = buf_writer.toArrayList();
     const body = buf.toOwnedSlice(allocator) catch return errorResponse();
     return .{ .body = body };
 }
@@ -489,7 +500,7 @@ pub fn isStreamingMethod(body: []const u8) bool {
 
 /// SSE Sink context — writes JSON-RPC SSE events to a raw TCP stream.
 pub const SseStreamCtx = struct {
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     allocator: std.mem.Allocator,
     request_id: []const u8,
     task_id: []const u8,
@@ -536,7 +547,7 @@ pub const SseStreamCtx = struct {
 pub fn handleStreamingRpc(
     allocator: std.mem.Allocator,
     body: []const u8,
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     registry: *TaskRegistry,
     session_mgr: anytype,
 ) void {
@@ -549,10 +560,11 @@ pub fn handleStreamingRpc(
         return;
     }
 
-    const text = extractMessageText(body) orelse {
+    const text = (extractMessageContent(allocator, body) catch null) orelse {
         writeSseError(allocator, stream, request_id, -32602, "Missing message text");
         return;
     };
+    defer allocator.free(text);
 
     // v0.3.0: messageId is required on Message.
     if (extractMessageMessageId(body) == null) {
@@ -637,7 +649,7 @@ pub fn handleStreamingRpc(
 fn handleResubscribeStreaming(
     allocator: std.mem.Allocator,
     body: []const u8,
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     request_id: []const u8,
     registry: *TaskRegistry,
 ) void {
@@ -675,7 +687,7 @@ fn writeSseErrorEvent(allocator: std.mem.Allocator, sse_ctx: *SseStreamCtx, code
 }
 
 /// Write SSE headers and a single error event for pre-streaming failures.
-fn writeSseError(allocator: std.mem.Allocator, stream: *std.net.Stream, request_id: []const u8, code: i32, message: []const u8) void {
+fn writeSseError(allocator: std.mem.Allocator, stream: *std_compat.net.Stream, request_id: []const u8, code: i32, message: []const u8) void {
     stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
     const err_json = buildJsonRpcError(allocator, request_id, code, message) catch return;
     defer allocator.free(err_json);
@@ -693,11 +705,12 @@ fn handleSendMessage(
     registry: *TaskRegistry,
     session_mgr: anytype,
 ) A2aResponse {
-    const text = extractMessageText(body) orelse {
+    const text = (extractMessageContent(allocator, body) catch null) orelse {
         const err_body = buildJsonRpcError(allocator, request_id, -32602, "Missing message text") catch
             return errorResponse();
         return .{ .body = err_body };
     };
+    defer allocator.free(text);
 
     // v0.3.0: messageId is required on Message.
     if (extractMessageMessageId(body) == null) {
@@ -936,7 +949,8 @@ fn handleListTasks(
     // Build result JSON: {"tasks":[...], "nextPageToken":"", "pageSize":N, "totalSize":N}
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     w.writeAll("{\"tasks\":[") catch return errorResponse();
     for (tasks, 0..) |*task, i| {
@@ -946,11 +960,12 @@ fn handleListTasks(
         w.writeAll(task_json) catch return errorResponse();
     }
     w.writeAll("],\"nextPageToken\":\"\",\"pageSize\":") catch return errorResponse();
-    std.fmt.format(w, "{d}", .{page_size}) catch return errorResponse();
+    w.print("{d}", .{page_size}) catch return errorResponse();
     w.writeAll(",\"totalSize\":") catch return errorResponse();
-    std.fmt.format(w, "{d}", .{registry.taskCount()}) catch return errorResponse();
+    w.print("{d}", .{registry.taskCount()}) catch return errorResponse();
     w.writeByte('}') catch return errorResponse();
 
+    buf = buf_writer.toArrayList();
     const list_json = buf.toOwnedSlice(allocator) catch return errorResponse();
     defer allocator.free(list_json);
 
@@ -965,7 +980,8 @@ fn handleListTasks(
 fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, result_json: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
@@ -973,6 +989,7 @@ fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, resu
     try w.writeAll(result_json);
     try w.writeByte('}');
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -980,23 +997,26 @@ fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, resu
 fn buildJsonRpcError(allocator: std.mem.Allocator, request_id: []const u8, code: i32, message: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
     try w.writeAll(",\"error\":{\"code\":");
-    try std.fmt.format(w, "{d}", .{code});
+    try w.print("{d}", .{code});
     try w.writeAll(",\"message\":\"");
     try gateway.jsonEscapeInto(w, message);
     try w.writeAll("\"}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
 fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot, max_history: ?i64) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     // Format timestamp as ISO 8601 from unix epoch seconds.
     var ts_buf: [32]u8 = undefined;
@@ -1058,6 +1078,7 @@ fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot, max_hi
 
     try w.writeByte('}');
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1305,12 +1326,66 @@ fn extractArrayObjectStringField(array_json: []const u8, key: []const u8) ?[]con
     }
 }
 
-/// Extract the user's message text from A2A params.message.parts[0].text.
-fn extractMessageText(body: []const u8) ?[]const u8 {
+/// Extract message content from all A2A parts, combining text parts and converting
+/// inlineData parts to [IMAGE:data:mime;base64,...] markers understood by the multimodal
+/// pipeline. Returns an allocated string the caller must free; returns null only when
+/// there are no parts at all (no text and no inlineData).
+fn extractMessageContent(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
     const params = extractParamsObject(body) orelse return null;
     const message = extractObjectObjectField(params, "message") orelse return null;
-    const parts = extractObjectArrayField(message, "parts") orelse return null;
-    return extractArrayObjectStringField(parts, "text");
+    const parts_json = extractObjectArrayField(message, "parts") orelse return null;
+
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    // Walk every element of the parts array.
+    var i = skipJsonWhitespace(parts_json, 0);
+    if (i >= parts_json.len or parts_json[i] != '[') return null;
+    i += 1;
+
+    var found_any = false;
+    while (true) {
+        i = skipJsonWhitespace(parts_json, i);
+        if (i >= parts_json.len) break;
+        if (parts_json[i] == ']') break;
+
+        const elem_start = i;
+        const elem_end = scanJsonValueEnd(parts_json, i) orelse break;
+        const elem = parts_json[elem_start..elem_end];
+
+        // Text part — append to buffer (space-separated from prior content).
+        if (extractObjectStringField(elem, "text")) |text| {
+            if (buf.items.len > 0) try buf.append(allocator, ' ');
+            try buf.appendSlice(allocator, text);
+            found_any = true;
+        }
+
+        // inlineData part — convert to [IMAGE:data:<mimeType>;base64,<data>] marker.
+        if (extractObjectObjectField(elem, "inlineData")) |inline_data| {
+            if (extractObjectStringField(inline_data, "mimeType")) |mime| {
+                if (extractObjectStringField(inline_data, "data")) |b64| {
+                    if (buf.items.len > 0) try buf.append(allocator, ' ');
+                    try buf.appendSlice(allocator, "[IMAGE:data:");
+                    try buf.appendSlice(allocator, mime);
+                    try buf.appendSlice(allocator, ";base64,");
+                    try buf.appendSlice(allocator, b64);
+                    try buf.append(allocator, ']');
+                    found_any = true;
+                }
+            }
+        }
+
+        i = skipJsonWhitespace(parts_json, elem_end);
+        if (i >= parts_json.len) break;
+        if (parts_json[i] == ',') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    if (!found_any) return null;
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn extractMessageContextId(body: []const u8) ?[]const u8 {
@@ -1416,7 +1491,8 @@ fn buildArtifactUpdateEvent(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
@@ -1432,6 +1508,7 @@ fn buildArtifactUpdateEvent(
     try w.writeAll(if (last_chunk) "true" else "false");
     try w.writeAll("}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1446,7 +1523,8 @@ fn buildStatusUpdateEvent(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     var ts_buf: [32]u8 = undefined;
     const timestamp = formatTimestamp(&ts_buf, updated_at);
 
@@ -1464,6 +1542,7 @@ fn buildStatusUpdateEvent(
     try w.writeAll(if (final) "true" else "false");
     try w.writeAll("}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1653,7 +1732,7 @@ test "TaskRegistry evicts oldest completed tasks by recency" {
 
 test "handleAgentCard returns valid JSON" {
     const cfg = testConfig();
-    const resp = handleAgentCard(testing.allocator, &cfg);
+    const resp = handleAgentCard(testing.allocator, &cfg, null);
     defer if (resp.allocated) testing.allocator.free(resp.body);
 
     try testing.expectEqualStrings("200 OK", resp.status);
@@ -1670,6 +1749,38 @@ test "handleAgentCard returns valid JSON" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"streaming\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"defaultInputModes\":[\"text/plain\"]") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"skills\":[") != null);
+}
+
+test "handleAgentCard vision_capable=true overrides cfg.multi_modal=false" {
+    var cfg = testConfig();
+    cfg.a2a.multi_modal = false;
+    const resp = handleAgentCard(testing.allocator, &cfg, true);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"multi_modal\":true") != null);
+}
+
+test "handleAgentCard manual multi_modal=true overrides probe result false" {
+    var cfg = testConfig();
+    cfg.a2a.multi_modal = true;
+    const resp = handleAgentCard(testing.allocator, &cfg, false);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"multi_modal\":true") != null);
+}
+
+test "handleAgentCard vision_capable=null falls back to cfg.multi_modal=true" {
+    var cfg = testConfig();
+    cfg.a2a.multi_modal = true;
+    const resp = handleAgentCard(testing.allocator, &cfg, null);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"multi_modal\":true") != null);
+}
+
+test "handleAgentCard vision_capable=null falls back to cfg.multi_modal=false" {
+    var cfg = testConfig();
+    cfg.a2a.multi_modal = false;
+    const resp = handleAgentCard(testing.allocator, &cfg, null);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"multi_modal\"") == null);
 }
 
 test "handleJsonRpc dispatches message/send with string id" {
@@ -1779,20 +1890,65 @@ test "buildTaskJson escapes special characters" {
     try testing.expect(std.mem.indexOf(u8, json, "line1\\nline2\\ttab") != null);
 }
 
-test "extractMessageText finds text in parts" {
+test "extractMessageContent returns text-only message unchanged" {
     const body =
-        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"Hello there"}]}}}
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"kind":"text","text":"What is this?"}]}}}
     ;
-    const text = extractMessageText(body);
-    try testing.expect(text != null);
-    try testing.expectEqualStrings("Hello there", text.?);
+    const result = try extractMessageContent(testing.allocator, body);
+    try testing.expect(result != null);
+    defer testing.allocator.free(result.?);
+    try testing.expectEqualStrings("What is this?", result.?);
 }
 
-test "extractMessageText returns null for missing parts" {
+test "extractMessageContent injects IMAGE marker for inlineData part" {
     const body =
-        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user"}}}
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"kind":"text","text":"Describe this"},{"inlineData":{"mimeType":"image/jpeg","data":"iVBORw0KGgo="}}]}}}
     ;
-    try testing.expect(extractMessageText(body) == null);
+    const result = try extractMessageContent(testing.allocator, body);
+    try testing.expect(result != null);
+    defer testing.allocator.free(result.?);
+    try testing.expect(std.mem.startsWith(u8, result.?, "Describe this "));
+    try testing.expect(std.mem.indexOf(u8, result.?, "[IMAGE:data:image/jpeg;base64,iVBORw0KGgo=]") != null);
+}
+
+test "extractMessageContent image-only message produces marker with no leading space" {
+    const body =
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":"ABC123=="}}]}}}
+    ;
+    const result = try extractMessageContent(testing.allocator, body);
+    try testing.expect(result != null);
+    defer testing.allocator.free(result.?);
+    try testing.expectEqualStrings("[IMAGE:data:image/png;base64,ABC123==]", result.?);
+}
+
+test "extractMessageContent multiple inlineData parts produce multiple markers" {
+    const body =
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"kind":"text","text":"Compare"},{"inlineData":{"mimeType":"image/jpeg","data":"AAA="}},{"inlineData":{"mimeType":"image/png","data":"BBB="}}]}}}
+    ;
+    const result = try extractMessageContent(testing.allocator, body);
+    try testing.expect(result != null);
+    defer testing.allocator.free(result.?);
+    try testing.expect(std.mem.indexOf(u8, result.?, "Compare") != null);
+    try testing.expect(std.mem.indexOf(u8, result.?, "[IMAGE:data:image/jpeg;base64,AAA=]") != null);
+    try testing.expect(std.mem.indexOf(u8, result.?, "[IMAGE:data:image/png;base64,BBB=]") != null);
+}
+
+test "extractMessageContent returns null when no parts present" {
+    const body =
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[]}}}
+    ;
+    const result = try extractMessageContent(testing.allocator, body);
+    try testing.expect(result == null);
+}
+
+test "extractMessageContent ignores parts without text or inlineData" {
+    const body =
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"kind":"unknown"},{"kind":"text","text":"Hi"}]}}}
+    ;
+    const result = try extractMessageContent(testing.allocator, body);
+    try testing.expect(result != null);
+    defer testing.allocator.free(result.?);
+    try testing.expectEqualStrings("Hi", result.?);
 }
 
 test "handleJsonRpc dispatches tasks/cancel" {

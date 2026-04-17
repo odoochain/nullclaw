@@ -17,6 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const std_compat = @import("compat");
 const streaming = @import("../streaming.zig");
 const outbound = @import("../outbound.zig");
 const log = std.log.scoped(.channels);
@@ -64,6 +65,10 @@ pub const ChannelMessage = struct {
     reply_target: ?[]const u8 = null,
     /// Platform message ID (e.g. Telegram message_id for reply-to).
     message_id: ?i64 = null,
+    /// Whether the reply should replace the originating platform message.
+    replace_message: bool = false,
+    /// Whether this message resulted from an explicit user interaction (e.g. button click).
+    is_interaction: bool = false,
     /// Sender's first name (for personalized greetings).
     first_name: ?[]const u8 = null,
     /// Whether the message came from a group chat.
@@ -490,7 +495,7 @@ pub fn isAllowedExactScoped(comptime scope: []const u8, allowed: []const []const
 
 /// Get current UNIX epoch seconds.
 pub fn nowEpochSecs() u64 {
-    const ns = std.time.nanoTimestamp();
+    const ns = std_compat.time.nanoTimestamp();
     if (ns < 0) return 0;
     return @intCast(@as(u128, @intCast(ns)) / 1_000_000_000);
 }

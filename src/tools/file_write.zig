@@ -1,14 +1,19 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const file_common = @import("file_common.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const memory_root = @import("../memory/root.zig");
+const bootstrapRootFilename = file_common.bootstrapRootFilename;
+const isSymlinkPath = file_common.isSymlinkPath;
+const prepareWorkspacePath = file_common.prepareWorkspacePath;
+const resolveNearestExistingAncestor = file_common.resolveNearestExistingAncestor;
 
 /// Write file contents with workspace path scoping.
 pub const FileWriteTool = struct {
@@ -40,27 +45,21 @@ pub const FileWriteTool = struct {
             return ToolResult.fail("Missing 'content' parameter");
 
         // Build full path — absolute or relative
-        const full_path = if (std.fs.path.isAbsolute(path)) blk: {
-            if (self.allowed_paths.len == 0)
-                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
-            if (std.mem.indexOfScalar(u8, path, 0) != null)
-                return ToolResult.fail("Path contains null bytes");
-            break :blk try allocator.dupe(u8, path);
-        } else blk: {
-            if (!isPathSafe(path))
-                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        const path_info = prepareWorkspacePath(allocator, self.workspace_dir, path, self.allowed_paths.len > 0) catch |err| switch (err) {
+            error.AbsolutePathsNotAllowed => return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)"),
+            error.PathContainsNullBytes => return ToolResult.fail("Path contains null bytes"),
+            error.UnsafePath => return ToolResult.fail("Path not allowed: contains traversal or absolute path"),
+            else => return err,
         };
-        defer allocator.free(full_path);
-        const bootstrap_filename = bootstrapRootFilename(path);
+        defer path_info.deinit(allocator);
 
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
-        defer if (ws_resolved) |wr| allocator.free(wr);
-        const ws_path = ws_resolved orelse "";
+        const full_path = path_info.full_path;
+        const bootstrap_filename = bootstrapRootFilename(path);
+        const ws_path = path_info.workspacePath();
 
         // Resolve and validate before any filesystem writes so symlink targets
         // and disallowed absolute destinations are rejected without side effects.
-        const resolved_target: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| switch (err) {
+        const resolved_target: ?[]const u8 = fs_compat.realpathAllocPath(allocator, full_path) catch |err| switch (err) {
             error.FileNotFound => null,
             else => {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
@@ -72,7 +71,7 @@ pub const FileWriteTool = struct {
         // Always validate against the nearest existing ancestor.
         // For hard links this is the security boundary we care about, because we
         // write through temp+rename (inode swap) rather than in-place mutation.
-        const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
+        const parent_to_check = std_compat.fs.path.dirname(full_path) orelse full_path;
         const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -125,8 +124,8 @@ pub const FileWriteTool = struct {
             try allocator.dupe(u8, full_path);
         defer allocator.free(write_path);
 
-        const existing_mode: ?std.fs.File.Mode = blk: {
-            const st = std.fs.cwd().statFile(write_path) catch |err| switch (err) {
+        const existing_mode: ?std_compat.fs.File.Mode = blk: {
+            const st = fs_compat.statPath(write_path) catch |err| switch (err) {
                 error.FileNotFound => break :blk null,
                 else => {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to stat file: {}", .{err});
@@ -137,8 +136,8 @@ pub const FileWriteTool = struct {
         };
 
         // Ensure parent directory exists after policy checks pass.
-        if (std.fs.path.dirname(write_path)) |parent| {
-            std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+        if (std_compat.fs.path.dirname(write_path)) |parent| {
+            std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
                     fs_compat.makePath(parent) catch |e| {
@@ -150,15 +149,15 @@ pub const FileWriteTool = struct {
         }
 
         // Write via temp file + rename so existing hard links are not modified in place.
-        const parent = std.fs.path.dirname(write_path) orelse write_path;
-        const basename = std.fs.path.basename(write_path);
-        var parent_dir = if (std.fs.path.isAbsolute(parent))
-            std.fs.openDirAbsolute(parent, .{}) catch |err| {
+        const parent = std_compat.fs.path.dirname(write_path) orelse write_path;
+        const basename = std_compat.fs.path.basename(write_path);
+        var parent_dir = if (std_compat.fs.path.isAbsolute(parent))
+            std_compat.fs.openDirAbsolute(parent, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to open directory: {}", .{err});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             }
         else
-            std.fs.cwd().openDir(parent, .{}) catch |err| {
+            fs_compat.openDirPath(parent, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to open directory: {}", .{err});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
@@ -166,13 +165,13 @@ pub const FileWriteTool = struct {
 
         var tmp_name_buf: [128]u8 = undefined;
         var tmp_name_len: usize = 0;
-        var tmp_file: ?std.fs.File = null;
+        var tmp_file: ?std_compat.fs.File = null;
         var attempt: usize = 0;
         while (attempt < 32) : (attempt += 1) {
             const tmp_name = std.fmt.bufPrint(
                 &tmp_name_buf,
                 ".nullclaw-write-{d}-{d}.tmp",
-                .{ std.time.nanoTimestamp(), attempt },
+                .{ std_compat.time.nanoTimestamp(), attempt },
             ) catch unreachable;
             tmp_file = parent_dir.createFile(tmp_name, .{ .exclusive = true }) catch |err| switch (err) {
                 error.PathAlreadyExists => continue,
@@ -191,7 +190,7 @@ pub const FileWriteTool = struct {
         var file = tmp_file.?;
         defer file.close();
 
-        if (comptime std.fs.has_executable_bit) {
+        if (comptime std_compat.fs.has_executable_bit) {
             if (existing_mode) |mode| {
                 if (mode != 0) {
                     file.chmod(mode) catch |err| {
@@ -218,17 +217,17 @@ pub const FileWriteTool = struct {
         };
         committed = true;
 
-        const final_resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| {
+        const final_resolved = fs_compat.realpathAllocPath(allocator, full_path) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(final_resolved);
 
         if (!isResolvedPathAllowed(allocator, final_resolved, ws_path, self.allowed_paths)) {
-            if (std.fs.path.isAbsolute(write_path)) {
-                std.fs.deleteFileAbsolute(write_path) catch {};
+            if (std_compat.fs.path.isAbsolute(write_path)) {
+                std_compat.fs.deleteFileAbsolute(write_path) catch {};
             } else {
-                std.fs.cwd().deleteFile(write_path) catch {};
+                fs_compat.deletePath(write_path) catch {};
             }
             return ToolResult.fail("Path is outside allowed areas");
         }
@@ -237,43 +236,6 @@ pub const FileWriteTool = struct {
         return ToolResult{ .success = true, .output = msg, .error_msg = null };
     }
 };
-
-fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
-        error.FileNotFound => {
-            const parent = std.fs.path.dirname(path) orelse return err;
-            if (std.mem.eql(u8, parent, path)) return err;
-            return resolveNearestExistingAncestor(allocator, parent);
-        },
-        else => return err,
-    };
-}
-
-fn bootstrapRootFilename(path: []const u8) ?[]const u8 {
-    if (std.fs.path.isAbsolute(path)) return null;
-    const basename = std.fs.path.basename(path);
-    if (!std.mem.eql(u8, basename, path)) return null;
-    if (!bootstrap_mod.isBootstrapFilename(basename)) return null;
-    return basename;
-}
-
-fn isSymlinkPath(path: []const u8) !bool {
-    const dir_path = std.fs.path.dirname(path) orelse ".";
-    const entry_name = std.fs.path.basename(path);
-    var dir = if (std.fs.path.isAbsolute(dir_path))
-        try std.fs.openDirAbsolute(dir_path, .{})
-    else
-        try std.fs.cwd().openDir(dir_path, .{});
-    defer dir.close();
-
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    _ = dir.readLink(entry_name, &link_buf) catch |err| switch (err) {
-        error.NotLink => return false,
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return true;
-}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -294,7 +256,7 @@ test "file_write tool schema has path and content" {
 test "file_write creates file" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileWriteTool{ .workspace_dir = ws_path };
@@ -317,7 +279,7 @@ test "file_write creates file" {
 test "file_write creates parent dirs" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileWriteTool{ .workspace_dir = ws_path };
@@ -338,8 +300,8 @@ test "file_write creates parent dirs" {
 test "file_write overwrites existing" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "exist.txt", .data = "old" });
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "exist.txt", .data = "old" });
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileWriteTool{ .workspace_dir = ws_path };
@@ -401,7 +363,7 @@ test "file_write missing content param" {
 test "file_write empty content" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileWriteTool{ .workspace_dir = ws_path };
@@ -424,16 +386,16 @@ test "file_write blocks symlink target escape outside workspace" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
 
-    try outside_tmp.dir.writeFile(.{ .sub_path = "outside.txt", .data = "safe" });
-    const outside_file = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "outside.txt" });
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{ .sub_path = "outside.txt", .data = "safe" });
+    const outside_file = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "outside.txt" });
     defer std.testing.allocator.free(outside_file);
 
-    try ws_tmp.dir.symLink(outside_file, "escape.txt", .{});
+    try @import("compat").fs.Dir.wrap(ws_tmp.dir).symLink(outside_file, "escape.txt", .{});
 
     var ft = FileWriteTool{ .workspace_dir = ws_path };
     const t = ft.tool();
@@ -456,18 +418,18 @@ test "file_write does not mutate outside inode through hard link" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
 
-    try outside_tmp.dir.writeFile(.{ .sub_path = "outside.txt", .data = "SAFE" });
-    const outside_file = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "outside.txt" });
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{ .sub_path = "outside.txt", .data = "SAFE" });
+    const outside_file = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "outside.txt" });
     defer std.testing.allocator.free(outside_file);
-    const hardlink_path = try std.fs.path.join(std.testing.allocator, &.{ ws_path, "hl.txt" });
+    const hardlink_path = try std_compat.fs.path.join(std.testing.allocator, &.{ ws_path, "hl.txt" });
     defer std.testing.allocator.free(hardlink_path);
 
-    try std.posix.link(outside_file, hardlink_path);
+    try std_compat.fs.hardLinkAbsolute(outside_file, hardlink_path, .{});
 
     var ft = FileWriteTool{ .workspace_dir = ws_path };
     const t = ft.tool();
@@ -492,11 +454,11 @@ test "file_write keeps symlink and updates target" {
 
     var ws_tmp = std.testing.tmpDir(.{});
     defer ws_tmp.cleanup();
-    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
-    try ws_tmp.dir.writeFile(.{ .sub_path = "target.txt", .data = "old" });
-    try ws_tmp.dir.symLink("target.txt", "link.txt", .{});
+    try @import("compat").fs.Dir.wrap(ws_tmp.dir).writeFile(.{ .sub_path = "target.txt", .data = "old" });
+    try @import("compat").fs.Dir.wrap(ws_tmp.dir).symLink("target.txt", "link.txt", .{});
 
     var ft = FileWriteTool{ .workspace_dir = ws_path };
     const t = ft.tool();
@@ -507,8 +469,8 @@ test "file_write keeps symlink and updates target" {
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
 
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const link_target = try ws_tmp.dir.readLink("link.txt", &link_buf);
+    var link_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const link_target = try std_compat.fs.Dir.wrap(ws_tmp.dir).readLink("link.txt", &link_buf);
     try std.testing.expectEqualStrings("target.txt", link_target);
 
     const target_actual = try fs_compat.readFileAlloc(ws_tmp.dir, std.testing.allocator, "target.txt", 1024);
@@ -521,13 +483,13 @@ test "file_write preserves executable mode on overwrite" {
 
     var ws_tmp = std.testing.tmpDir(.{});
     defer ws_tmp.cleanup();
-    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
-    try ws_tmp.dir.writeFile(.{ .sub_path = "script.sh", .data = "#!/bin/sh\necho old\n" });
-    var file = try ws_tmp.dir.openFile("script.sh", .{ .mode = .read_write });
+    try @import("compat").fs.Dir.wrap(ws_tmp.dir).writeFile(.{ .sub_path = "script.sh", .data = "#!/bin/sh\necho old\n" });
+    var file = try @import("compat").fs.Dir.wrap(ws_tmp.dir).openFile("script.sh", .{ .mode = .read_write });
     defer file.close();
-    try file.chmod(@as(std.fs.File.Mode, 0o755));
+    try file.chmod(@as(std_compat.fs.File.Mode, 0o755));
 
     var ft = FileWriteTool{ .workspace_dir = ws_path };
     const t = ft.tool();
@@ -538,9 +500,9 @@ test "file_write preserves executable mode on overwrite" {
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
 
-    const st = try ws_tmp.dir.statFile("script.sh");
-    const perms: std.fs.File.Mode = st.mode & @as(std.fs.File.Mode, 0o777);
-    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o755), perms);
+    const st = try @import("compat").fs.Dir.wrap(ws_tmp.dir).statFile("script.sh");
+    const perms: std_compat.fs.File.Mode = st.mode & @as(std_compat.fs.File.Mode, 0o777);
+    try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o755), perms);
 }
 
 test "file_write rejects disallowed absolute path without creating parent directories" {
@@ -551,14 +513,14 @@ test "file_write rejects disallowed absolute path without creating parent direct
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
 
-    const outside_parent = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "created_by_rejected_write" });
+    const outside_parent = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "created_by_rejected_write" });
     defer std.testing.allocator.free(outside_parent);
-    const outside_file = try std.fs.path.join(std.testing.allocator, &.{ outside_parent, "note.txt" });
+    const outside_file = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_parent, "note.txt" });
     defer std.testing.allocator.free(outside_file);
 
     const json_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\": \"{s}\", \"content\": \"x\"}}", .{outside_file});
@@ -573,7 +535,7 @@ test "file_write rejects disallowed absolute path without creating parent direct
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
 
     const dir_exists = blk: {
-        var d = std.fs.openDirAbsolute(outside_parent, .{}) catch |err| switch (err) {
+        var d = std_compat.fs.openDirAbsolute(outside_parent, .{}) catch |err| switch (err) {
             error.FileNotFound => break :blk false,
             else => return err,
         };
@@ -589,13 +551,13 @@ test "file_write does not bypass allowed_paths for bootstrap memory writes" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
 
-    try outside_tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "outside-before" });
-    const outside_file = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "AGENTS.md" });
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{ .sub_path = "AGENTS.md", .data = "outside-before" });
+    const outside_file = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "AGENTS.md" });
     defer std.testing.allocator.free(outside_file);
 
     var escaped_buf: [1024]u8 = undefined;

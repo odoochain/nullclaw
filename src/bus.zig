@@ -5,6 +5,7 @@
 //! Message tool, Heartbeat execution, Cron dispatch, USB hotplug.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const outbound = @import("outbound.zig");
@@ -385,9 +386,9 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
         tail: usize = 0,
         len: usize = 0,
         closed: bool = false,
-        mutex: std.Thread.Mutex = .{},
-        not_empty: std.Thread.Condition = .{},
-        not_full: std.Thread.Condition = .{},
+        mutex: std_compat.sync.Mutex = .{},
+        not_empty: std_compat.sync.Condition = .{},
+        not_full: std_compat.sync.Condition = .{},
 
         pub fn init() Self {
             return .{};
@@ -414,16 +415,14 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            const deadline_ns: i128 = std.time.nanoTimestamp() +
+            const deadline_ns: i128 = std_compat.time.nanoTimestamp() +
                 (@as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms);
             while (self.len == capacity and !self.closed) {
                 const remaining_ns = remainingTimeoutNs(deadline_ns);
                 if (remaining_ns == 0) return error.Timeout;
-                self.not_full.timedWait(&self.mutex, remaining_ns) catch |err| switch (err) {
-                    error.Timeout => {
-                        if (self.len == capacity and !self.closed) return error.Timeout;
-                    },
-                };
+                self.mutex.unlock();
+                std_compat.thread.sleep(@intCast(@min(remaining_ns, 10 * std.time.ns_per_ms)));
+                self.mutex.lock();
             }
             if (self.closed) return error.Closed;
 
@@ -452,6 +451,30 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
             return item;
         }
 
+        pub fn consumeTimeout(self: *Self, timeout_ms: u32) error{Timeout}!?T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const deadline_ns: i128 = std_compat.time.nanoTimestamp() +
+                (@as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms);
+
+            while (self.len == 0 and !self.closed) {
+                const remaining_ns = remainingTimeoutNs(deadline_ns);
+                if (remaining_ns == 0) return error.Timeout;
+                self.mutex.unlock();
+                std_compat.thread.sleep(@intCast(@min(remaining_ns, 10 * std.time.ns_per_ms)));
+                self.mutex.lock();
+            }
+            if (self.len == 0) return null;
+
+            const item = self.buf[self.head];
+            self.head = (self.head + 1) % capacity;
+            self.len -= 1;
+
+            self.not_full.signal();
+            return item;
+        }
+
         /// Closes the queue, waking all waiting threads.
         pub fn close(self: *Self) void {
             self.mutex.lock();
@@ -471,7 +494,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
 }
 
 fn remainingTimeoutNs(deadline_ns: i128) u64 {
-    const remaining_ns = deadline_ns - std.time.nanoTimestamp();
+    const remaining_ns = deadline_ns - std_compat.time.nanoTimestamp();
     if (remaining_ns <= 0) return 0;
     return @intCast(remaining_ns);
 }
@@ -502,6 +525,10 @@ pub const Bus = struct {
 
     pub fn consumeInbound(self: *Bus) ?InboundMessage {
         return self.inbound.consume();
+    }
+
+    pub fn consumeInboundTimeout(self: *Bus, timeout_ms: u32) error{Timeout}!?InboundMessage {
+        return self.inbound.consumeTimeout(timeout_ms);
     }
 
     // -- Outbound: agent/cron/heartbeat → channels --
@@ -679,7 +706,7 @@ test "queue close wakes consumer — returns null" {
 
     const handle = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
         fn run(qp: *BoundedQueue(u32, 4)) void {
-            std.Thread.sleep(5 * std.time.ns_per_ms);
+            std_compat.thread.sleep(5 * std.time.ns_per_ms);
             qp.close();
         }
     }.run, .{&q});

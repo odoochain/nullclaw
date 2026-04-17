@@ -5,6 +5,7 @@
 //! daemon supervisor).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const telegram = @import("channels/telegram.zig");
@@ -28,6 +29,7 @@ const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
 const fs_compat = @import("fs_compat.zig");
+const provider_probe = @import("provider_probe.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -36,6 +38,73 @@ const channels_mod = @import("channels/root.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.channel_loop);
+
+fn hasNonEmptyCredential(value: ?[]const u8) bool {
+    const credential = value orelse return false;
+    return std.mem.trim(u8, credential, " \t\r\n").len > 0;
+}
+
+fn providerHasStartupCredentials(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    provider_name: []const u8,
+) bool {
+    const resolved_key = providers.resolveApiKeyFromConfig(
+        allocator,
+        provider_name,
+        config.providers,
+    ) catch null;
+    defer if (resolved_key) |key| allocator.free(key);
+
+    if (hasNonEmptyCredential(resolved_key)) return true;
+
+    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+        allocator,
+        provider_name,
+        null,
+        config.getProviderBaseUrl(provider_name),
+        config.getProviderNativeTools(provider_name),
+        config.getProviderUserAgent(provider_name),
+        config.getProviderApiMode(provider_name),
+        config.getProviderMaxStreamingPromptBytes(provider_name),
+        config.getProviderChatTemplateEnableThinkingParam(provider_name),
+        config.getProviderExtraBodyParams(provider_name),
+    );
+    defer holder.deinit();
+
+    return switch (holder) {
+        .ollama => true,
+        .claude_cli, .codex_cli, .gemini_cli => true,
+        .openai_codex => |provider| provider.access_token != null,
+        .gemini => |provider| provider.auth != null,
+        .vertex => |provider| provider.auth != null and provider.base != null,
+        .compatible => !provider_probe.providerRequiresApiKey(provider_name, config.getProviderBaseUrl(provider_name)),
+        else => false,
+    };
+}
+
+fn hasReliabilityCredentialFallback(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) bool {
+    for (config.reliability.api_keys) |key| {
+        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+    }
+
+    for (config.reliability.fallback_providers) |provider_name| {
+        if (providerHasStartupCredentials(allocator, config, provider_name)) return true;
+    }
+
+    return false;
+}
+
+pub fn hasStartupProviderCredentials(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) bool {
+    if (providerHasStartupCredentials(allocator, config, config.default_provider)) return true;
+    return hasReliabilityCredentialFallback(allocator, config);
+}
 
 /// Set ScheduleTool's default chat_id for delivery context.
 fn setScheduleToolContext(
@@ -223,7 +292,8 @@ pub fn buildTelegramBindingStatusReply(
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.writeAll("Telegram binding status\n");
     try writer.print("Account: {s}\n", .{account_id});
@@ -265,6 +335,7 @@ pub fn buildTelegramBindingStatusReply(
     }
     try writer.writeAll("Usage: /bind <agent>, /bind clear, /bind status");
 
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(allocator);
 }
 
@@ -584,8 +655,9 @@ pub fn buildTelegramTopicMapReply(
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const writer = out.writer(allocator);
-    const now_ts = std.time.timestamp();
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const writer = &out_writer.writer;
+    const now_ts = std_compat.time.timestamp();
 
     try writer.print("Telegram topic/session map for chat {s}\n", .{current_target.base_chat_id});
     if (current_target.thread_id) |thread_id| {
@@ -596,6 +668,7 @@ pub fn buildTelegramTopicMapReply(
 
     if (entries.items.len == 0) {
         try writer.writeAll("No active in-memory sessions for this chat yet.");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(allocator);
     }
 
@@ -631,6 +704,7 @@ pub fn buildTelegramTopicMapReply(
         }
     }
 
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(allocator);
 }
 
@@ -796,6 +870,7 @@ fn processTelegramMessage(
     is_group: bool,
     reply_to_id: ?i64,
     message_sender_id: []const u8,
+    replace_message: bool,
 ) void {
     const typing_target = sender;
     const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
@@ -828,6 +903,7 @@ fn processTelegramMessage(
     const conversation_context = buildConversationContext(.{
         .channel = "telegram",
         .account_id = tg_ptr.account_id,
+        .delivery_chat_id = sender,
         .peer_id = sender,
         .is_group = is_group,
         .group_id = if (is_group) sender else null,
@@ -858,11 +934,35 @@ fn processTelegramMessage(
         return;
     }
 
-    tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
-        tg_ptr.setTaskReaction(sender, message_id, .failed);
-        log.warn("Send error: {}", .{err});
-        return;
-    };
+    if (replace_message and message_id != null) {
+        var payload = telegram.buildOwnedOutboundPayloadFromLegacy(allocator, reply, &.{}, true) catch |err| {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            log.warn("Failed to build telegram edit payload: {}", .{err});
+            return;
+        };
+        defer payload.deinit(allocator);
+        const edit_message_id = std.fmt.allocPrint(allocator, "{d}", .{message_id.?}) catch {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            return;
+        };
+        defer allocator.free(edit_message_id);
+
+        tg_ptr.editRichMessage(.{
+            .target = sender,
+            .message_id = edit_message_id,
+            .payload = payload.payload(),
+        }) catch |err| {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            log.warn("Edit error: {}", .{err});
+            return;
+        };
+    } else {
+        tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            log.warn("Send error: {}", .{err});
+            return;
+        };
+    }
     tg_ptr.setTaskReaction(sender, message_id, .done);
 }
 
@@ -878,6 +978,7 @@ const MessageTask = struct {
     is_group: bool,
     reply_to_id: ?i64,
     message_sender_id: []const u8,
+    replace_message: bool,
 
     fn run(task: *MessageTask) void {
         processTelegramMessage(
@@ -891,6 +992,7 @@ const MessageTask = struct {
             task.is_group,
             task.reply_to_id,
             task.message_sender_id,
+            task.replace_message,
         );
     }
 
@@ -935,14 +1037,23 @@ fn normalizeTelegramAccountId(allocator: std.mem.Allocator, account_id: []const 
 }
 
 fn telegramUpdateOffsetPath(allocator: std.mem.Allocator, config: *const Config, account_id: []const u8) ![]u8 {
-    const config_dir = std.fs.path.dirname(config.config_path) orelse ".";
+    const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
     const normalized_account_id = try normalizeTelegramAccountId(allocator, account_id);
     defer allocator.free(normalized_account_id);
 
     const file_name = try std.fmt.allocPrint(allocator, "update-offset-{s}.json", .{normalized_account_id});
     defer allocator.free(file_name);
 
-    return std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    const relative_path = try std_compat.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    defer allocator.free(relative_path);
+
+    if (std_compat.fs.path.isAbsolute(relative_path)) {
+        return std_compat.fs.path.resolve(allocator, &.{relative_path});
+    }
+
+    const cwd = try std_compat.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    return std_compat.fs.path.resolve(allocator, &.{ cwd, relative_path });
 }
 
 /// Load persisted Telegram update offset. Returns null when missing/invalid/stale.
@@ -955,7 +1066,7 @@ pub fn loadTelegramUpdateOffset(
     const path = telegramUpdateOffsetPath(allocator, config, account_id) catch return null;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
 
     const content = file.readToEndAlloc(allocator, 16 * 1024) catch return null;
@@ -996,8 +1107,8 @@ pub fn saveTelegramUpdateOffset(
     const path = try telegramUpdateOffsetPath(allocator, config, account_id);
     defer allocator.free(path);
 
-    if (std.fs.path.dirname(path)) |dir| {
-        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(path)) |dir| {
+        std_compat.fs.makeDirAbsolute(dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => try fs_compat.makePath(dir),
         };
@@ -1007,10 +1118,10 @@ pub fn saveTelegramUpdateOffset(
     defer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "{\n");
-    try std.fmt.format(buf.writer(allocator), "  \"version\": {d},\n", .{TELEGRAM_OFFSET_STORE_VERSION});
-    try std.fmt.format(buf.writer(allocator), "  \"last_update_id\": {d},\n", .{update_id});
+    try buf.print(allocator, "  \"version\": {d},\n", .{TELEGRAM_OFFSET_STORE_VERSION});
+    try buf.print(allocator, "  \"last_update_id\": {d},\n", .{update_id});
     if (extractTelegramBotId(bot_token)) |bot_id| {
-        try std.fmt.format(buf.writer(allocator), "  \"bot_id\": \"{s}\"\n", .{bot_id});
+        try buf.print(allocator, "  \"bot_id\": \"{s}\"\n", .{bot_id});
     } else {
         try buf.appendSlice(allocator, "  \"bot_id\": null\n");
     }
@@ -1020,14 +1131,14 @@ pub fn saveTelegramUpdateOffset(
     defer allocator.free(tmp_path);
 
     {
-        var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+        var tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
         defer tmp_file.close();
         try tmp_file.writeAll(buf.items);
     }
 
-    std.fs.renameAbsolute(tmp_path, path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
-        const file = try std.fs.createFileAbsolute(path, .{});
+    std_compat.fs.renameAbsolute(tmp_path, path) catch {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(buf.items);
     };
@@ -1079,7 +1190,7 @@ pub const TelegramLoopState = struct {
 
     pub fn init() TelegramLoopState {
         return .{
-            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
         };
     }
@@ -1177,6 +1288,8 @@ pub const ChannelRuntime = struct {
             .subagent_manager = subagent_manager,
             .bootstrap_provider = bootstrap_provider,
             .backend_name = config.memory.backend,
+            .sandbox_backend = config.security.sandbox.backend,
+            .sandbox_enabled = config.sandboxEnabled(),
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
@@ -1298,12 +1411,12 @@ pub fn runTelegramLoop(
     var evict_counter: u32 = 0;
 
     const model = config.default_model orelse {
-        log.err("No default model configured. Set agents.defaults.model.primary in ~/.nullclaw/config.json or run `nullclaw onboard`.", .{});
+        log.err("No default model configured. Set agents.defaults.model.primary in config.json in your nullclaw config directory or run `nullclaw onboard`.", .{});
         return;
     };
 
     // Update activity timestamp at start
-    loop_state.last_activity.store(std.time.timestamp(), .release);
+    loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     // Parallel worker bookkeeping.
     // Keep at most one in-flight worker per session_key to preserve order.
@@ -1330,13 +1443,13 @@ pub fn runTelegramLoop(
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = tg_ptr.pollUpdates(allocator) catch |err| {
             log.warn("Telegram poll error: {}", .{err});
-            loop_state.last_activity.store(std.time.timestamp(), .release);
-            std.Thread.sleep(5 * std.time.ns_per_s);
+            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+            std_compat.thread.sleep(5 * std.time.ns_per_s);
             continue;
         };
 
         // Update activity after each poll (even if no messages)
-        loop_state.last_activity.store(std.time.timestamp(), .release);
+        loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
             // Reply-to logic
@@ -1477,6 +1590,7 @@ pub fn runTelegramLoop(
                         .is_group = msg.is_group,
                         .reply_to_id = reply_to_id,
                         .message_sender_id = task_message_sender_id,
+                        .replace_message = msg.replace_message,
                     };
 
                     const thread = std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, messageTaskWorker, .{task}) catch |err| {
@@ -1532,6 +1646,7 @@ pub fn runTelegramLoop(
                 msg.is_group,
                 reply_to_id,
                 msg.id,
+                msg.replace_message,
             );
         }
 
@@ -1578,7 +1693,7 @@ pub const SignalLoopState = struct {
 
     pub fn init() SignalLoopState {
         return .{
-            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
         };
     }
@@ -1600,20 +1715,20 @@ pub fn runSignalLoop(
     sg_ptr: *signal.SignalChannel,
 ) void {
     // Update activity timestamp at start
-    loop_state.last_activity.store(std.time.timestamp(), .release);
+    loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = sg_ptr.pollMessages(allocator) catch |err| {
             log.warn("Signal poll error: {}", .{err});
-            loop_state.last_activity.store(std.time.timestamp(), .release);
-            std.Thread.sleep(5 * std.time.ns_per_s);
+            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+            std_compat.thread.sleep(5 * std.time.ns_per_s);
             continue;
         };
 
         // Update activity after each poll (even if no messages)
-        loop_state.last_activity.store(std.time.timestamp(), .release);
+        loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
@@ -1664,6 +1779,7 @@ pub fn runSignalLoop(
                 .account_id = sg_ptr.account_id,
                 .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
                 .sender_uuid = msg.sender_uuid,
+                .delivery_chat_id = msg.reply_target orelse msg.sender,
                 .peer_id = if (msg.is_group) msg.group_id else msg.sender,
                 .group_id = msg.group_id,
                 .is_group = msg.is_group,
@@ -1721,7 +1837,7 @@ pub const MatrixLoopState = struct {
 
     pub fn init() MatrixLoopState {
         return .{
-            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
         };
     }
@@ -1741,7 +1857,7 @@ pub const MaxLoopState = struct {
 
     pub fn init() MaxLoopState {
         return .{
-            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
             .stop_requested = Atomic(bool).init(false),
         };
     }
@@ -1844,19 +1960,19 @@ pub fn runMatrixLoop(
     loop_state: *MatrixLoopState,
     mx_ptr: *matrix.MatrixChannel,
 ) void {
-    loop_state.last_activity.store(std.time.timestamp(), .release);
+    loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = mx_ptr.pollMessages(allocator) catch |err| {
             log.warn("Matrix poll error: {}", .{err});
-            loop_state.last_activity.store(std.time.timestamp(), .release);
-            std.Thread.sleep(5 * std.time.ns_per_s);
+            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+            std_compat.thread.sleep(5 * std.time.ns_per_s);
             continue;
         };
 
-        loop_state.last_activity.store(std.time.timestamp(), .release);
+        loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
             const schedule_chat_id = msg.reply_target orelse msg.sender;
@@ -1901,6 +2017,7 @@ pub fn runMatrixLoop(
             const conversation_context = buildConversationContext(.{
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
+                .delivery_chat_id = typing_target,
                 .peer_id = if (msg.is_group) room_peer_id else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) room_peer_id else null,
@@ -1982,7 +2099,7 @@ pub fn runMaxLoop(
     };
     defer mx_ptr.channel().stop();
 
-    loop_state.last_activity.store(std.time.timestamp(), .release);
+    loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
     var evict_counter: u32 = 0;
     var backoff_ns: u64 = std.time.ns_per_s;
@@ -1991,15 +2108,15 @@ pub fn runMaxLoop(
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = mx_ptr.pollUpdates(allocator) catch |err| {
             log.warn("Max poll error: {}", .{err});
-            loop_state.last_activity.store(std.time.timestamp(), .release);
-            std.Thread.sleep(backoff_ns);
+            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+            std_compat.thread.sleep(backoff_ns);
             backoff_ns = @min(backoff_ns * 2, max_backoff_ns);
             continue;
         };
 
         // Reset backoff on success
         backoff_ns = std.time.ns_per_s;
-        loop_state.last_activity.store(std.time.timestamp(), .release);
+        loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
         for (messages) |msg| {
             const reply_target = msg.reply_target orelse msg.sender;
@@ -2045,6 +2162,7 @@ pub fn runMaxLoop(
             const conversation_context = buildConversationContext(.{
                 .channel = "max",
                 .account_id = mx_ptr.account_id,
+                .delivery_chat_id = reply_target,
                 .peer_id = if (msg.is_group) reply_target else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) reply_target else null,
@@ -2114,8 +2232,8 @@ test "TelegramLoopState stop_requested toggle" {
 test "TelegramLoopState last_activity update" {
     var state = TelegramLoopState.init();
     const before = state.last_activity.load(.acquire);
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-    state.last_activity.store(std.time.timestamp(), .release);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std_compat.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
 }
@@ -2161,9 +2279,9 @@ test "channel runtime wires security policy into session manager and shell tool"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
-    const config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
     defer allocator.free(config_path);
 
     var allowed_paths = [_][]const u8{workspace};
@@ -2214,8 +2332,8 @@ test "SignalLoopState stop_requested toggle" {
 test "SignalLoopState last_activity update" {
     var state = SignalLoopState.init();
     const before = state.last_activity.load(.acquire);
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-    state.last_activity.store(std.time.timestamp(), .release);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std_compat.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
 }
@@ -2237,8 +2355,8 @@ test "MatrixLoopState stop_requested toggle" {
 test "MatrixLoopState last_activity update" {
     var state = MatrixLoopState.init();
     const before = state.last_activity.load(.acquire);
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-    state.last_activity.store(std.time.timestamp(), .release);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std_compat.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
 }
@@ -2260,8 +2378,8 @@ test "MaxLoopState stop_requested toggle" {
 test "MaxLoopState last_activity update" {
     var state = MaxLoopState.init();
     const before = state.last_activity.load(.acquire);
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-    state.last_activity.store(std.time.timestamp(), .release);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std_compat.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
 }
@@ -2456,9 +2574,9 @@ test "telegram update offset store roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
 
     const cfg = Config{
@@ -2470,6 +2588,36 @@ test "telegram update offset store roundtrip" {
     try saveTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token", 777);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 777), restored);
+}
+
+test "telegram update offset path resolves relative config path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std_compat.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const relative_base = try std_compat.fs.path.relative(allocator, cwd, base);
+    defer allocator.free(relative_base);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ relative_base, "config.json" });
+    defer allocator.free(config_path);
+
+    const cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+
+    const resolved = try telegramUpdateOffsetPath(allocator, &cfg, "default");
+    defer allocator.free(resolved);
+    const expected = try std_compat.fs.path.join(allocator, &.{ base, "state", "telegram", "update-offset-default.json" });
+    defer allocator.free(expected);
+
+    try std.testing.expect(std_compat.fs.path.isAbsolute(resolved));
+    try std.testing.expectEqualStrings(expected, resolved);
 }
 
 test "detailedProviderErrorForDisplay surfaces sanitized provider detail" {
@@ -2504,9 +2652,9 @@ test "telegram update offset store returns null for mismatched bot id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
 
     const cfg = Config{
@@ -2526,9 +2674,9 @@ test "telegram update offset store treats legacy payload without bot_id as stale
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
 
     const cfg = Config{
@@ -2539,12 +2687,12 @@ test "telegram update offset store treats legacy payload without bot_id as stale
 
     const offset_path = try telegramUpdateOffsetPath(allocator, &cfg, "default");
     defer allocator.free(offset_path);
-    const offset_dir = std.fs.path.dirname(offset_path).?;
-    std.fs.makeDirAbsolute(offset_dir) catch |err| switch (err) {
+    const offset_dir = std_compat.fs.path.dirname(offset_path).?;
+    std_compat.fs.makeDirAbsolute(offset_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => try fs_compat.makePath(offset_dir),
     };
-    const file = try std.fs.createFileAbsolute(offset_path, .{});
+    const file = try std_compat.fs.createFileAbsolute(offset_path, .{});
     defer file.close();
     try file.writeAll(
         \\{
@@ -2564,9 +2712,9 @@ test "telegram offset persistence helper retries after write failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
 
     const cfg = Config{
@@ -2575,11 +2723,11 @@ test "telegram offset persistence helper retries after write failure" {
         .allocator = allocator,
     };
 
-    const blocked_state_path = try std.fs.path.join(allocator, &.{ base, "state" });
+    const blocked_state_path = try std_compat.fs.path.join(allocator, &.{ base, "state" });
     defer allocator.free(blocked_state_path);
 
     {
-        const blocked_state_file = try std.fs.createFileAbsolute(blocked_state_path, .{});
+        const blocked_state_file = try std_compat.fs.createFileAbsolute(blocked_state_path, .{});
         blocked_state_file.close();
     }
 
@@ -2595,7 +2743,7 @@ test "telegram offset persistence helper retries after write failure" {
     try std.testing.expectEqual(@as(i64, 100), persisted_update_id);
     try std.testing.expect(loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token") == null);
 
-    try std.fs.deleteFileAbsolute(blocked_state_path);
+    try std_compat.fs.deleteFileAbsolute(blocked_state_path);
 
     persistTelegramUpdateOffsetIfAdvanced(
         allocator,

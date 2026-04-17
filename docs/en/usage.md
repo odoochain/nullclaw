@@ -71,9 +71,9 @@ nullclaw gateway
 For long-running deployments:
 
 - macOS uses `launchctl`.
-- Linux uses `systemd --user` when available and falls back to OpenRC on Alpine/OpenRC systems.
+- Linux uses `systemd --user` when available and falls back to OpenRC or SysVinit when the required runtime is present.
 - Windows uses the Service Control Manager.
-- If Linux has neither working `systemd --user` nor the required OpenRC commands, service subcommands fail; use foreground `nullclaw gateway` or another supervisor instead.
+- If Linux has neither working `systemd --user` nor the required OpenRC/SysVinit support, service subcommands fail; use foreground `nullclaw gateway` or another supervisor instead.
 
 ```bash
 nullclaw service install
@@ -136,7 +136,7 @@ nullclaw onboard --interactive
 Check:
 
 - `channels.<name>.accounts.*` token/webhook/account settings.
-- `allow_from` accidentally set to empty array.
+- Channel-specific allowlist or gating mismatch (`allow_from`, `group_allow_from`, `require_mention`, and similar settings). Empty `allow_from` is not a universal deny switch.
 - `nullclaw channel status` health output.
 - For DingTalk-specific stream and reply-target checks, open
   [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md).
@@ -176,6 +176,20 @@ If the plan is valid but fragile, tune reliability conservatively:
 ```
 
 If you have multiple keys for the same provider, add `reliability.api_keys` so NullClaw can rotate them.
+
+### 6) Local Ollama model says it has no access to `scheduler_tool`
+
+What this usually means:
+
+- The canonical NullClaw tool name is `schedule`.
+- Some local Ollama-served models emit `scheduler_tool` or `schedule_tool` instead.
+- Current NullClaw builds normalize those Ollama aliases back to `schedule` before dispatch.
+
+Checks:
+
+- Confirm you are running a build that includes the Ollama tool-alias normalization fix.
+- Re-run with `nullclaw agent --verbose` if you still see `Unknown tool` for a scheduler-related name.
+- If you are pinned to an older binary, upgrade before changing your scheduler config. The problem is usually tool-name drift, not a disabled scheduler.
 
 ## Post-Change Checklist
 

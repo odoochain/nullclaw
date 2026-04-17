@@ -1,13 +1,15 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const file_common = @import("file_common.zig");
 const getBinaryFileType = @import("file_read.zig").getBinaryFileType;
 const isBinaryContent = @import("file_read.zig").isBinaryContent;
+const prepareWorkspacePath = file_common.prepareWorkspacePath;
 
 /// Default maximum file size to read (10MB).
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -52,33 +54,25 @@ pub const FileReadHashedTool = struct {
         const path = root.getString(args, "path") orelse
             return ToolResult.fail("Missing 'path' parameter");
 
-        const full_path = if (std.fs.path.isAbsolute(path)) blk: {
-            if (self.allowed_paths.len == 0)
-                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
-            if (std.mem.indexOfScalar(u8, path, 0) != null)
-                return ToolResult.fail("Path contains null bytes");
-            break :blk try allocator.dupe(u8, path);
-        } else blk: {
-            if (!isPathSafe(path))
-                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        const path_info = prepareWorkspacePath(allocator, self.workspace_dir, path, self.allowed_paths.len > 0) catch |err| switch (err) {
+            error.AbsolutePathsNotAllowed => return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)"),
+            error.PathContainsNullBytes => return ToolResult.fail("Path contains null bytes"),
+            error.UnsafePath => return ToolResult.fail("Path not allowed: contains traversal or absolute path"),
+            else => return err,
         };
-        defer allocator.free(full_path);
+        defer path_info.deinit(allocator);
 
-        const resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| {
+        const resolved = fs_compat.realpathAllocPath(allocator, path_info.full_path) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(resolved);
 
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
-        defer if (ws_resolved) |wr| allocator.free(wr);
-
-        if (!isResolvedPathAllowed(allocator, resolved, ws_resolved orelse "", self.allowed_paths)) {
+        if (!isResolvedPathAllowed(allocator, resolved, path_info.workspacePath(), self.allowed_paths)) {
             return ToolResult.fail("Path is outside allowed areas");
         }
 
-        const file = std.fs.openFileAbsolute(resolved, .{}) catch |err| {
+        const file = std_compat.fs.openFileAbsolute(resolved, .{}) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to open file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -114,7 +108,7 @@ pub const FileReadHashedTool = struct {
         }
         defer allocator.free(contents);
 
-        var output: std.ArrayList(u8) = .{};
+        var output: std.ArrayList(u8) = .empty;
         errdefer output.deinit(allocator);
 
         var line_it = std.mem.splitScalar(u8, contents, '\n');
@@ -122,7 +116,7 @@ pub const FileReadHashedTool = struct {
         var last_line: []const u8 = "";
         while (line_it.next()) |line| {
             const hash = generateLineHash(last_line, line);
-            try output.writer(allocator).print("L{d}:{s}|{s}\n", .{ line_num, hash, line });
+            try output.print(allocator, "L{d}:{s}|{s}\n", .{ line_num, hash, line });
             last_line = line;
             line_num += 1;
         }
@@ -147,9 +141,9 @@ test "file_read_hashed adds tags to lines" {
     defer tmp_dir.cleanup();
 
     const content = "const x = 1;\nconst y = 2;";
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = content });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.zig", .data = content });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadHashedTool{ .workspace_dir = ws_path };
@@ -170,9 +164,9 @@ test "file_read_hashed reports binary files like file_read" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.png", .data = "\x89PNG\r\n\x1a\nrest" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.png", .data = "\x89PNG\r\n\x1a\nrest" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadHashedTool{ .workspace_dir = ws_path };

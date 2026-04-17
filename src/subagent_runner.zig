@@ -26,11 +26,12 @@ fn buildSubagentSystemPrompt(
     system_prompt: []const u8,
     workspace_dir: []const u8,
     tools: []const tools_mod.Tool,
+    observer: ?observability.Observer,
 ) ![]const u8 {
     const tool_instructions = try agent_mod.prompt.buildToolInstructions(allocator, tools);
     defer allocator.free(tool_instructions);
 
-    const skills_section = try agent_mod.prompt.buildSkillsSection(allocator, workspace_dir);
+    const skills_section = try agent_mod.prompt.buildSkillsSection(allocator, workspace_dir, observer);
     defer allocator.free(skills_section);
 
     if (skills_section.len > 0) {
@@ -60,6 +61,7 @@ pub fn runTaskWithTools(
     const provider_user_agent = if (provider_entry) |entry| entry.user_agent else null;
     const provider_api_mode = if (provider_entry) |entry| entry.api_mode else .chat_completions;
     const provider_max_streaming_prompt_bytes = if (provider_entry) |entry| entry.max_streaming_prompt_bytes else null;
+    const provider_extra_body_params = if (provider_entry) |entry| entry.extra_body_params else null;
 
     var provider_holder = providers.ProviderHolder.fromConfigWithApiMode(
         allocator,
@@ -71,6 +73,7 @@ pub fn runTaskWithTools(
         provider_api_mode,
         provider_max_streaming_prompt_bytes,
         if (provider_entry) |entry| entry.chat_template_enable_thinking_param else false,
+        provider_extra_body_params,
     );
     defer provider_holder.deinit();
 
@@ -164,6 +167,7 @@ pub fn runTaskWithTools(
         request.system_prompt,
         request.workspace_dir,
         tools,
+        obs,
     );
     // After append, ownership transfers to agent.history; agent.deinit() frees it.
     // Use catch to free only if append itself fails (avoids double-free with deinit).
@@ -234,6 +238,14 @@ test "findProviderEntry threads chat_template_enable_thinking_param from entry" 
     try std.testing.expect(found.chat_template_enable_thinking_param);
 }
 
+test "findProviderEntry threads extra_body_params from entry" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "groq", .api_key = "sk-test", .extra_body_params = "{\"seed\":42}" },
+    };
+    const found = findProviderEntry("groq", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("{\"seed\":42}", found.extra_body_params.?);
+}
+
 test "findProviderEntry returns null when provider not in list" {
     // GAP-20c: When no entry matches, findProviderEntry returns null and
     // runTaskWithTools falls back to null for max_streaming_prompt_bytes,
@@ -249,20 +261,20 @@ test "buildSubagentSystemPrompt includes installed skills before tool instructio
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/commit");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/commit");
 
     {
-        const f = try tmp.dir.createFile("skills/commit/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/commit/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"commit\", \"description\": \"Git commit helper\", \"always\": true}");
     }
     {
-        const f = try tmp.dir.createFile("skills/commit/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/commit/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Always stage before committing.");
     }
 
-    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_dir);
 
     const no_tools = [_]tools_mod.Tool{};
@@ -271,6 +283,7 @@ test "buildSubagentSystemPrompt includes installed skills before tool instructio
         "You are a background subagent.",
         workspace_dir,
         no_tools[0..],
+        null,
     );
     defer allocator.free(prompt);
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const fs_compat = @import("../fs_compat.zig");
@@ -8,7 +9,11 @@ const error_classify = @import("error_classify.zig");
 const verbose = @import("../verbose.zig");
 const log = std.log.scoped(.provider_sse);
 
-var curl_fail_fast_arg_mutex: std.Thread.Mutex = .{};
+// Keep large request bodies out of argv. On Linux, a single oversized `-d`
+// argument can hit execve limits long before the total ARG_MAX budget.
+const MAX_INLINE_CURL_BODY_BYTES: usize = 64 * 1024;
+
+var curl_fail_fast_arg_mutex: std_compat.sync.Mutex = .{};
 var curl_fail_with_body_supported_cache: ?bool = null;
 const stream_stall_detection_args = [_][]const u8{
     "--speed-limit",
@@ -22,10 +27,13 @@ fn finalizeStreamResult(
     accumulated: []const u8,
     stream_usage: ?root.TokenUsage,
 ) !root.StreamChatResult {
-    const content = if (accumulated.len > 0)
-        try allocator.dupe(u8, accumulated)
-    else
-        null;
+    var content: ?[]const u8 = null;
+    var reasoning_content: ?[]const u8 = null;
+    if (accumulated.len > 0) {
+        const split = try root.splitThinkContent(allocator, accumulated);
+        content = split.visible;
+        reasoning_content = split.reasoning;
+    }
 
     var usage = stream_usage orelse root.TokenUsage{};
     if (usage.completion_tokens == 0) {
@@ -34,6 +42,7 @@ fn finalizeStreamResult(
 
     return .{
         .content = content,
+        .reasoning_content = reasoning_content,
         .usage = usage,
         .model = "",
     };
@@ -69,7 +78,7 @@ fn curlVersionSupportsFailWithBody(version_line: []const u8) bool {
 }
 
 fn detectCurlFailWithBodySupport(allocator: std.mem.Allocator) bool {
-    const result = std.process.Child.run(.{
+    const result = std_compat.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "curl", "--version" },
         .max_output_bytes = 1024,
@@ -78,7 +87,7 @@ fn detectCurlFailWithBodySupport(allocator: std.mem.Allocator) bool {
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) return false,
+        .exited => |code| if (code != 0) return false,
         else => return false,
     }
 
@@ -109,13 +118,13 @@ pub fn appendCurlStallDetectionArgs(argv_buf: [][]const u8, argc: *usize) void {
 
 const CurlBodyArg = struct {
     arg: []const u8,
-    temp_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    temp_path_buf: [std_compat.fs.max_path_bytes]u8 = undefined,
     temp_path_len: usize = 0,
     uses_temp_file: bool = false,
 
     fn deinit(self: *const CurlBodyArg, allocator: std.mem.Allocator) void {
         if (!self.uses_temp_file) return;
-        std.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
+        std_compat.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
         allocator.free(self.arg);
     }
 };
@@ -125,7 +134,8 @@ fn prepareCurlBodyArg(
     body: []const u8,
     log_enabled: bool,
 ) !CurlBodyArg {
-    if (builtin.os.tag != .windows) {
+    const should_use_temp_file = builtin.os.tag == .windows or body.len > MAX_INLINE_CURL_BODY_BYTES;
+    if (!should_use_temp_file) {
         return .{ .arg = body };
     }
 
@@ -136,17 +146,17 @@ fn prepareCurlBodyArg(
         return error.TempDirNotFound;
     defer allocator.free(tmp_dir_path);
 
-    var tmp_dir = std.fs.openDirAbsolute(tmp_dir_path, .{}) catch
+    var tmp_dir = std_compat.fs.openDirAbsolute(tmp_dir_path, .{}) catch
         return error.TempDirNotFound;
     defer tmp_dir.close();
 
     const body_path = std.fmt.bufPrint(
         &prepared.temp_path_buf,
         "{s}{s}sse_body_{d}.tmp",
-        .{ tmp_dir_path, std.fs.path.sep_str, std.time.timestamp() },
+        .{ tmp_dir_path, std_compat.fs.path.sep_str, std_compat.time.timestamp() },
     ) catch return error.PathTooLong;
     prepared.temp_path_len = body_path.len;
-    errdefer std.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
+    errdefer std_compat.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
 
     var tmp_file = tmp_dir.createFile(
         body_path[tmp_dir_path.len + 1 ..],
@@ -163,7 +173,7 @@ fn prepareCurlBodyArg(
         debug_log.info("Using temp file for curl body: {s}, body_len={d}", .{ body_path, body.len });
     }
 
-    const verify_file = std.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
+    const verify_file = std_compat.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
     defer verify_file.close();
     const verify_stat = fs_compat.stat(verify_file) catch return error.TempFileCreateFailed;
     if (log_enabled) {
@@ -199,7 +209,7 @@ pub const SseLineResult = union(enum) {
 /// - `data: {JSON}` → extracts `choices[0].delta.content` → `.delta`
 /// - Empty lines, comments (`:`) → `.skip`
 pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
@@ -254,9 +264,10 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
 }
 
 /// Extract visible streaming text from an SSE JSON payload.
-/// Falls back to `delta.reasoning_content` when providers stream their
-/// thinking trace separately and wraps it in think tags so higher layers can
-/// suppress it from user-visible output.
+/// Falls back to `delta.reasoning`, `delta.reasoning_content`, or
+/// `delta.reasoning_details` when providers stream their thinking trace
+/// separately and wraps it in think tags so higher layers can suppress it
+/// from user-visible output.
 /// Returns owned slice or null if no content found.
 pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
@@ -279,10 +290,23 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
         }
     }
 
+    if (delta.object.get("reasoning")) |reasoning| {
+        if (reasoning == .string and reasoning.string.len > 0) {
+            return try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning.string});
+        }
+    }
+
     if (delta.object.get("reasoning_content")) |reasoning_content| {
         if (reasoning_content == .string and reasoning_content.string.len > 0) {
             const wrapped = try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning_content.string});
             return wrapped;
+        }
+    }
+
+    if (delta.object.get("reasoning_details")) |reasoning_details| {
+        if (try root.extractReasoningTextFromDetails(allocator, reasoning_details)) |reasoning_text| {
+            defer allocator.free(reasoning_text);
+            return try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning_text});
         }
     }
 
@@ -309,8 +333,8 @@ pub fn curlStream(
     const log_enabled = verbose.isVerbose();
     const debug_log = std.log.scoped(.sse);
 
-    // Build argv on stack (max 32 args)
-    var argv_buf: [32][]const u8 = undefined;
+    // Build argv on stack (max 40 args)
+    var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
@@ -355,6 +379,10 @@ pub fn curlStream(
         argv_buf[argc] = p;
         argc += 1;
     }
+
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     if (auth_header) |auth| {
         argv_buf[argc] = "-H";
@@ -409,7 +437,7 @@ pub fn curlStream(
         debug_log.info("curl command: {s}", .{cmd_buf.items});
     }
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -558,7 +586,7 @@ pub fn curlStream(
         debug_log.info("curl process terminated: {}", .{term});
     }
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
@@ -610,7 +638,7 @@ pub const AnthropicSseResult = union(enum) {
 /// - `data: {JSON}` + current_event=="message_stop" → `.done`
 /// - Everything else → `.skip`
 pub fn parseAnthropicSseLine(allocator: std.mem.Allocator, line: []const u8, current_event: []const u8) !AnthropicSseResult {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
@@ -697,8 +725,8 @@ pub fn curlStreamAnthropic(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Build argv on stack (max 32 args)
-    var argv_buf: [32][]const u8 = undefined;
+    // Build argv on stack (max 40 args)
+    var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
@@ -727,6 +755,10 @@ pub fn curlStreamAnthropic(
         argc += 1;
     }
 
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
+
     for (headers) |hdr| {
         argv_buf[argc] = "-H";
         argc += 1;
@@ -749,7 +781,7 @@ pub fn curlStreamAnthropic(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -824,7 +856,7 @@ pub fn curlStreamAnthropic(
         return error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
@@ -874,7 +906,7 @@ test "parseSseLine valid delta without optional space" {
     }
 }
 
-test "prepareCurlBodyArg uses temp file only on Windows" {
+test "prepareCurlBodyArg keeps small bodies inline except on Windows" {
     const allocator = std.testing.allocator;
     const body = [_]u8{'x'} ** 4096;
     var prepared = try prepareCurlBodyArg(allocator, body[0..], false);
@@ -887,6 +919,16 @@ test "prepareCurlBodyArg uses temp file only on Windows" {
         try std.testing.expect(!prepared.uses_temp_file);
         try std.testing.expectEqualStrings(body[0..], prepared.arg);
     }
+}
+
+test "prepareCurlBodyArg spills large bodies to temp file" {
+    const allocator = std.testing.allocator;
+    const body = [_]u8{'x'} ** (MAX_INLINE_CURL_BODY_BYTES + 1);
+    var prepared = try prepareCurlBodyArg(allocator, body[0..], false);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expect(prepared.uses_temp_file);
+    try std.testing.expect(std.mem.startsWith(u8, prepared.arg, "@"));
 }
 
 test "appendCurlStallDetectionArgs appends curl speed flags in order" {
@@ -979,11 +1021,30 @@ test "extractDeltaContent falls back to reasoning_content when content empty" {
     try std.testing.expectEqualStrings("<think>step by step</think>", result);
 }
 
+// Regression: OpenRouter's documented chat stream uses delta.reasoning.
+test "extractDeltaContent falls back to reasoning when content missing" {
+    const allocator = std.testing.allocator;
+    const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning\":\"step by step\"}}]}")).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<think>step by step</think>", result);
+}
+
 test "extractDeltaContent falls back to reasoning_content when content missing" {
     const allocator = std.testing.allocator;
     const result = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"reasoning_content\":\"step by step\"}}]}")).?;
     defer allocator.free(result);
     try std.testing.expectEqualStrings("<think>step by step</think>", result);
+}
+
+// Regression: OpenRouter's current normalized streaming shape uses reasoning_details.
+test "extractDeltaContent falls back to reasoning_details when content missing" {
+    const allocator = std.testing.allocator;
+    const result = (try extractDeltaContent(
+        allocator,
+        "{\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"plan\"},{\"type\":\"reasoning.text\",\"text\":\"step by step\"}]}}]}",
+    )).?;
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<think>plan\nstep by step</think>", result);
 }
 
 test "extractDeltaContent prefers visible content over reasoning_content" {
@@ -1102,6 +1163,21 @@ test "extractStreamUsage returns null for chunk without usage" {
 
 test "extractStreamUsage returns null for invalid JSON" {
     try std.testing.expect(extractStreamUsage("not-json{{{") == null);
+}
+
+test "finalizeStreamResult separates think blocks into reasoning content" {
+    const result = try finalizeStreamResult(
+        std.testing.allocator,
+        "<think>private trace</think>Visible answer",
+        .{ .completion_tokens = 4, .total_tokens = 4 },
+    );
+    defer {
+        if (result.content) |content| std.testing.allocator.free(content);
+        if (result.reasoning_content) |reasoning| std.testing.allocator.free(reasoning);
+    }
+
+    try std.testing.expectEqualStrings("Visible answer", result.content.?);
+    try std.testing.expectEqualStrings("private trace", result.reasoning_content.?);
 }
 
 test "parseSseLine extracts usage from final chunk" {

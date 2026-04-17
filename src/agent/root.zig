@@ -5,6 +5,7 @@
 //! (system prompt), memory_loader.zig (memory enrichment).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
@@ -26,6 +27,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const util = @import("../util.zig");
 const verbose_mod = @import("../verbose.zig");
 
 const cache = memory_mod.cache;
@@ -338,7 +340,7 @@ pub const Agent = struct {
     /// Cross-thread interrupt flag used to stop in-flight tool loops.
     interrupt_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Tracks currently running tool and effective interruptions for user-facing reporting.
-    tool_state_mu: std.Thread.Mutex = .{},
+    tool_state_mu: std_compat.sync.Mutex = .{},
     active_tool_name: ?[]u8 = null,
     interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Conversation context for the current turn.
@@ -1139,7 +1141,7 @@ pub const Agent = struct {
 
     fn markRouteDegraded(self: *Agent, selection: RouteSelection, err: anyerror) !void {
         if (!self.routeShouldBeDegraded(err)) return;
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
         const reason = try self.routeDegradeReason(err);
         errdefer self.allocator.free(reason);
 
@@ -1196,7 +1198,7 @@ pub const Agent = struct {
 
     fn routeSelectionForTurn(self: *Agent, user_message: []const u8) ?RouteSelection {
         if (self.model_pinned_by_user or self.model_routes.len == 0) return null;
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
 
         if (std.mem.indexOf(u8, user_message, "[IMAGE:") != null and self.hasUsableModelRouteHint("vision", now_ms)) {
             return self.routeSelectionForHint(
@@ -1369,7 +1371,8 @@ pub const Agent = struct {
     pub fn formatModelStatus(self: *const Agent) ![]const u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
 
         try w.print("Current model: {s}\n", .{self.model_name});
         try w.print("Default model: {s}\n", .{self.default_model});
@@ -1471,7 +1474,7 @@ pub const Agent = struct {
             }
         }
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
         if (self.model_routes.len > 0) {
             try w.writeAll("\nAuto routes:");
             for (self.model_routes) |route| {
@@ -1509,6 +1512,7 @@ pub const Agent = struct {
         }
 
         try w.writeAll("\nSwitch: /model <name>");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -1679,6 +1683,7 @@ pub const Agent = struct {
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
+                .observer = self.observer,
             });
             const final_system = if (self.profile_system_prompt) |profile_prompt|
                 if (profile_prompt.len > 0) blk: {
@@ -1726,7 +1731,7 @@ pub const Agent = struct {
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
             if (self.mem) |mem| {
-                const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
@@ -1796,9 +1801,10 @@ pub const Agent = struct {
             // Build messages slice for provider (arena-owned; freed at end of iteration)
             const messages = try self.buildProviderMessages(arena, turn_model_name);
 
-            const timer_start = std.time.milliTimestamp();
+            const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+            const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
             const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
@@ -1827,13 +1833,14 @@ pub const Agent = struct {
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
+                        .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
                     self.stream_callback.?,
                     self.stream_ctx.?,
                 ) catch |err| retry_stream: {
-                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
@@ -1863,6 +1870,7 @@ pub const Agent = struct {
                                 .tools = null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -1881,6 +1889,7 @@ pub const Agent = struct {
                 };
                 response = ChatResponse{
                     .content = stream_result.content,
+                    .reasoning_content = stream_result.reasoning_content,
                     .tool_calls = &.{},
                     .usage = stream_result.usage,
                     .model = stream_result.model,
@@ -1899,12 +1908,13 @@ pub const Agent = struct {
                         .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
+                        .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
                 ) catch |err| retry_blk: {
                     // Record the failed attempt
-                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
@@ -1934,6 +1944,7 @@ pub const Agent = struct {
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -1972,6 +1983,7 @@ pub const Agent = struct {
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -1989,7 +2001,7 @@ pub const Agent = struct {
                     }
 
                     // Retry once
-                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                    std_compat.thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
                     self.recordLlmRequestEvent(turn_model_name, messages);
                     self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
@@ -2004,6 +2016,7 @@ pub const Agent = struct {
                             .tools = if (native_tools_enabled) turn_tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
+                            .include_reasoning = include_reasoning,
                         },
                         turn_model_name,
                         self.temperature,
@@ -2033,6 +2046,7 @@ pub const Agent = struct {
                                     .tools = if (native_tools_enabled) turn_tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
+                                    .include_reasoning = include_reasoning,
                                 },
                                 turn_model_name,
                                 self.temperature,
@@ -2050,7 +2064,7 @@ pub const Agent = struct {
             }
             self.logLlmResponse(iteration + 1, response_attempt, &response);
 
-            const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+            const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
 
             const response_text = response.contentOrEmpty();
 
@@ -2208,7 +2222,7 @@ pub const Agent = struct {
                             while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
                             break :blk base_text[0..end];
                         } else base_text;
-                        const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                        const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                         const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
                         if (save_key) |key| {
                             defer self.allocator.free(key);
@@ -2255,7 +2269,7 @@ pub const Agent = struct {
             // so avoid writing arbitrary text that can corrupt the control channel.
             if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
-                var bw = std.fs.File.stdout().writer(&out_buf);
+                var bw = std_compat.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
                 w.print("{s}", .{display_text}) catch {};
                 w.flush() catch {};
@@ -2300,7 +2314,7 @@ pub const Agent = struct {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
 
-                const tool_timer = std.time.milliTimestamp();
+                const tool_timer = std_compat.time.milliTimestamp();
                 const result = blk: {
                     if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
                         break :blk ToolExecutionResult{
@@ -2322,7 +2336,7 @@ pub const Agent = struct {
                     rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, executed_result);
                     break :blk executed_result;
                 };
-                const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+                const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
                     log.info(
@@ -2402,7 +2416,7 @@ pub const Agent = struct {
         defer self.allocator.free(summary_messages);
         const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
-        const summary_timer_start = std.time.milliTimestamp();
+        const summary_timer_start = std_compat.time.milliTimestamp();
         self.recordLlmRequestEvent(self.model_name, summary_messages);
         self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, summary_messages, false, false);
         var summary_response = self.provider.chat(
@@ -2420,7 +2434,7 @@ pub const Agent = struct {
             self.model_name,
             self.temperature,
         ) catch |err| {
-            const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - summary_timer_start)));
+            const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
             self.recordLlmFailureEvent(self.model_name, fail_duration, @errorName(err));
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -2428,7 +2442,7 @@ pub const Agent = struct {
             return fallback;
         };
         self.logLlmResponse(self.max_tool_iterations + 1, 1, &summary_response);
-        const summary_duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - summary_timer_start)));
+        const summary_duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
         const summary_text = summary_response.contentOrEmpty();
         var normalized_summary_usage = summary_response.usage;
         if (normalized_summary_usage.total_tokens == 0 and
@@ -2485,6 +2499,7 @@ pub const Agent = struct {
 
     fn tool_call_updates_tools_md(allocator: std.mem.Allocator, call: ParsedToolCall) bool {
         if (!std.mem.eql(u8, call.name, "file_write") and
+            !std.mem.eql(u8, call.name, "file_append") and
             !std.mem.eql(u8, call.name, "file_edit") and
             !std.mem.eql(u8, call.name, "file_edit_hashed")) return false;
 
@@ -2577,6 +2592,14 @@ pub const Agent = struct {
         call: ParsedToolCall,
         result: ToolExecutionResult,
     ) void {
+        // Only cache successful results, unless it's a native tool call with an ID.
+        // For ID-based calls, we must preserve the result (even if failed) to support
+        // exact replays requested by the provider.
+        // Signature-based calls (XML) that failed are not cached so they can be
+        // re-tried if a subsequent tool in the same turn fixes the environment.
+        const has_id = call.tool_call_id != null and call.tool_call_id.?.len > 0;
+        if (!result.success and !has_id) return;
+
         const fingerprint = toolCallDedupFingerprint(call);
         if (seen_tool_call_results.contains(fingerprint)) return;
 
@@ -2750,19 +2773,26 @@ pub const Agent = struct {
     const LLM_LOG_MAX_BYTES: usize = 8192;
 
     fn previewText(text: []const u8, max_bytes: usize) TextPreview {
-        if (text.len <= max_bytes) {
-            return .{ .slice = text, .truncated = false };
-        }
-        return .{ .slice = text[0..max_bytes], .truncated = true };
+        const preview = util.previewUtf8(text, max_bytes);
+        return .{
+            .slice = preview.slice,
+            .truncated = preview.truncated,
+        };
     }
 
     fn llmLogPreview(text: []const u8) TextPreview {
         return previewText(text, LLM_LOG_MAX_BYTES);
     }
 
+    test "previewText keeps UTF-8 intact when truncating" {
+        const preview = previewText("aaa\xd0\x99tail", 4);
+        try std.testing.expectEqualStrings("aaa", preview.slice);
+        try std.testing.expect(preview.truncated);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
+    }
+
     fn llmRequestObserverDetail(buf: []u8, messages: []const ChatMessage) ?[]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         const max_messages = @min(messages.len, 6);
         for (messages[0..max_messages], 0..) |msg, idx| {
             const preview = previewText(msg.content, 240);
@@ -2785,14 +2815,13 @@ pub const Agent = struct {
         if (messages.len > max_messages) {
             w.print("\n... {d} more messages", .{messages.len - max_messages}) catch {};
         }
-        const written = fbs.getWritten();
+        const written = w.buffered();
         if (written.len == 0) return null;
         return written;
     }
 
     fn llmResponseObserverDetail(buf: []u8, response: *const ChatResponse) ?[]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
 
         const content = response.contentOrEmpty();
         const content_preview = previewText(content, 400);
@@ -2835,7 +2864,7 @@ pub const Agent = struct {
             w.print("\n... {d} more tool calls", .{response.tool_calls.len - max_tool_calls}) catch {};
         }
 
-        const written = fbs.getWritten();
+        const written = w.buffered();
         if (written.len == 0) return null;
         return written;
     }
@@ -2843,23 +2872,23 @@ pub const Agent = struct {
     fn toolArgsObserverDetail(buf: []u8, arguments_json: []const u8) ?[]const u8 {
         const preview = previewText(arguments_json, @min(buf.len, 512));
         if (preview.slice.len == 0) return null;
-        var fbs = std.io.fixedBufferStream(buf);
-        fbs.writer().print("{f}{s}", .{
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("{f}{s}", .{
             std.json.fmt(preview.slice, .{}),
             if (preview.truncated) " [truncated]" else "",
         }) catch return null;
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn toolResultObserverDetail(buf: []u8, output: []const u8) ?[]const u8 {
         const preview = previewText(output, @min(buf.len, 512));
         if (preview.slice.len == 0) return null;
-        var fbs = std.io.fixedBufferStream(buf);
-        fbs.writer().print("{f}{s}", .{
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("{f}{s}", .{
             std.json.fmt(preview.slice, .{}),
             if (preview.truncated) " [truncated]" else "",
         }) catch return null;
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn recordLlmRequestEvent(self: *Agent, model_name: []const u8, messages: []const ChatMessage) void {
@@ -2949,8 +2978,10 @@ pub const Agent = struct {
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
+        const reasoning_returned = response.reasoning_content != null and response.reasoning_content.?.len > 0;
+        const reasoning_requested = self.reasoning_mode != .off;
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} reasoning_mode={s} reasoning_effort={s} reasoning_requested={} reasoning_returned={} usage={f} content={f}{s}",
             .{
                 session_hash,
                 iteration,
@@ -2959,11 +2990,32 @@ pub const Agent = struct {
                 self.effectiveModel(response),
                 content.len,
                 response.tool_calls.len,
+                self.reasoning_mode.toSlice(),
+                self.reasoning_effort orelse "off",
+                reasoning_requested,
+                reasoning_returned,
                 std.json.fmt(response.usage, .{}),
                 std.json.fmt(preview.slice, .{}),
                 if (preview.truncated) " [log preview truncated]" else "",
             },
         );
+
+        // NOTE: Logging-only path. No direct unit test added because verifying structured
+        // log emission here would require a log sink harness for Agent runtime logging.
+        if (reasoning_requested and !reasoning_returned) {
+            log.info(
+                "llm response reasoning missing session=0x{x} iter={d} attempt={d} provider={s} model={s} reasoning_mode={s} reasoning_effort={s}",
+                .{
+                    session_hash,
+                    iteration,
+                    attempt,
+                    self.effectiveProvider(response),
+                    self.effectiveModel(response),
+                    self.reasoning_mode.toSlice(),
+                    self.reasoning_effort orelse "off",
+                },
+            );
+        }
 
         if (response.reasoning_content) |reasoning| {
             const r_preview = llmLogPreview(reasoning);
@@ -3012,7 +3064,7 @@ pub const Agent = struct {
         const cb = self.usage_record_callback orelse return;
         const ctx = self.usage_record_ctx orelse return;
         cb(ctx, .{
-            .ts = std.time.timestamp(),
+            .ts = std_compat.time.timestamp(),
             .provider = self.effectiveProvider(response),
             .model = self.effectiveModel(response),
             .usage = response.usage,
@@ -3108,7 +3160,7 @@ pub const Agent = struct {
         dirs: *std.ArrayListUnmanaged([]const u8),
         raw_dir: []const u8,
     ) !void {
-        const trimmed = std.mem.trimRight(u8, raw_dir, "/\\");
+        const trimmed = std_compat.mem.trimRight(u8, raw_dir, "/\\");
         if (trimmed.len == 0) return;
 
         if (!containsMultimodalDir(dirs.items, trimmed)) {
@@ -3116,7 +3168,7 @@ pub const Agent = struct {
         }
 
         // Add canonical path variant too (/var <-> /private/var on macOS).
-        const canonical = std.fs.realpathAlloc(arena, trimmed) catch return;
+        const canonical = std_compat.fs.realpathAlloc(arena, trimmed) catch return;
         if (!containsMultimodalDir(dirs.items, canonical)) {
             try dirs.append(arena, canonical);
         }
@@ -3646,6 +3698,10 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
         fn supportsVisionForModel(_: *anyopaque, model: []const u8) bool {
             return std.mem.eql(u8, model, "vision-model");
         }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -3723,6 +3779,10 @@ test "Agent buildProviderMessages allows workspace image paths" {
         fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
             return true;
         }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -3731,15 +3791,15 @@ test "Agent buildProviderMessages allows workspace image paths" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
         .sub_path = "screen.png",
         .data = "\x89PNG\x0d\x0a\x1a\x0a",
     });
 
     const allocator = std.testing.allocator;
-    const workspace_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const workspace_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_path);
-    const image_path = try std.fs.path.join(allocator, &.{ workspace_path, "screen.png" });
+    const image_path = try std_compat.fs.path.join(allocator, &.{ workspace_path, "screen.png" });
     defer allocator.free(image_path);
 
     var dummy: u8 = 0;
@@ -3905,6 +3965,10 @@ fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy-test-provider";
         }
@@ -3965,6 +4029,8 @@ const RecordingObserver = struct {
         .record_metric = recordMetric,
         .flush = flush,
         .name = getName,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
     };
 
     fn observer(self: *Self) Observer {
@@ -4010,6 +4076,10 @@ const RecordingObserver = struct {
 
     fn flush(_: *anyopaque) void {}
 
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
     fn getName(_: *anyopaque) []const u8 {
         return "recording-test";
     }
@@ -4114,6 +4184,10 @@ test "turn prepends profile system prompt when profile is active" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "capture-profile-provider";
         }
@@ -4580,6 +4654,10 @@ test "turn bare /new routes through fresh-session prompt" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "echo-provider";
         }
@@ -4652,6 +4730,10 @@ test "turn /reset with argument stays slash-only command" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "nocall-provider";
         }
@@ -4716,6 +4798,10 @@ test "turn retains user message on provider error" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "fail-provider";
         }
@@ -4789,6 +4875,10 @@ test "turn does not retry immediately on rate limit" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "rate-limited-provider";
         }
@@ -4859,6 +4949,10 @@ test "turn still retries non-rate-limited provider failures once" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "retry-provider";
         }
@@ -4936,6 +5030,10 @@ test "turn records llm request for immediate context-compaction retry" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "recovery-provider";
         }
@@ -5116,6 +5214,7 @@ test "slash /model with telegram bot mention switches model" {
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.default_model);
+    try std.testing.expectEqualStrings("qianfan", agent.default_provider);
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
 }
 
@@ -5130,7 +5229,31 @@ test "slash /model resolves provider max_tokens fallback" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
+    try std.testing.expectEqualStrings("qianfan", agent.default_provider);
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
+}
+
+test "slash /model preserves custom provider prefix when switching explicit provider model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.max_tokens = 111;
+
+    const response = (try agent.handleSlashCommand(
+        "/model custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+    )).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model") != null);
+    try std.testing.expectEqualStrings(
+        "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+        agent.model_name,
+    );
+    try std.testing.expectEqualStrings(
+        "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+        agent.default_model,
+    );
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/proxy/v1/openai/v2", agent.default_provider);
 }
 
 test "slash /model keeps explicit token_limit override" {
@@ -5367,14 +5490,14 @@ test "auto route selection benchmark stays below visible overhead" {
     };
 
     const iterations: usize = 50_000;
-    var timer = try std.time.Timer.start();
+    const start_ns = std_compat.time.nanoTimestamp();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const hint = agent.selectRouteHintForTurn("show current status");
         try std.testing.expect(hint != null);
         try std.testing.expectEqualStrings("fast", hint.?);
     }
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(std_compat.time.nanoTimestamp() - start_ns);
     const avg_ns = elapsed_ns / iterations;
 
     // Heuristic routing should stay far below human-visible latency.
@@ -5460,6 +5583,94 @@ test "slash /model without name shows current" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
+}
+
+test "slash /model renders interactive choices for telegram sessions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model provider anthropic") != null);
+}
+
+test "slash /model provider renders interactive model choices for selected provider" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model provider anthropic")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+}
+
+test "slash /model with a single configured provider renders models directly" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+}
+
+test "slash /model renders interactive choices for routed slack sessions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "agent:slack-ops:main";
+    agent.conversation_context = .{ .channel = "slack" };
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model provider anthropic") != null);
 }
 
 test "slash /models aliases to /model" {
@@ -5839,6 +6050,10 @@ test "hard stop mock interruption lists exactly interrupted tool" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "one-shot-tool-provider";
         }
@@ -5853,9 +6068,9 @@ test "hard stop mock interruption lists exactly interrupted tool" {
     const InterruptWorker = struct {
         fn run(ctx: *InterruptCtx) void {
             while (!ctx.started.load(.acquire)) {
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                std_compat.thread.sleep(10 * std.time.ns_per_ms);
             }
-            std.Thread.sleep(80 * std.time.ns_per_ms);
+            std_compat.thread.sleep(80 * std.time.ns_per_ms);
             ctx.agent.requestInterrupt();
         }
     };
@@ -6009,6 +6224,10 @@ test "turn includes reasoning and usage footer when enabled" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "test";
         }
@@ -6053,7 +6272,7 @@ test "turn includes reasoning and usage footer when enabled" {
     const response = try agent.turn("hello");
     defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\n> thinking trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
 }
@@ -6077,6 +6296,10 @@ test "turn estimates token usage when provider omits usage" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "test";
         }
@@ -6145,6 +6368,10 @@ test "turn refreshes system prompt after workspace markdown change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6157,12 +6384,12 @@ test "turn refreshes system prompt after workspace markdown change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll("SOUL-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6203,7 +6430,7 @@ test "turn refreshes system prompt after workspace markdown change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("SOUL-V2-UPDATED");
     }
@@ -6232,6 +6459,10 @@ test "turn refreshes system prompt after TOOLS.md change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6244,12 +6475,12 @@ test "turn refreshes system prompt after TOOLS.md change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("TOOLS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("TOOLS.md", .{});
         defer f.close();
         try f.writeAll("TOOLS-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6290,7 +6521,7 @@ test "turn refreshes system prompt after TOOLS.md change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "TOOLS-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("TOOLS.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("TOOLS.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("TOOLS-V2-UPDATED");
     }
@@ -6319,6 +6550,10 @@ test "turn refreshes system prompt after USER.md change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6331,12 +6566,12 @@ test "turn refreshes system prompt after USER.md change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("- **Name:** USER-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6377,7 +6612,7 @@ test "turn refreshes system prompt after USER.md change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "USER-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("- **Name:** USER-V2-UPDATED");
     }
@@ -6406,6 +6641,10 @@ test "turn refreshes system prompt when conversation sender changes" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6417,7 +6656,7 @@ test "turn refreshes system prompt when conversation sender changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6612,9 +6851,9 @@ test "direct slash skill command resolves hyphenated skill name" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6626,14 +6865,14 @@ test "direct slash skill command resolves hyphenated skill name" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news-digest latest ai news")).?;
@@ -6648,9 +6887,9 @@ test "direct slash skill command resolves two-word alias to hyphenated skill" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6662,14 +6901,14 @@ test "direct slash skill command resolves two-word alias to hyphenated skill" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
@@ -6684,9 +6923,9 @@ test "direct slash skill command does not collapse token boundaries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6698,14 +6937,14 @@ test "direct slash skill command does not collapse token boundaries" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = try agent.handleSlashCommand("/newsdigest latest ai news");
@@ -6717,10 +6956,10 @@ test "direct slash skill command reports ambiguous normalized alias" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
-    try tmp.dir.makePath("skills/news_ digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news_ digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6732,12 +6971,12 @@ test "direct slash skill command reports ambiguous normalized alias" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
     {
-        const f = try tmp.dir.createFile("skills/news_ digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news_ digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6749,14 +6988,14 @@ test "direct slash skill command reports ambiguous normalized alias" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news_ digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news_ digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect other news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
@@ -6770,9 +7009,9 @@ test "direct slash skill command does not shadow built in doctor" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/doctor");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/doctor");
     {
-        const f = try tmp.dir.createFile("skills/doctor/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/doctor/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6784,14 +7023,14 @@ test "direct slash skill command does not shadow built in doctor" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/doctor/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/doctor/SKILL.md", .{});
         defer f.close();
         try f.writeAll("This should not shadow /doctor.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/doctor")).?;
@@ -6806,10 +7045,10 @@ test "direct slash skill command reports ambiguity between exact and composite m
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news");
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6821,12 +7060,12 @@ test "direct slash skill command reports ambiguity between exact and composite m
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news/SKILL.md", .{});
         defer f.close();
         try f.writeAll("General news skill body.");
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6838,14 +7077,14 @@ test "direct slash skill command reports ambiguity between exact and composite m
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Digest skill body.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
@@ -6858,16 +7097,16 @@ test "slash /skill reload invalidates prompt caches" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("skills/broken");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/broken");
     {
-        const f = try tmp.dir.createFile("skills/broken/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/broken/skill.json", .{});
         defer f.close();
         try f.writeAll("{ invalid json");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     agent.has_system_prompt = true;
@@ -6958,6 +7197,10 @@ test "turn passes auto-routed model to provider" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "capture-provider";
         }
@@ -7012,8 +7255,8 @@ test "turn passes auto-routed model to provider" {
 // Simulate by verifying the @max(0, ...) clamping logic.
 test "milliTimestamp negative difference clamps to zero" {
     // Simulate: timer_start is in the future relative to "now" (negative diff)
-    const timer_start = std.time.milliTimestamp() + 10_000;
-    const diff = std.time.milliTimestamp() - timer_start;
+    const timer_start = std_compat.time.milliTimestamp() + 10_000;
+    const diff = std_compat.time.milliTimestamp() - timer_start;
     // diff < 0 here; @max(0, diff) must clamp to 0 without panic
     const clamped = @max(0, diff);
     const duration: u64 = @as(u64, @intCast(clamped));
@@ -7028,6 +7271,11 @@ test "tool_call_batch_updates_tools_md detects writes to TOOLS.md" {
         .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"target\":\"L1:abc\",\"new_text\":\"b\"}" },
     };
     try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_match));
+
+    const calls_append_match = [_]ParsedToolCall{
+        .{ .name = "file_append", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"content\":\"\\nmore guidance\"}" },
+    };
+    try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_append_match));
 
     const calls_no_match = [_]ParsedToolCall{
         .{ .name = "file_write", .arguments_json = "{\"path\":\"README.md\",\"content\":\"x\"}" },
@@ -7132,6 +7380,27 @@ test "rememberToolCallResultInTurn preserves failed result for replayed tool_cal
     try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
 }
 
+test "rememberToolCallResultInTurn skips failed signature-only calls" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const failed_call = ParsedToolCall{
+        .name = "file_read",
+        .arguments_json = "{\"path\":\"missing.txt\"}",
+        .tool_call_id = null,
+    };
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, failed_call, .{
+        .name = failed_call.name,
+        .output = "FileNotFound",
+        .success = false,
+        .tool_call_id = null,
+    });
+
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, failed_call) == null);
+}
+
 test "Agent turn skips replayed tool_call_id across iterations" {
     const ProbeTool = struct {
         const Self = @This();
@@ -7192,6 +7461,10 @@ test "Agent turn skips replayed tool_call_id across iterations" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "replay-provider";
         }
@@ -7340,6 +7613,10 @@ test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same b
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -7467,6 +7744,10 @@ test "Agent tool-limit summary preserves provider session_id" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "session-capture-provider";
         }
@@ -7584,6 +7865,10 @@ test "Agent tool-limit summary records observer events and token metric" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "summary-provider";
         }
@@ -7704,6 +7989,10 @@ test "Agent tool-limit summary records llm failure when summary call fails" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "summary-fail-provider";
         }
@@ -7801,6 +8090,10 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -7919,6 +8212,10 @@ test "Agent tool loop frees dynamic tool outputs" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -8058,6 +8355,10 @@ test "Agent shell failure with normalized output does not poison next turn" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "shell-failure-provider";
         }
@@ -8171,6 +8472,10 @@ test "Agent strips fabricated tool_result blocks from XML assistant history" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "xml-fabrication-provider";
         }
@@ -8306,6 +8611,10 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
             return error.ShouldNotStream;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "stream-guard";
         }
@@ -8471,6 +8780,10 @@ test "Agent retries empty final response once before succeeding" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "empty-then-recovered-provider";
         }
@@ -8540,6 +8853,10 @@ test "Agent returns NoResponseContent after repeated empty final responses" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "always-empty-provider";
         }
@@ -8643,6 +8960,10 @@ test "Agent retries empty streaming response once" {
             };
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "empty-then-recovered-streaming-provider";
         }
@@ -8776,6 +9097,10 @@ test "Agent forces follow-through retry for streaming deferred promise" {
             };
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "deferred-promise-streaming-provider";
         }
@@ -8971,19 +9296,19 @@ test "execBlockMessage allows all commands when exec_security=full" {
     agent.exec_ask = .off;
 
     // Even high-risk commands should not be blocked by execBlockMessage
-    var args1 = std.json.ObjectMap.init(allocator);
-    defer args1.deinit();
-    try args1.put("command", .{ .string = "rm -rf /tmp/test" });
+    var args1: std.json.ObjectMap = .empty;
+    defer args1.deinit(allocator);
+    try args1.put(allocator, "command", .{ .string = "rm -rf /tmp/test" });
     try std.testing.expect(agent.execBlockMessage(args1) == null);
 
-    var args2 = std.json.ObjectMap.init(allocator);
-    defer args2.deinit();
-    try args2.put("command", .{ .string = "curl https://example.com" });
+    var args2: std.json.ObjectMap = .empty;
+    defer args2.deinit(allocator);
+    try args2.put(allocator, "command", .{ .string = "curl https://example.com" });
     try std.testing.expect(agent.execBlockMessage(args2) == null);
 
-    var args3 = std.json.ObjectMap.init(allocator);
-    defer args3.deinit();
-    try args3.put("command", .{ .string = "ls -la" });
+    var args3: std.json.ObjectMap = .empty;
+    defer args3.deinit(allocator);
+    try args3.put(allocator, "command", .{ .string = "ls -la" });
     try std.testing.expect(agent.execBlockMessage(args3) == null);
 }
 
@@ -9008,15 +9333,15 @@ test "execBlockMessage checks allowlist when exec_security=allowlist" {
     agent.policy = &policy;
 
     // Allowed command passes
-    var args1 = std.json.ObjectMap.init(allocator);
-    defer args1.deinit();
-    try args1.put("command", .{ .string = "ls -la" });
+    var args1: std.json.ObjectMap = .empty;
+    defer args1.deinit(allocator);
+    try args1.put(allocator, "command", .{ .string = "ls -la" });
     try std.testing.expect(agent.execBlockMessage(args1) == null);
 
     // Disallowed command is blocked
-    var args2 = std.json.ObjectMap.init(allocator);
-    defer args2.deinit();
-    try args2.put("command", .{ .string = "curl https://example.com" });
+    var args2: std.json.ObjectMap = .empty;
+    defer args2.deinit(allocator);
+    try args2.put(allocator, "command", .{ .string = "curl https://example.com" });
     try std.testing.expect(agent.execBlockMessage(args2) != null);
 }
 
@@ -9054,9 +9379,9 @@ test "execBlockMessage allowlist mode honors wildcard allowed_commands" {
 
     // Command outside default allowlist should pass with wildcard policy.
     agent.policy = &open_policy;
-    var args = std.json.ObjectMap.init(allocator);
-    defer args.deinit();
-    try args.put("command", .{ .string = "python3 script.py" });
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(allocator);
+    try args.put(allocator, "command", .{ .string = "python3 script.py" });
     try std.testing.expect(agent.execBlockMessage(args) == null);
 
     // Same command should be blocked under restrictive allowlist.

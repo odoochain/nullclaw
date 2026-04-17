@@ -68,6 +68,7 @@ pub const InboundMetadata = struct {
     peer_kind: ?agent_routing.ChatType = null,
     peer_id: ?[]const u8 = null,
     message_id: ?[]const u8 = null,
+    replace_message: ?bool = null,
     guild_id: ?[]const u8 = null,
     team_id: ?[]const u8 = null,
     channel_id: ?[]const u8 = null,
@@ -335,6 +336,17 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .derive_peer = deriveNostrPeer,
     },
 };
+
+pub fn derivePeerForStaticChannel(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    for (&inbound_route_descriptors) |*desc| {
+        if (desc.channel_name) |name| {
+            if (std.mem.eql(u8, name, input.channel_name)) {
+                return desc.derive_peer(input, meta);
+            }
+        }
+    }
+    return null;
+}
 
 pub fn findInboundRouteDescriptor(config: *const Config, channel_name: []const u8) ?*const InboundRouteDescriptor {
     for (&inbound_route_descriptors) |*desc| {

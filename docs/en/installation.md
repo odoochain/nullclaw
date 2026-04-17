@@ -98,6 +98,10 @@ Interactive onboarding:
 docker compose --profile agent run --rm agent onboard --interactive
 ```
 
+Inside the official container flow, pressing Enter at the workspace prompt keeps the volume-backed default:
+
+- workspace: `/nullclaw-data/workspace`
+
 Interactive agent session:
 
 ```bash
@@ -209,12 +213,12 @@ if (-not ($user_path -split ";" | Where-Object { $_ -eq $bin })) {
 $env:Path = "$env:Path;$bin"
 ```
 
-### Downloaded nullclaw binary file (Windows,Powershell)
-You can rename the downloaded nullclaw binary file(.exe) to nullclaw.exe，then run the following commands with administrator privileges in Powershell, that will add the directory which the binary file is located in to Environment Variable PATH in Windows:
+### Downloaded nullclaw binary file (Windows, Powershell)
+Download the Windows `.zip` archive from the releases page, extract it, and then run the following commands with administrator privileges in Powershell to add the directory containing `nullclaw.exe` to the Windows `PATH` environment variable:
 
 ```Powershell 
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
-$new = "$old;x:\nullclaww二进制文件所在目录"
+$new = "$old;x:\path\to\nullclaw"
 [Environment]::SetEnvironmentVariable("Path", $new, "Machine")
 ```
 

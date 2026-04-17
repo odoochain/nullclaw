@@ -5,6 +5,7 @@
 //! Task results are routed via the event bus as system InboundMessages.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
@@ -78,6 +79,7 @@ const ThreadContext = struct {
     origin_channel: []const u8,
     origin_chat_id: []const u8,
     agent_name: ?[]const u8 = null,
+    trace_id: ?[32]u8 = null,
 };
 
 // ── SubagentManager ─────────────────────────────────────────────
@@ -86,7 +88,7 @@ pub const SubagentManager = struct {
     allocator: Allocator,
     tasks: std.AutoHashMapUnmanaged(u64, *TaskState),
     next_id: u64,
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
     config: SubagentConfig,
     bus: ?*bus_mod.Bus,
 
@@ -213,7 +215,7 @@ pub const SubagentManager = struct {
             .status = .running,
             .label = state_label,
             .session_key = state_session,
-            .started_at = std.time.milliTimestamp(),
+            .started_at = std_compat.time.milliTimestamp(),
         };
 
         try self.tasks.put(self.allocator, task_id, state);
@@ -230,6 +232,8 @@ pub const SubagentManager = struct {
         const agent_name_copy = if (agent_name) |name| try self.allocator.dupe(u8, name) else null;
         errdefer if (agent_name_copy) |name| self.allocator.free(name);
 
+        const trace_id = if (self.observer) |obs| obs.getTraceId() else null;
+
         // Build thread context
         const ctx = try self.allocator.create(ThreadContext);
         errdefer self.allocator.destroy(ctx);
@@ -241,6 +245,7 @@ pub const SubagentManager = struct {
             .origin_channel = origin_channel_copy,
             .origin_chat_id = origin_chat_copy,
             .agent_name = agent_name_copy,
+            .trace_id = trace_id,
         };
 
         state.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, subagentThreadFn, .{ctx});
@@ -302,7 +307,7 @@ pub const SubagentManager = struct {
                 state.status = if (owned_err != null) .failed else .completed;
                 state.result = owned_result;
                 state.error_msg = owned_err;
-                state.completed_at = std.time.milliTimestamp();
+                state.completed_at = std_compat.time.milliTimestamp();
                 label = state.label;
             }
         }
@@ -343,13 +348,13 @@ fn resolveWorkspacePath(
     config_path: []const u8,
     fallback_workspace: []const u8,
 ) ?[]const u8 {
-    if (std.fs.path.isAbsolute(workspace_path)) {
+    if (std_compat.fs.path.isAbsolute(workspace_path)) {
         return allocator.dupe(u8, workspace_path) catch null;
     }
     const normalized_workspace_path = config_mod.normalizeHostPathSeparators(allocator, workspace_path) catch return null;
     defer allocator.free(normalized_workspace_path);
-    const home_dir = std.fs.path.dirname(config_path) orelse fallback_workspace;
-    return std.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path }) catch null;
+    const home_dir = std_compat.fs.path.dirname(config_path) orelse fallback_workspace;
+    return std_compat.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path }) catch null;
 }
 
 // ── Thread function ─────────────────────────────────────────────
@@ -362,6 +367,19 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.allocator.free(ctx.origin_chat_id);
         if (ctx.agent_name) |agent_name| ctx.manager.allocator.free(agent_name);
         ctx.manager.allocator.destroy(ctx);
+    }
+
+    if (ctx.manager.observer) |obs| {
+        if (ctx.trace_id) |tid| {
+            obs.setTraceId(tid);
+        }
+
+        const name_to_report = ctx.agent_name orelse "default";
+        const subagent_start_event = observability.ObserverEvent{ .subagent_start = .{
+            .agent_name = name_to_report,
+            .task = ctx.task,
+        } };
+        obs.recordEvent(&subagent_start_event);
     }
 
     // Default prompt differs based on execution mode:
@@ -473,7 +491,7 @@ fn waitTaskTerminalStatus(manager: *SubagentManager, task_id: u64) !TaskStatus {
     while (attempts < 200) : (attempts += 1) {
         const status = manager.getTaskStatus(task_id) orelse return error.TestUnexpectedResult;
         if (status != .running) return status;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std_compat.thread.sleep(10 * std.time.ns_per_ms);
     }
     return error.TestUnexpectedResult;
 }
@@ -585,7 +603,7 @@ test "SubagentManager completeTask updates state" {
     state.* = .{
         .status = .running,
         .label = try std.testing.allocator.dupe(u8, "test-task"),
-        .started_at = std.time.milliTimestamp(),
+        .started_at = std_compat.time.milliTimestamp(),
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
@@ -608,7 +626,7 @@ test "SubagentManager completeTask with error" {
     state.* = .{
         .status = .running,
         .label = try std.testing.allocator.dupe(u8, "fail-task"),
-        .started_at = std.time.milliTimestamp(),
+        .started_at = std_compat.time.milliTimestamp(),
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
@@ -634,7 +652,7 @@ test "SubagentManager completeTask routes via bus" {
     state.* = .{
         .status = .running,
         .label = try std.testing.allocator.dupe(u8, "bus-task"),
-        .started_at = std.time.milliTimestamp(),
+        .started_at = std_compat.time.milliTimestamp(),
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
@@ -705,11 +723,11 @@ test "SubagentManager uses named agent workspace_path for task runner" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const config_path = try std.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
     defer std.testing.allocator.free(config_path);
-    const expected_workspace = try std.fs.path.join(std.testing.allocator, &.{ base, "agents", "researcher" });
+    const expected_workspace = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "agents", "researcher" });
     defer std.testing.allocator.free(expected_workspace);
 
     const agents = [_]config_mod.NamedAgentConfig{.{
@@ -738,11 +756,11 @@ test "SubagentManager preserves named agent system_prompt when workspace_path is
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const config_path = try std.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
     defer std.testing.allocator.free(config_path);
-    const expected_workspace = try std.fs.path.join(std.testing.allocator, &.{ base, "agents", "researcher" });
+    const expected_workspace = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "agents", "researcher" });
     defer std.testing.allocator.free(expected_workspace);
     const expected_prompt = "Focus on implementation and tests.";
 

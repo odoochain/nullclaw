@@ -1,11 +1,12 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const Config = @import("config.zig").Config;
 const version = @import("version.zig");
 const channel_catalog = @import("channel_catalog.zig");
 
 pub fn run(allocator: std.mem.Allocator) !void {
     var buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writer(&buf);
     const w = &bw.interface;
 
     var cfg = Config.load(allocator) catch {
@@ -73,7 +74,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     // Sandbox
     try w.print("Sandbox:     {s}\n", .{
-        if (cfg.security.sandbox.enabled orelse false) "enabled" else "disabled",
+        if (cfg.sandboxEnabled()) "enabled" else "disabled",
     });
 
     // Audit

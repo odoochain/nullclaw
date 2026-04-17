@@ -1073,7 +1073,19 @@ pub const Config = struct {
         // agents.defaults (model + heartbeat) + agents.list
         {
             const has_model = self.default_model != null;
-            const has_heartbeat = self.heartbeat.enabled or self.heartbeat.interval_minutes != 30;
+            const has_heartbeat = self.heartbeat.enabled or
+                self.heartbeat.interval_minutes != 30 or
+                self.heartbeat.prompt != null or
+                self.heartbeat.model != null or
+                self.heartbeat.timeout_secs != 120 or
+                self.heartbeat.delivery_mode != null or
+                self.heartbeat.delivery_channel != null or
+                self.heartbeat.delivery_to != null or
+                self.heartbeat.delivery_account_id != null or
+                self.heartbeat.delivery_peer_kind != null or
+                self.heartbeat.delivery_peer_id != null or
+                self.heartbeat.delivery_thread_id != null or
+                !self.heartbeat.delivery_best_effort;
             const has_agents = self.agents.len > 0;
             if (has_model or has_heartbeat or has_agents) {
                 try w.print("  \"agents\": {{\n", .{});
@@ -1110,6 +1122,48 @@ pub const Config = struct {
                     }
                     if (!self.heartbeat.enabled) {
                         try w.print(", \"enabled\": false", .{});
+                    }
+                    if (self.heartbeat.prompt) |prompt| {
+                        try w.print(", \"prompt\": ", .{});
+                        try writeJsonStr(w, prompt);
+                    }
+                    if (self.heartbeat.model) |model| {
+                        try w.print(", \"model\": ", .{});
+                        try writeJsonStr(w, model);
+                    }
+                    if (self.heartbeat.timeout_secs != 120) {
+                        try w.print(", \"timeout_secs\": {d}", .{self.heartbeat.timeout_secs});
+                    }
+                    if (self.heartbeat.delivery_mode) |delivery_mode| {
+                        try w.print(", \"delivery_mode\": ", .{});
+                        try writeJsonStr(w, delivery_mode);
+                    }
+                    if (self.heartbeat.delivery_channel) |delivery_channel| {
+                        try w.print(", \"delivery_channel\": ", .{});
+                        try writeJsonStr(w, delivery_channel);
+                    }
+                    if (self.heartbeat.delivery_to) |delivery_to| {
+                        try w.print(", \"delivery_to\": ", .{});
+                        try writeJsonStr(w, delivery_to);
+                    }
+                    if (self.heartbeat.delivery_account_id) |delivery_account_id| {
+                        try w.print(", \"delivery_account_id\": ", .{});
+                        try writeJsonStr(w, delivery_account_id);
+                    }
+                    if (self.heartbeat.delivery_peer_kind) |delivery_peer_kind| {
+                        try w.print(", \"delivery_peer_kind\": ", .{});
+                        try writeJsonStr(w, delivery_peer_kind);
+                    }
+                    if (self.heartbeat.delivery_peer_id) |delivery_peer_id| {
+                        try w.print(", \"delivery_peer_id\": ", .{});
+                        try writeJsonStr(w, delivery_peer_id);
+                    }
+                    if (self.heartbeat.delivery_thread_id) |delivery_thread_id| {
+                        try w.print(", \"delivery_thread_id\": ", .{});
+                        try writeJsonStr(w, delivery_thread_id);
+                    }
+                    if (!self.heartbeat.delivery_best_effort) {
+                        try w.print(", \"delivery_best_effort\": false", .{});
                     }
                     try w.print("}}\n", .{});
                 }
@@ -5813,6 +5867,104 @@ test "parse agents.defaults.heartbeat disabled" {
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.heartbeat.enabled);
     try std.testing.expectEqual(@as(u32, 30), cfg.heartbeat.interval_minutes);
+}
+
+test "parse agents.defaults.heartbeat dispatch settings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agents":{"defaults":{"heartbeat":{"every":"1m","prompt":"Review tasks","model":"openai/gpt-5.4","timeout_secs":45,"delivery_mode":"on_error","delivery_channel":"telegram","delivery_account_id":"backup","delivery_to":"-100123:thread:77","delivery_peer_kind":"group","delivery_peer_id":"-100123","delivery_thread_id":"77","delivery_best_effort":false}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.heartbeat.enabled);
+    try std.testing.expectEqual(@as(u32, 1), cfg.heartbeat.interval_minutes);
+    try std.testing.expectEqualStrings("Review tasks", cfg.heartbeat.prompt.?);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", cfg.heartbeat.model.?);
+    try std.testing.expectEqual(@as(u32, 45), cfg.heartbeat.timeout_secs);
+    try std.testing.expectEqualStrings("on_error", cfg.heartbeat.delivery_mode.?);
+    try std.testing.expectEqualStrings("telegram", cfg.heartbeat.delivery_channel.?);
+    try std.testing.expectEqualStrings("backup", cfg.heartbeat.delivery_account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", cfg.heartbeat.delivery_to.?);
+    try std.testing.expectEqualStrings("group", cfg.heartbeat.delivery_peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", cfg.heartbeat.delivery_peer_id.?);
+    try std.testing.expectEqualStrings("77", cfg.heartbeat.delivery_thread_id.?);
+    try std.testing.expect(!cfg.heartbeat.delivery_best_effort);
+}
+
+test "save roundtrip preserves heartbeat dispatch settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.heartbeat = .{
+        .enabled = true,
+        .interval_minutes = 1,
+        .prompt = "Review tasks",
+        .model = "openai/gpt-5.4",
+        .timeout_secs = 45,
+        .delivery_mode = "on_error",
+        .delivery_channel = "telegram",
+        .delivery_account_id = "backup",
+        .delivery_to = "-100123:thread:77",
+        .delivery_peer_kind = "group",
+        .delivery_peer_id = "-100123",
+        .delivery_thread_id = "77",
+        .delivery_best_effort = false,
+    };
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"heartbeat\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"every\": \"1m\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"prompt\": \"Review tasks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"model\": \"openai/gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"timeout_secs\": 45") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_mode\": \"on_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_channel\": \"telegram\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_account_id\": \"backup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_to\": \"-100123:thread:77\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_peer_kind\": \"group\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_peer_id\": \"-100123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_thread_id\": \"77\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_best_effort\": false") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    try std.testing.expect(loaded.heartbeat.enabled);
+    try std.testing.expectEqual(@as(u32, 1), loaded.heartbeat.interval_minutes);
+    try std.testing.expectEqualStrings("Review tasks", loaded.heartbeat.prompt.?);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", loaded.heartbeat.model.?);
+    try std.testing.expectEqual(@as(u32, 45), loaded.heartbeat.timeout_secs);
+    try std.testing.expectEqualStrings("on_error", loaded.heartbeat.delivery_mode.?);
+    try std.testing.expectEqualStrings("telegram", loaded.heartbeat.delivery_channel.?);
+    try std.testing.expectEqualStrings("backup", loaded.heartbeat.delivery_account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", loaded.heartbeat.delivery_to.?);
+    try std.testing.expectEqualStrings("group", loaded.heartbeat.delivery_peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", loaded.heartbeat.delivery_peer_id.?);
+    try std.testing.expectEqualStrings("77", loaded.heartbeat.delivery_thread_id.?);
+    try std.testing.expect(!loaded.heartbeat.delivery_best_effort);
 }
 
 test "tools.media.audio disabled" {

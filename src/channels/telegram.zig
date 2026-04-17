@@ -21,6 +21,7 @@ const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
 const TOPIC_TARGET_SEPARATOR = "#topic:";
+const THREAD_TARGET_SEPARATOR = ":thread:";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Attachment Types
@@ -146,15 +147,19 @@ pub const TaskReaction = enum {
 };
 
 fn parseTelegramTarget(target: []const u8) ParsedTelegramTarget {
-    const sep = std.mem.lastIndexOf(u8, target, TOPIC_TARGET_SEPARATOR) orelse return .{ .chat_id = target };
-    const chat_id = target[0..sep];
-    const thread_raw = target[sep + TOPIC_TARGET_SEPARATOR.len ..];
-    if (chat_id.len == 0 or thread_raw.len == 0) return .{ .chat_id = target };
-    const thread_id = std.fmt.parseInt(i64, thread_raw, 10) catch return .{ .chat_id = target };
-    return .{
-        .chat_id = chat_id,
-        .message_thread_id = if (thread_id > 0) thread_id else null,
-    };
+    const separators = [_][]const u8{ THREAD_TARGET_SEPARATOR, TOPIC_TARGET_SEPARATOR };
+    for (separators) |separator| {
+        const sep = std.mem.lastIndexOf(u8, target, separator) orelse continue;
+        const chat_id = target[0..sep];
+        const thread_raw = target[sep + separator.len ..];
+        if (chat_id.len == 0 or thread_raw.len == 0) continue;
+        const thread_id = std.fmt.parseInt(i64, thread_raw, 10) catch continue;
+        return .{
+            .chat_id = chat_id,
+            .message_thread_id = if (thread_id > 0) thread_id else null,
+        };
+    }
+    return .{ .chat_id = target };
 }
 
 pub fn targetChatId(target: []const u8) []const u8 {
@@ -5825,6 +5830,12 @@ test "nextAdaptiveSplitLimit halves toward minimum threshold" {
 
 test "parseTelegramTarget extracts topic suffix" {
     const parsed = parseTelegramTarget("-100123#topic:77");
+    try std.testing.expectEqualStrings("-100123", parsed.chat_id);
+    try std.testing.expectEqual(@as(?i64, 77), parsed.message_thread_id);
+}
+
+test "parseTelegramTarget accepts canonical thread suffix" {
+    const parsed = parseTelegramTarget("-100123:thread:77");
     try std.testing.expectEqualStrings("-100123", parsed.chat_id);
     try std.testing.expectEqual(@as(?i64, 77), parsed.message_thread_id);
 }

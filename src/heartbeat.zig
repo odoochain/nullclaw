@@ -82,7 +82,7 @@ pub const HeartbeatEngine = struct {
     pub fn init(enabled: bool, interval_minutes: u32, workspace_dir: []const u8, observer: ?observability.Observer) HeartbeatEngine {
         return .{
             .enabled = enabled,
-            .interval_minutes = if (interval_minutes < 5) 5 else interval_minutes,
+            .interval_minutes = @max(interval_minutes, 1),
             .workspace_dir = workspace_dir,
             .observer = observer,
         };
@@ -97,7 +97,10 @@ pub const HeartbeatEngine = struct {
     pub fn collectTasks(self: *const HeartbeatEngine, allocator: std.mem.Allocator) ![][]const u8 {
         // Try bootstrap provider first when available.
         if (self.bootstrap_provider) |bp| {
-            const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch null;
+            const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch |err| {
+                log.warn("bootstrap provider failed to load HEARTBEAT.md: {s}", .{@errorName(err)});
+                return &.{};
+            };
             if (bp_content) |content| {
                 defer allocator.free(content);
                 if (isContentEffectivelyEmpty(content)) return &.{};
@@ -337,9 +340,14 @@ test "parseTasksInternal tracks actionable line numbers" {
     try std.testing.expectEqualSlices(usize, &[_]usize{ 3, 5, 7 }, task_line_numbers.items);
 }
 
-test "HeartbeatEngine init clamps interval" {
-    const engine = HeartbeatEngine.init(true, 2, "/tmp", null);
-    try std.testing.expectEqual(@as(u32, 5), engine.interval_minutes);
+test "HeartbeatEngine init clamps zero interval to one minute" {
+    const engine = HeartbeatEngine.init(true, 0, "/tmp", null);
+    try std.testing.expectEqual(@as(u32, 1), engine.interval_minutes);
+}
+
+test "HeartbeatEngine init preserves low interval" {
+    const engine = HeartbeatEngine.init(true, 1, "/tmp", null);
+    try std.testing.expectEqual(@as(u32, 1), engine.interval_minutes);
 }
 
 test "HeartbeatEngine init preserves valid interval" {

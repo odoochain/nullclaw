@@ -400,6 +400,17 @@ pub const ModelRouteConfig = struct {
 pub const HeartbeatConfig = struct {
     enabled: bool = false,
     interval_minutes: u32 = 30,
+    prompt: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    timeout_secs: u32 = 120,
+    delivery_mode: ?[]const u8 = null,
+    delivery_channel: ?[]const u8 = null,
+    delivery_to: ?[]const u8 = null,
+    delivery_account_id: ?[]const u8 = null,
+    delivery_peer_kind: ?[]const u8 = null,
+    delivery_peer_id: ?[]const u8 = null,
+    delivery_thread_id: ?[]const u8 = null,
+    delivery_best_effort: bool = true,
 };
 
 pub const CronConfig = struct {

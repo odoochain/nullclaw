@@ -877,7 +877,40 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                             // Explicit interval_minutes (our internal field)
                             if (hb.object.get("interval_minutes")) |v| {
-                                if (v == .integer) self.heartbeat.interval_minutes = @intCast(v.integer);
+                                if (v == .integer and v.integer >= 0) self.heartbeat.interval_minutes = @intCast(v.integer);
+                            }
+                            if (hb.object.get("prompt")) |v| {
+                                if (v == .string) self.heartbeat.prompt = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("model")) |v| {
+                                if (v == .string) self.heartbeat.model = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("timeout_secs")) |v| {
+                                if (v == .integer and v.integer >= 0) self.heartbeat.timeout_secs = @intCast(v.integer);
+                            }
+                            if (hb.object.get("delivery_mode")) |v| {
+                                if (v == .string) self.heartbeat.delivery_mode = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_channel")) |v| {
+                                if (v == .string) self.heartbeat.delivery_channel = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_to")) |v| {
+                                if (v == .string) self.heartbeat.delivery_to = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_account_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_account_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_peer_kind")) |v| {
+                                if (v == .string) self.heartbeat.delivery_peer_kind = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_peer_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_peer_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_thread_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_thread_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_best_effort")) |v| {
+                                if (v == .bool) self.heartbeat.delivery_best_effort = v.bool;
                             }
                         }
                     }

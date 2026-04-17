@@ -10,6 +10,7 @@
 //! - KV store for settings
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -51,7 +52,7 @@ pub fn shouldUseWal(path: [*:0]const u8) bool {
 /// Returns `false` if the fs is 9p/nfs/cifs/smb3, `true` for others,
 /// `null` if mountinfo is unavailable or unparseable.
 fn checkMountinfo(path: []const u8) ?bool {
-    const file = std.fs.openFileAbsolute("/proc/self/mountinfo", .{}) catch return null;
+    const file = std_compat.fs.openFileAbsolute("/proc/self/mountinfo", .{}) catch return null;
     defer file.close();
 
     var best_len: usize = 0;
@@ -174,8 +175,8 @@ fn checkStatfs(path: [*:0]const u8) bool {
     const path_span = std.mem.span(path);
     if (path_span.len == 0 or std.mem.eql(u8, path_span, ":memory:")) return true;
 
-    const dir_path = std.fs.path.dirname(path_span) orelse ".";
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = std_compat.fs.path.dirname(path_span) orelse ".";
+    var dir_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
     if (dir_path.len + 1 > dir_buf.len) return true;
     @memcpy(dir_buf[0..dir_path.len], dir_path);
     dir_buf[dir_path.len] = 0;
@@ -615,7 +616,7 @@ pub const SqliteMemory = struct {
         if (category) |cat| {
             const cat_str = cat.toString();
             const sql = "SELECT id, key, content, category, created_at, session_id FROM memories " ++
-                "WHERE category = ?1 ORDER BY updated_at DESC";
+                "WHERE category = ?1 ORDER BY updated_at DESC, id DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -637,7 +638,7 @@ pub const SqliteMemory = struct {
                 } else break;
             }
         } else {
-            const sql = "SELECT id, key, content, category, created_at, session_id FROM memories ORDER BY updated_at DESC";
+            const sql = "SELECT id, key, content, category, created_at, session_id FROM memories ORDER BY updated_at DESC, id DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -656,6 +657,60 @@ pub const SqliteMemory = struct {
                     try entries.append(allocator, entry);
                 } else break;
             }
+        }
+
+        return entries.toOwnedSlice(allocator);
+    }
+
+    fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        var entries: std.ArrayList(MemoryEntry) = .empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(allocator);
+            entries.deinit(allocator);
+        }
+
+        const sql = if (category != null and session_id != null)
+            "SELECT id, key, content, category, created_at, session_id FROM memories WHERE category = ?1 AND session_id = ?2 ORDER BY updated_at DESC, id DESC LIMIT ?3 OFFSET ?4"
+        else if (category != null)
+            "SELECT id, key, content, category, created_at, session_id FROM memories WHERE category = ?1 ORDER BY updated_at DESC, id DESC LIMIT ?2 OFFSET ?3"
+        else if (session_id != null)
+            "SELECT id, key, content, category, created_at, session_id FROM memories WHERE session_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT ?2 OFFSET ?3"
+        else
+            "SELECT id, key, content, category, created_at, session_id FROM memories ORDER BY updated_at DESC, id DESC LIMIT ?1 OFFSET ?2";
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (category != null and session_id != null) {
+            const cat_str = category.?.toString();
+            _ = c.sqlite3_bind_text(stmt, 1, cat_str.ptr, @intCast(cat_str.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(stmt, 2, session_id.?.ptr, @intCast(session_id.?.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(stmt, 3, @intCast(limit));
+            _ = c.sqlite3_bind_int64(stmt, 4, @intCast(offset));
+        } else if (category) |cat| {
+            const cat_str = cat.toString();
+            _ = c.sqlite3_bind_text(stmt, 1, cat_str.ptr, @intCast(cat_str.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+            _ = c.sqlite3_bind_int64(stmt, 3, @intCast(offset));
+        } else if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 1, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+            _ = c.sqlite3_bind_int64(stmt, 3, @intCast(offset));
+        } else {
+            _ = c.sqlite3_bind_int64(stmt, 1, @intCast(limit));
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(offset));
+        }
+
+        while (true) {
+            rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_ROW) {
+                const entry = try readEntryFromRow(stmt.?, allocator);
+                try entries.append(allocator, entry);
+            } else break;
         }
 
         return entries.toOwnedSlice(allocator);
@@ -740,6 +795,7 @@ pub const SqliteMemory = struct {
         .get = &implGet,
         .getScoped = &implGetScoped,
         .list = &implList,
+        .listPaged = &implListPaged,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,
         .count = &implCount,
@@ -1322,14 +1378,14 @@ pub const SqliteMemory = struct {
     }
 
     fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.timestamp();
+        const ts = std_compat.time.timestamp();
         return std.fmt.allocPrint(allocator, "{d}", .{ts});
     }
 
     fn generateId(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.nanoTimestamp();
+        const ts = std_compat.time.nanoTimestamp();
         var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf);
+        std_compat.crypto.random.bytes(&buf);
         const rand_hi = std.mem.readInt(u64, buf[0..8], .little);
         const rand_lo = std.mem.readInt(u64, buf[8..16], .little);
         return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, rand_hi, rand_lo });
@@ -2484,6 +2540,28 @@ test "sqlite same key can exist in global and scoped namespaces" {
     try std.testing.expect(scoped_entry.session_id != null);
     try std.testing.expectEqualStrings("sess-new", scoped_entry.session_id.?);
     try std.testing.expectEqualStrings("v2", scoped_entry.content);
+}
+
+test "sqlite listPaged respects limit offset and filters" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("a", "one", .core, null);
+    try m.store("b", "two", .core, null);
+    try m.store("c", "three", .daily, null);
+    try m.store("d", "four", .core, "sess-1");
+
+    const core_page = try m.listPaged(std.testing.allocator, .core, null, 1, 1);
+    defer root.freeEntries(std.testing.allocator, core_page);
+    try std.testing.expectEqual(@as(usize, 1), core_page.len);
+    try std.testing.expectEqualStrings("b", core_page[0].key);
+
+    const scoped_page = try m.listPaged(std.testing.allocator, null, "sess-1", 5, 0);
+    defer root.freeEntries(std.testing.allocator, scoped_page);
+    try std.testing.expectEqual(@as(usize, 1), scoped_page.len);
+    try std.testing.expectEqualStrings("d", scoped_page[0].key);
+    try std.testing.expectEqualStrings("sess-1", scoped_page[0].session_id.?);
 }
 
 test "sqlite scoped forget removes only matching namespace" {

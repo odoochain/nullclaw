@@ -33,7 +33,7 @@ If Android kills the process under memory pressure, that is an Android / Termux 
 
 ## Prerequisites
 
-- **Zig 0.15.2 exactly**
+- **Zig 0.16.0 exactly**
 - Git
 - enough local storage for the repository and build cache
 
@@ -43,7 +43,7 @@ Verify Zig before building:
 zig version
 ```
 
-The output must be `0.15.2`.
+The output must be `0.16.0`.
 
 ## Native Termux Build
 
@@ -94,10 +94,10 @@ the usual cause is the wrong Zig version, not the NullClaw source tree.
 Checklist:
 
 1. Run `zig version`.
-2. Confirm it prints `0.15.2`.
+2. Confirm it prints `0.16.0`.
 3. If it does not, replace the Zig package/binary before trying again.
 
-Do not patch `build.zig.zon` locally to work around an older Zig build. The project is pinned to Zig 0.15.2.
+Do not patch `build.zig.zon` locally to work around an older Zig build. The project is pinned to Zig 0.16.0.
 
 ## First Runtime Check
 

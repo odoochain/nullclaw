@@ -118,9 +118,9 @@ nullclaw --help
 
 ### 2) Build from source
 
-> **Prerequisite:** use **Zig 0.15.2** (exact version).
-> `0.16.0-dev` and other Zig versions are currently unsupported and may fail to build.
-> Verify before building: `zig version` should print `0.15.2`.
+> **Prerequisite:** use **Zig 0.16.0** (exact version).
+> Other Zig versions are currently unsupported and may fail to build.
+> Verify before building: `zig version` should print `0.16.0`.
 
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
@@ -766,14 +766,14 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
 | `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
 | `doctor` | Diagnose system health |
-| `status` | Show full system status |
-| `channel list\|start\|status\|add\|remove` | Manage channels |
-| `cron list\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
-| `skills list\|install\|remove\|info` | Manage skill packs |
+| `status [--json]` | Show full system status or emit the machine-readable runtime snapshot |
+| `channel list\|info\|start\|status\|add\|remove` | Manage channels, including JSON account inventory for automation |
+| `cron list\|status\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
+| `skills list\|install\|remove\|info` | Manage skill packs, including `install --name <query>` registry search |
 | `history list\|show` | View session conversation history |
 | `memory stats\|count\|reindex\|search\|get\|list\|drain-outbox\|forget` | Inspect and maintain memory |
 | `hardware scan\|flash\|monitor` | Hardware device management |
-| `models list\|info\|benchmark\|refresh` | Model catalog |
+| `config show\|get`, `models list\|summary\|info\|benchmark\|refresh` | Read config/model admin state and manage the model catalog |
 | `workspace edit\|reset-md` | Maintain workspace markdown/bootstrap files |
 | `capabilities [--json]` | Show runtime capabilities manifest |
 | `auth login\|status\|logout` | Manage OAuth authentication |
@@ -782,7 +782,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 
 ## Development
 
-Build and tests are pinned to **Zig 0.15.2**.
+Build and tests are pinned to **Zig 0.16.0**.
 
 ```bash
 zig build                          # Dev build
@@ -803,7 +803,7 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 ### Project Stats
 
 ```
-Language:     Zig 0.15.2
+Language:     Zig 0.16.0
 Source files: ~250
 Lines of code: ~249,000
 Tests:        5,300+

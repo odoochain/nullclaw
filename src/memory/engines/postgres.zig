@@ -4,6 +4,7 @@
 //! When disabled, this file provides only pure-logic helpers and their tests.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -66,14 +67,14 @@ pub fn buildQuery(allocator: std.mem.Allocator, template: []const u8, schema_q: 
 }
 
 fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
-    const ts = std.time.timestamp();
+    const ts = std_compat.time.timestamp();
     return std.fmt.allocPrint(allocator, "{d}", .{ts});
 }
 
 fn generateId(allocator: std.mem.Allocator) ![]u8 {
-    const ts = std.time.nanoTimestamp();
+    const ts = std_compat.time.nanoTimestamp();
     var buf: [16]u8 = undefined;
-    std.crypto.random.bytes(&buf);
+    std_compat.crypto.random.bytes(&buf);
     const rand_hi = std.mem.readInt(u64, buf[0..8], .little);
     const rand_lo = std.mem.readInt(u64, buf[8..16], .little);
     return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, rand_hi, rand_lo });
@@ -644,6 +645,94 @@ const PostgresMemoryImpl = struct {
         return entries.toOwnedSlice(allocator);
     }
 
+    fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const template = if (category != null and session_id != null)
+            "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 AND session_id = $2 AND instance_id = $3 ORDER BY updated_at DESC, id DESC LIMIT $4 OFFSET $5"
+        else if (category != null)
+            "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 AND instance_id = $2 ORDER BY updated_at DESC, id DESC LIMIT $3 OFFSET $4"
+        else if (session_id != null)
+            "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE session_id = $1 AND instance_id = $2 ORDER BY updated_at DESC, id DESC LIMIT $3 OFFSET $4"
+        else
+            "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE instance_id = $1 ORDER BY updated_at DESC, id DESC LIMIT $2 OFFSET $3";
+
+        const query = try buildQuery(allocator, template, self_.schema_q, self_.table_q);
+        defer allocator.free(query);
+
+        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        defer allocator.free(iid_z);
+
+        var limit_buf: [20]u8 = undefined;
+        const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+        var offset_buf: [20]u8 = undefined;
+        const offset_str = try std.fmt.bufPrintZ(&offset_buf, "{d}", .{offset});
+
+        var result: *c.PGresult = undefined;
+        if (category) |cat| {
+            const cat_str = cat.toString();
+            const cat_z = try allocator.dupeZ(u8, cat_str);
+            defer allocator.free(cat_z);
+            if (session_id) |sid| {
+                const sid_z = try allocator.dupeZ(u8, sid);
+                defer allocator.free(sid_z);
+                const params = [_]?[*:0]const u8{ cat_z, sid_z, iid_z, limit_str.ptr, offset_str.ptr };
+                const lengths = [_]c_int{
+                    @intCast(cat_str.len),
+                    @intCast(sid.len),
+                    @intCast(self_.instance_id.len),
+                    @intCast(std.mem.len(limit_str)),
+                    @intCast(std.mem.len(offset_str)),
+                };
+                result = try self_.execParams(query, &params, &lengths);
+            } else {
+                const params = [_]?[*:0]const u8{ cat_z, iid_z, limit_str.ptr, offset_str.ptr };
+                const lengths = [_]c_int{
+                    @intCast(cat_str.len),
+                    @intCast(self_.instance_id.len),
+                    @intCast(std.mem.len(limit_str)),
+                    @intCast(std.mem.len(offset_str)),
+                };
+                result = try self_.execParams(query, &params, &lengths);
+            }
+        } else if (session_id) |sid| {
+            const sid_z = try allocator.dupeZ(u8, sid);
+            defer allocator.free(sid_z);
+            const params = [_]?[*:0]const u8{ sid_z, iid_z, limit_str.ptr, offset_str.ptr };
+            const lengths = [_]c_int{
+                @intCast(sid.len),
+                @intCast(self_.instance_id.len),
+                @intCast(std.mem.len(limit_str)),
+                @intCast(std.mem.len(offset_str)),
+            };
+            result = try self_.execParams(query, &params, &lengths);
+        } else {
+            const params = [_]?[*:0]const u8{ iid_z, limit_str.ptr, offset_str.ptr };
+            const lengths = [_]c_int{
+                @intCast(self_.instance_id.len),
+                @intCast(std.mem.len(limit_str)),
+                @intCast(std.mem.len(offset_str)),
+            };
+            result = try self_.execParams(query, &params, &lengths);
+        }
+        defer c.PQclear(result);
+
+        const nrows = c.PQntuples(result);
+        var entries: std.ArrayList(MemoryEntry) = .empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(allocator);
+            entries.deinit(allocator);
+        }
+
+        var row: c_int = 0;
+        while (row < nrows) : (row += 1) {
+            const entry = try readEntryFromResult(allocator, result, row);
+            try entries.append(allocator, entry);
+        }
+
+        return entries.toOwnedSlice(allocator);
+    }
+
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -703,6 +792,7 @@ const PostgresMemoryImpl = struct {
         .recall = &implRecall,
         .get = &implGet,
         .list = &implList,
+        .listPaged = &implListPaged,
         .forget = &implForget,
         .count = &implCount,
         .healthCheck = &implHealthCheck,

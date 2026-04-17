@@ -24,7 +24,7 @@ This guide covers the main installation paths for macOS, Linux, and Windows.
 
 ## Prerequisites
 
-- If building from source, use **Zig 0.15.2**.
+- If building from source, use **Zig 0.16.0**.
 - Git (required for source install).
 
 Check Zig version:
@@ -33,7 +33,7 @@ Check Zig version:
 zig version
 ```
 
-The output must be `0.15.2`.
+The output must be `0.16.0`.
 
 ## Option 1: Homebrew (recommended for macOS/Linux)
 
@@ -162,7 +162,7 @@ zig build -Doptimize=ReleaseSmall
 
 Notes:
 
-- Use **Zig 0.15.2** exactly.
+- Use **Zig 0.16.0** exactly.
 - If `zig build` fails immediately, verify the Zig version first.
 - This uses the native target of the current Termux environment, so you usually do **not** need `-Dtarget`.
 - On Android / Termux, prefer foreground use first (`agent`, `gateway`) before trying to manage it as a background service.

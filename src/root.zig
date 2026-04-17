@@ -7,6 +7,7 @@
 
 // Shared utilities
 pub const json_util = @import("json_util.zig");
+pub const admin_output = @import("admin_output.zig");
 pub const http_util = @import("http_util.zig");
 pub const net_security = @import("net_security.zig");
 pub const websocket = @import("websocket.zig");
@@ -31,6 +32,8 @@ pub const control_plane = @import("control_plane.zig");
 pub const channel_loop = @import("channel_loop.zig");
 pub const channel_manager = @import("channel_manager.zig");
 pub const channel_catalog = @import("channel_catalog.zig");
+pub const channel_admin = @import("channel_admin.zig");
+pub const mcp_admin = @import("mcp_admin.zig");
 pub const migration = @import("migration.zig");
 pub const sse_client = @import("sse_client.zig");
 pub const update = @import("update.zig");

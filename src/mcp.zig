@@ -4,6 +4,7 @@
 //! the standard Tool vtable so the agent can call them like any built-in tool.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const tools_mod = @import("tools/root.zig");
 const config_mod = @import("config.zig");
 const json_util = @import("json_util.zig");
@@ -11,6 +12,7 @@ const version = @import("version.zig");
 const platform = @import("platform.zig");
 const http_util = @import("http_util.zig");
 const sse_client = @import("sse_client.zig");
+const util = @import("util.zig");
 const verbose = @import("verbose.zig");
 const Allocator = std.mem.Allocator;
 
@@ -32,8 +34,8 @@ pub const McpServer = struct {
     allocator: Allocator,
     name: []const u8,
     config: McpServerConfig,
-    child: ?std.process.Child,
-    http_client: ?std.http.Client,
+    child: ?std_compat.process.Child,
+    http_client: ?http_util.ProxyHttpClient,
     next_id: u32,
     mcp_session_id: ?[]u8,
 
@@ -83,20 +85,20 @@ pub const McpServer = struct {
 
     fn connectStdio(self: *McpServer) !void {
         // Build argv: command + args
-        var argv_list: std.ArrayList([]const u8) = .{};
+        var argv_list: std.ArrayList([]const u8) = .empty;
         defer argv_list.deinit(self.allocator);
         try argv_list.append(self.allocator, self.config.command);
         for (self.config.args) |a| {
             try argv_list.append(self.allocator, a);
         }
 
-        var child = std.process.Child.init(argv_list.items, self.allocator);
+        var child = std_compat.process.Child.init(argv_list.items, self.allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
         // Build environment: inherit parent + config overrides
-        var env = std.process.EnvMap.init(self.allocator);
+        var env = std_compat.process.EnvMap.init(self.allocator);
         defer env.deinit();
         // Add PATH, HOME, etc. from parent
         const inherit_vars = [_][]const u8{
@@ -128,7 +130,7 @@ pub const McpServer = struct {
         _ = std.Uri.parse(url) catch return error.InvalidHttpUrl;
         if (!McpServerConfig.isValidHttpUrl(url)) return error.InvalidHttpUrl;
 
-        self.http_client = std.http.Client{ .allocator = self.allocator };
+        self.http_client = try http_util.ProxyHttpClient.init(self.allocator);
     }
 
     /// Request the list of tools from the MCP server.
@@ -196,7 +198,8 @@ pub const McpServer = struct {
             defer allocator.free(resp.headers);
             if (resp.status_code < 200 or resp.status_code >= 300) {
                 const max_body: usize = 4096;
-                const body_truncated = if (resp.body.len > max_body) resp.body[0..max_body] else resp.body;
+                // NOTE: Log-only preview path; UTF-8 boundary coverage lives in util.previewUtf8 tests.
+                const body_truncated = util.previewUtf8(resp.body, max_body).slice;
                 if (verbose.isVerbose()) {
                     log.err("MCP server '{s}': HTTP {d}: {s}", .{ self.name, resp.status_code, body_truncated });
                 } else {
@@ -289,7 +292,6 @@ pub const McpServer = struct {
         var timeout_buf: [16]u8 = undefined;
         const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
 
-        // std.http.Client.fetch has no request timeout control in Zig 0.15.
         // Use curl so timeouts are enforced.
         var header_lines: std.ArrayListUnmanaged([]u8) = .empty;
         defer {
@@ -325,7 +327,7 @@ pub const McpServer = struct {
     }
 
     fn readLine(self: *McpServer, allocator: Allocator) ![]const u8 {
-        var line_buf: std.ArrayList(u8) = .{};
+        var line_buf: std.ArrayList(u8) = .empty;
         errdefer line_buf.deinit(allocator);
         var byte: [1]u8 = undefined;
         const stdout = self.child.?.stdout orelse return error.NoStdout;
@@ -360,7 +362,7 @@ pub fn parseToolsListResponse(allocator: Allocator, resp: []const u8) ![]McpTool
     const tools_val = result.object.get("tools") orelse return error.MissingResult;
     if (tools_val != .array) return error.InvalidJson;
 
-    var list: std.ArrayList(McpToolDef) = .{};
+    var list: std.ArrayList(McpToolDef) = .empty;
     errdefer list.deinit(allocator);
 
     for (tools_val.array.items) |item| {
@@ -411,7 +413,7 @@ pub fn parseCallToolResponse(allocator: Allocator, resp: []const u8) ![]const u8
     if (content != .array) return error.InvalidJson;
 
     // Collect all text content
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
     for (content.array.items) |item| {
@@ -502,7 +504,7 @@ pub const McpToolWrapper = struct {
 /// tools, and returns them wrapped in the standard Tool vtable.
 /// Errors from individual servers are logged and skipped.
 pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]tools_mod.Tool {
-    var all_tools: std.ArrayList(tools_mod.Tool) = .{};
+    var all_tools: std.ArrayList(tools_mod.Tool) = .empty;
     errdefer {
         for (all_tools.items) |t| {
             t.deinit(allocator);

@@ -218,10 +218,9 @@ pub fn resolveThreadParentSessionKey(key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Find the default agent from a named agents list.
-/// Returns the first agent's name, or "main" if the list is empty.
-pub fn findDefaultAgent(agents: []const NamedAgentConfig) []const u8 {
-    if (agents.len > 0) return agents[0].name;
+/// Find the default agent when no binding matches.
+/// The fallback must always remain the reserved root agent id `main`.
+pub fn findDefaultAgent(_: []const NamedAgentConfig) []const u8 {
     return "main";
 }
 
@@ -503,7 +502,9 @@ test "resolveRoute — no bindings returns default agent" {
     defer allocator.free(route.session_key);
     defer allocator.free(route.main_session_key);
 
-    try std.testing.expectEqualStrings("helper", route.agent_id);
+    // Regression: unbound traffic must stay on the reserved root agent
+    // instead of implicitly routing to the first named subagent.
+    try std.testing.expectEqualStrings("main", route.agent_id);
     try std.testing.expectEqual(MatchedBy.default, route.matched_by);
     try std.testing.expectEqualStrings("discord", route.channel);
     try std.testing.expectEqualStrings("acct1", route.account_id);
@@ -792,13 +793,13 @@ test "findDefaultAgent — empty list returns main" {
     try std.testing.expectEqualStrings("main", result);
 }
 
-test "findDefaultAgent — returns first agent name" {
+test "findDefaultAgent — ignores named agents and returns main" {
     const agents = [_]NamedAgentConfig{
         .{ .name = "alpha", .provider = "openai", .model = "gpt-4" },
         .{ .name = "beta", .provider = "anthropic", .model = "claude-3" },
     };
     const result = findDefaultAgent(&agents);
-    try std.testing.expectEqualStrings("alpha", result);
+    try std.testing.expectEqualStrings("main", result);
 }
 
 test "peerMatches — both present and equal" {
@@ -1146,8 +1147,8 @@ test "resolveRoute — defaultAgentId used when no binding matches" {
     }, &.{}, &agents);
     defer allocator.free(route.session_key);
     defer allocator.free(route.main_session_key);
-    try std.testing.expectEqualStrings("home", route.agent_id);
-    try std.testing.expectEqualStrings("agent:home:main", route.main_session_key);
+    try std.testing.expectEqualStrings("main", route.agent_id);
+    try std.testing.expectEqualStrings("agent:main:main", route.main_session_key);
 }
 
 test "resolveRoute — peer+guild binding requires guild match" {

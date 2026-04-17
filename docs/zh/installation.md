@@ -10,7 +10,7 @@
 
 ## 前置要求
 
-- 如果走源码构建：必须使用 **Zig 0.15.2**。
+- 如果走源码构建：必须使用 **Zig 0.16.0**。
 - Git（源码安装需要）。
 
 检查 Zig 版本：
@@ -19,7 +19,7 @@
 zig version
 ```
 
-输出必须是 `0.15.2`。
+输出必须是 `0.16.0`。
 
 ## 方式一：使用二进制文件
 ### Homebrew（macOS/Linux推荐）
@@ -158,7 +158,7 @@ zig build -Doptimize=ReleaseSmall
 
 说明：
 
-- 必须使用 **Zig 0.15.2**
+- 必须使用 **Zig 0.16.0**
 - 如果 `zig build` 一开始就失败，先确认 Zig 版本
 - Termux 原生构建使用当前环境的 native target，通常不需要手动传 `-Dtarget`
 - 在 Android / Termux 上，建议先跑前台命令（如 `agent`、`gateway`），确认没问题后再考虑后台托管

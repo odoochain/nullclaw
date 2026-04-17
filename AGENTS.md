@@ -53,18 +53,18 @@ These codebase realities should drive every design decision:
    - `src/gateway.zig`, `src/security/`, `src/tools/`, `src/runtime.zig` carry high blast radius.
    - Defaults are secure-by-default (pairing, HTTPS-only, allowlists, AEAD encryption). Keep it that way.
 
-4. **Zig 0.15.2 API is the baseline — no newer features**
+4. **Zig 0.16.0 API is the baseline — no newer features**
    - HTTP client: `std.http.Client.fetch()` with `std.Io.Writer.Allocating` for response body capture.
    - Child processes: `std.process.Child.init(argv, allocator)`, `.Pipe` (capitalized).
    - stdout: `std.fs.File.stdout().writer(&buf)` → use `.interface` for `print`/`flush`.
-   - `std.io.getStdOut()` does NOT exist in 0.15 — use `std.fs.File.stdout()`.
+   - `std.io.getStdOut()` does NOT exist in the current Zig stdlib — use `std.fs.File.stdout()`.
    - SQLite: linked via `/opt/homebrew/opt/sqlite/{lib,include}` on the compile step, not the module.
    - `ArrayListUnmanaged`: init with `.empty`, pass allocator to every method.
 
 5. **All 5,640+ tests must pass at zero leaks**
    - The test suite uses `std.testing.allocator` (leak-detecting GPA). Every allocation must be freed.
    - `Config.load()` allocates — always wrap in `std.heap.ArenaAllocator` in tests and production.
-   - `ChaCha20Poly1305.decrypt` segfaults on tag failure with heap-allocated output on macOS/Zig 0.15 — use a stack buffer then `allocator.dupe()`.
+   - `ChaCha20Poly1305.decrypt` can segfault on tag failure with heap-allocated output on macOS with older Zig toolchains — use a stack buffer then `allocator.dupe()`.
 
 ## 3) Engineering Principles (Normative)
 
@@ -279,7 +279,7 @@ To bypass a hook in an emergency: `git commit --no-verify` / `git push --no-veri
 
 - Do not add C dependencies or large Zig packages without strong justification (binary size impact).
 - Do not return vtable interfaces pointing to temporaries — dangling pointer.
-- Do not use `std.io.getStdOut()` — it does not exist in Zig 0.15.
+- Do not use `std.io.getStdOut()` — it does not exist in Zig 0.16.
 - Do not silently weaken security policy or access constraints.
 - Do not add speculative config/feature flags "just in case".
 - Do not skip `defer allocator.free(...)` — every allocation must be freed.
@@ -307,5 +307,5 @@ When working in fast iterative mode:
 - Validate assumptions with code search before implementing.
 - Prefer deterministic behavior over clever shortcuts.
 - Do not "ship and hope" on security-sensitive paths.
-- If uncertain about Zig 0.15 API, check `src/` for existing usage patterns before guessing.
+- If uncertain about Zig 0.16 API, check `src/` for existing usage patterns before guessing.
 - If uncertain about architecture, read the vtable interface definition before implementing.

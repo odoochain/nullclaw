@@ -61,6 +61,7 @@ pub const convertToolsOpenAI = helpers.convertToolsOpenAI;
 pub const serializeMessageContent = helpers.serializeMessageContent;
 pub const serializeContentPart = helpers.serializeContentPart;
 pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
+pub const convertToolsResponses = helpers.convertToolsResponses;
 pub const curlPostTimed = helpers.curlPostTimed;
 pub const curlPostFormTimed = helpers.curlPostFormTimed;
 pub const extractContent = helpers.extractContent;

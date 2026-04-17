@@ -5,6 +5,7 @@
 //! Pattern follows store_qdrant.zig: std.http.Client + std.Io.Writer.Allocating.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const root = @import("../root.zig");
@@ -134,7 +135,6 @@ pub const ApiMemory = struct {
         method: std.http.Method,
         payload: ?[]const u8,
     ) !HttpResponse {
-        // Zig 0.15 std.http fetch has no request timeout control.
         // Use curl subprocess so `timeout_ms` is guaranteed to apply.
         const timeout_secs: u32 = @max(@as(u32, 1), (self.timeout_ms + 999) / 1000);
         var timeout_buf: [16]u8 = undefined;
@@ -187,7 +187,7 @@ pub const ApiMemory = struct {
         argv_buf[argc] = url;
         argc += 1;
 
-        var child = std.process.Child.init(argv_buf[0..argc], alloc);
+        var child = std_compat.process.Child.init(argv_buf[0..argc], alloc);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
@@ -199,7 +199,7 @@ pub const ApiMemory = struct {
 
         const term = child.wait() catch return error.ApiConnectionError;
         switch (term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code != 0) {
                     if (code == 28) return error.ApiTimeout;
                     return error.ApiConnectionError;

@@ -17,6 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const std_compat = @import("compat");
 const streaming = @import("../streaming.zig");
 const outbound = @import("../outbound.zig");
 const log = std.log.scoped(.channels);
@@ -290,6 +291,7 @@ pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
 pub const wechat = @import("wechat.zig");
 pub const wecom = @import("wecom.zig");
+pub const weixin = @import("weixin.zig");
 pub const nostr = @import("nostr.zig");
 pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
@@ -494,7 +496,7 @@ pub fn isAllowedExactScoped(comptime scope: []const u8, allowed: []const []const
 
 /// Get current UNIX epoch seconds.
 pub fn nowEpochSecs() u64 {
-    const ns = std.time.nanoTimestamp();
+    const ns = std_compat.time.nanoTimestamp();
     if (ns < 0) return 0;
     return @intCast(@as(u128, @intCast(ns)) / 1_000_000_000);
 }
@@ -503,7 +505,7 @@ pub fn nowEpochSecs() u64 {
 // Shared Utilities (re-exported from top-level modules)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// HTTP POST via curl subprocess (safe on Zig 0.15, avoids std.http.Client segfaults).
+/// HTTP POST via curl subprocess with explicit timeout/error semantics.
 pub const http_util = @import("../http_util.zig");
 
 /// JSON string escaping (RFC 8259). appendJsonString adds enclosing quotes.

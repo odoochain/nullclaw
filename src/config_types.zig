@@ -90,6 +90,25 @@ pub const ProviderEntry = struct {
     /// request bodies for OpenAI-compatible providers. The encoded value must
     /// be a JSON object.
     extra_body_params: ?[]const u8 = null,
+
+    /// Provider base URLs must be absolute http(s) URLs with no query/fragment.
+    /// Plain HTTP is accepted only for local/private hosts so intentional
+    /// loopback and LAN providers keep working.
+    pub fn isValidBaseUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n?#") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        if (uri.query != null or uri.fragment != null) return false;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+        if (!is_https and !is_http) return false;
+
+        const host = net_security.extractHost(trimmed) orelse return false;
+        if (is_http and !net_security.isLocalHost(host)) return false;
+        return true;
+    }
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────
@@ -140,18 +159,61 @@ pub const DiagnosticsConfig = struct {
     token_usage_ledger_max_lines: u64 = 0,
 
     /// OTLP endpoint must be an absolute HTTPS URL, or a local/private HTTP URL
-    /// when exporting to a collector on the same machine or private network.
+    /// when exporting to a collector on the same machine, private network, or
+    /// container runtime bridge.
     pub fn isValidOtelEndpoint(raw: []const u8) bool {
         var trimmed = std.mem.trim(u8, raw, " \t\r\n");
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
             trimmed = trimmed[0 .. trimmed.len - 1];
         }
         if (trimmed.len == 0) return false;
-        if (!McpServerConfig.isValidHttpUrl(trimmed)) return false;
 
         const uri = std.Uri.parse(trimmed) catch return false;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+        if (!is_https and !is_http) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+        if (host[0] == ':') return false;
+
+        if (is_http and !isPrivateOtelCollectorHost(host)) return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
         if (uri.query != null or uri.fragment != null) return false;
+        if (uri.port) |port| if (port == 0) return false;
         return true;
+    }
+
+    fn isPrivateOtelCollectorHost(host: []const u8) bool {
+        if (net_security.isLocalHost(host)) return true;
+
+        const bare = if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]"))
+            host[1 .. host.len - 1]
+        else
+            host;
+        if (bare.len == 0) return false;
+
+        // Container networks commonly expose services by a single-label DNS
+        // name such as `otel`. Keep the plaintext OTEL exception scoped to
+        // runtime-local service names rather than broader dotted domains.
+        if (std.mem.indexOfScalar(u8, bare, '.') == null and std.mem.indexOfScalar(u8, bare, ':') == null) {
+            return true;
+        }
+
+        return false;
     }
 };
 
@@ -594,6 +656,17 @@ pub const WeComConfig = struct {
     allow_from: []const []const u8 = &.{},
 };
 
+pub const WeixinConfig = struct {
+    account_id: []const u8 = "default",
+    /// Bot token obtained from iLink QR code login flow.
+    token: []const u8 = "",
+    /// iLink API base URL (may be region-specific after login redirect).
+    base_url: []const u8 = "https://ilinkai.weixin.qq.com/",
+    /// Optional HTTP proxy URL for API requests.
+    proxy: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
+};
+
 pub const SignalConfig = struct {
     account_id: []const u8 = "default",
     http_url: []const u8,
@@ -933,6 +1006,7 @@ pub const ChannelsConfig = struct {
     dingtalk: []const DingTalkConfig = &.{},
     wechat: []const WeChatConfig = &.{},
     wecom: []const WeComConfig = &.{},
+    weixin: []const WeixinConfig = &.{},
     signal: []const SignalConfig = &.{},
     email: []const EmailConfig = &.{},
     line: []const LineConfig = &.{},
@@ -1000,6 +1074,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn wecomPrimary(self: *const ChannelsConfig) ?WeComConfig {
         return primaryAccount(WeComConfig, self.wecom);
+    }
+    pub fn weixinPrimary(self: *const ChannelsConfig) ?WeixinConfig {
+        return primaryAccount(WeixinConfig, self.weixin);
     }
     pub fn emailPrimary(self: *const ChannelsConfig) ?EmailConfig {
         return primaryAccount(EmailConfig, self.email);
@@ -1436,8 +1513,9 @@ pub const HttpRequestConfig = struct {
     /// Allowed forms:
     ///   - https://host
     ///   - https://host/search
-    ///   - http://localhost[:port]
-    ///   - http://localhost[:port]/search
+    ///   - http://localhost[:port][/search]
+    ///   - http://192.168.1.10[:port][/search]
+    ///   - http://searx.local[:port][/search]
     pub fn isValidSearchBaseUrl(raw: []const u8) bool {
         return search_base_url.isValid(raw);
     }
@@ -1801,6 +1879,8 @@ test "McpServerConfig http url validation" {
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://localhost:6000/mcp"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://foo.localhost:6000/mcp"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://mcp.local:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://host.docker.internal:6000/mcp"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("http://host.containers.internal:6000/mcp"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://127.0.0.1:6000/mcp"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://10.0.0.1:8080/rpc"));
     try std.testing.expect(McpServerConfig.isValidHttpUrl("http://192.168.1.1:8080/rpc"));
@@ -1824,7 +1904,11 @@ test "DiagnosticsConfig otel endpoint validation" {
     try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://localhost:4318"));
     try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://127.0.0.1:4318"));
     try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://10.0.0.5:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://otel:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://host.docker.internal:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://host.containers.internal:4318"));
     try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("http://otel.example.com:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("http://otel.example.internal:4318"));
     try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com?x=1"));
     try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com#frag"));
     try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("ftp://otel.example.com"));
@@ -1856,6 +1940,16 @@ test "HttpRequestConfig proxy URL validation" {
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://:8080"));
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com/path"));
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com?x=1"));
+}
+
+test "ProviderEntry base URL validation keeps local providers and rejects remote http" {
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("https://api.example.com/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://localhost:1234/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://127.0.0.1:1234/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://192.168.1.10:1234/v1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("http://api.example.com/v1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("https://api.example.com/v1?x=1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("ftp://api.example.com/v1"));
 }
 
 test "WebConfig normalizePath trims and normalizes" {
@@ -1954,6 +2048,8 @@ test "HttpRequestConfig search base URL validation" {
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/search/"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://192.168.1.10:8888/search"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.local/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://host.docker.internal:8888/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://host.containers.internal:8888/search"));
 
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("ftp://searx.example.com"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://"));

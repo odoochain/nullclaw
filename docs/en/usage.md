@@ -71,9 +71,9 @@ nullclaw gateway
 For long-running deployments:
 
 - macOS uses `launchctl`.
-- Linux uses `systemd --user` when available and falls back to OpenRC on Alpine/OpenRC systems.
+- Linux uses `systemd --user` when available and falls back to OpenRC or SysVinit when the required runtime is present.
 - Windows uses the Service Control Manager.
-- If Linux has neither working `systemd --user` nor the required OpenRC commands, service subcommands fail; use foreground `nullclaw gateway` or another supervisor instead.
+- If Linux has neither working `systemd --user` nor the required OpenRC/SysVinit support, service subcommands fail; use foreground `nullclaw gateway` or another supervisor instead.
 
 ```bash
 nullclaw service install

@@ -4,7 +4,7 @@ env:
   ANDROID_API_LEVEL: 24
   ANDROID_NDK_VERSION: 29.0.14206865
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
 
 on:
   push:
@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.16.0
         run: bash .github/scripts/install-zig.sh "${ZIG_VERSION}"
 
       - name: Cache Zig build outputs

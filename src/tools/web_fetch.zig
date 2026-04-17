@@ -11,6 +11,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
 const http_util = @import("../http_util.zig");
+const util = @import("../util.zig");
 
 const log = std.log.scoped(.web_fetch);
 
@@ -137,19 +138,21 @@ pub const WebFetchTool = struct {
         const extracted = try htmlToText(allocator, body);
         defer allocator.free(extracted);
 
-        // Truncate if needed
-        if (extracted.len > max_chars) {
-            const truncated = try std.fmt.allocPrint(
-                allocator,
-                "{s}\n\n[Content truncated at {d} chars, total {d} chars]",
-                .{ extracted[0..max_chars], max_chars, extracted.len },
-            );
-            return ToolResult{ .success = true, .output = truncated };
-        }
-
-        return ToolResult{ .success = true, .output = try allocator.dupe(u8, extracted) };
+        return ToolResult{ .success = true, .output = try formatExtractedText(allocator, extracted, max_chars) };
     }
 };
+
+fn formatExtractedText(allocator: std.mem.Allocator, extracted: []const u8, max_chars: usize) ![]u8 {
+    const preview = util.previewUtf8(extracted, max_chars);
+    if (!preview.truncated) {
+        return allocator.dupe(u8, extracted);
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n\n[Content truncated at {d} chars, total {d} chars]",
+        .{ preview.slice, max_chars, extracted.len },
+    );
+}
 
 fn parseMaxChars(args: JsonObjectMap) usize {
     return parseMaxCharsWithDefault(args, DEFAULT_MAX_CHARS);
@@ -683,6 +686,17 @@ test "parseMaxChars" {
     const p4 = try root.parseTestArgs("{\"max_chars\":999999}");
     defer p4.deinit();
     try testing.expectEqual(@as(usize, 200_000), parseMaxChars(p4.value.object)); // clamped
+}
+
+test "formatExtractedText keeps UTF-8 intact when truncating" {
+    const allocator = std.testing.allocator;
+    const prefix = "a" ** 99;
+    const formatted = try formatExtractedText(allocator, prefix ++ "\xd0\x99tail", 100);
+    defer allocator.free(formatted);
+
+    try testing.expect(std.unicode.utf8ValidateSlice(formatted));
+    try testing.expect(std.mem.indexOf(u8, formatted, "\xd0\x99tail") == null);
+    try testing.expect(std.mem.indexOf(u8, formatted, "[Content truncated at 100 chars") != null);
 }
 
 test "decodeEntity" {

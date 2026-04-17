@@ -94,7 +94,7 @@ BP:- [新手入门指南](./beginners-guide.md)  ← 第一次接触 NullClaw，
 
 ## 先看这 3 条
 
-1. NullClaw 当前要求 **Zig 0.15.2**（精确版本）。
+1. NullClaw 当前要求 **Zig 0.16.0**（精确版本）。
 2. 默认配置文件路径为 `~/.nullclaw/config.json`（由 `nullclaw onboard` 生成）。
 3. 首次上手建议先跑 `onboard --interactive`，再用 `agent` 和 `gateway` 验证。
 

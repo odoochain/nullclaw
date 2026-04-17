@@ -23,3 +23,16 @@ pub fn setVerbose(enabled: bool) void {
 pub fn isVerbose() bool {
     return verbose_enabled.load(.acquire);
 }
+
+test "verbose flag toggles through explicit states" {
+    // Keep this in one test because the flag is process-global state.
+    setVerbose(false);
+    try std.testing.expect(!isVerbose());
+    defer setVerbose(false);
+
+    setVerbose(true);
+    try std.testing.expect(isVerbose());
+
+    setVerbose(false);
+    try std.testing.expect(!isVerbose());
+}

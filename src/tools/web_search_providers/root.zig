@@ -7,3 +7,7 @@ pub const tavily = @import("tavily.zig");
 pub const perplexity = @import("perplexity.zig");
 pub const exa = @import("exa.zig");
 pub const jina = @import("jina.zig");
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

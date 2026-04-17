@@ -6,16 +6,19 @@
 //!   - Body size limits (configurable, default 64KB)
 //!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /pair, /logout, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const daemon = @import("daemon.zig");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
+const fs_compat = @import("fs_compat.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
 const http_util = @import("http_util.zig");
@@ -165,7 +168,7 @@ const GatewayTurnToolEvent = struct {
 /// Used to enrich webhook responses with tool execution summaries.
 const GatewayThreadObserver = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     next_seq: u64 = 0,
     events: std.ArrayListUnmanaged(GatewayObservedToolEvent) = .empty,
 
@@ -303,7 +306,7 @@ pub const SlidingWindowRateLimiter = struct {
             .limit_per_window = limit_per_window,
             .window_ns = @as(i128, @intCast(window_secs)) * 1_000_000_000,
             .entries = .empty,
-            .last_sweep = std.time.nanoTimestamp(),
+            .last_sweep = std_compat.time.nanoTimestamp(),
         };
     }
 
@@ -319,7 +322,7 @@ pub const SlidingWindowRateLimiter = struct {
     pub fn allow(self: *SlidingWindowRateLimiter, allocator: std.mem.Allocator, key: []const u8) bool {
         if (self.limit_per_window == 0) return true;
 
-        const now = std.time.nanoTimestamp();
+        const now = std_compat.time.nanoTimestamp();
         const cutoff = now - self.window_ns;
 
         // Periodic sweep
@@ -427,7 +430,7 @@ pub const IdempotencyStore = struct {
     /// Returns true if this key is new and is now recorded.
     /// Returns false if this is a duplicate.
     pub fn recordIfNew(self: *IdempotencyStore, allocator: std.mem.Allocator, key: []const u8) bool {
-        const now = std.time.nanoTimestamp();
+        const now = std_compat.time.nanoTimestamp();
         const cutoff = now - self.ttl_ns;
 
         // Clean expired keys (simple sweep)
@@ -698,9 +701,23 @@ pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[
     return guard.isAuthenticated(token);
 }
 
+/// Revoke a currently authenticated bearer token. Returns false when pairing is
+/// unavailable, disabled, or the token is missing/invalid.
+pub fn revokeAuthorizedBearerToken(pairing_guard: ?*PairingGuard, bearer_token: ?[]const u8) bool {
+    const guard = pairing_guard orelse return false;
+    if (!guard.requirePairing()) return false;
+    const token = bearer_token orelse return false;
+    if (!guard.isAuthenticated(token)) return false;
+    return guard.revokeToken(token);
+}
+
 /// Format the /pair success payload. Returns null when buffer is too small.
-pub fn formatPairSuccessResponse(buf: []u8, token: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{{\"status\":\"paired\",\"token\":\"{s}\"}}", .{token}) catch null;
+pub fn formatPairSuccessResponse(buf: []u8, token: []const u8, expires_in_secs: u32) ?[]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"status\":\"paired\",\"token\":\"{s}\",\"expires_in\":{d}}}",
+        .{ token, expires_in_secs },
+    ) catch null;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -809,12 +826,14 @@ pub fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
 pub fn jsonWrapField(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeByte('"');
     try w.writeAll(key);
     try w.writeAll("\":\"");
     try jsonEscapeInto(w, value);
     try w.writeByte('"');
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -823,10 +842,12 @@ pub fn jsonWrapField(allocator: std.mem.Allocator, key: []const u8, value: []con
 pub fn jsonWrapResponse(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeAll("{\"status\":\"ok\",\"response\":\"");
     try jsonEscapeInto(w, response);
     try w.writeAll("\"}");
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -837,7 +858,8 @@ fn buildThreadEventsJson(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeByte('[');
 
@@ -858,6 +880,7 @@ fn buildThreadEventsJson(
     }
 
     try w.writeByte(']');
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -870,12 +893,14 @@ fn buildWebhookSuccessResponse(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeAll("{\"status\":\"ok\",\"response\":\"");
     try jsonEscapeInto(w, response_text);
     try w.writeAll("\",\"thread_events\":");
     try w.writeAll(thread_events_json);
     try w.writeByte('}');
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -884,10 +909,12 @@ fn buildWebhookSuccessResponse(
 fn jsonWrapChallenge(allocator: std.mem.Allocator, challenge: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try w.writeAll("{\"challenge\":\"");
     try jsonEscapeInto(w, challenge);
     try w.writeAll("\"}");
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1314,15 +1341,17 @@ fn verifySlackSignature(
     if (provided_hex.len != 64) return false;
 
     const ts = std.fmt.parseInt(i64, ts_trimmed, 10) catch return false;
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const delta = if (now >= ts) now - ts else ts - now;
     if (delta > 300) return false; // 5-minute replay window
 
     var base_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer base_buf.deinit(allocator);
-    const bw = base_buf.writer(allocator);
+    var base_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &base_buf);
+    const bw = &base_writer.writer;
     bw.print("v0:{s}:", .{ts_trimmed}) catch return false;
     bw.writeAll(body) catch return false;
+    base_buf = base_writer.toArrayList();
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac: [32]u8 = undefined;
@@ -2175,7 +2204,8 @@ fn expectedHttpRequestSize(raw: []const u8, max_body: usize) !?usize {
     return total;
 }
 
-fn configureRequestReadTimeout(stream: *std.net.Stream, timeout_secs: u64) void {
+fn configureRequestReadTimeout(stream: *std_compat.net.Stream, timeout_secs: u64) void {
+    if (comptime builtin.os.tag == .windows) return;
     if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
 
     const zero_timeout = std.posix.timeval{ .sec = 0, .usec = 0 };
@@ -2200,9 +2230,9 @@ fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype, max_
     var chunk: [2048]u8 = undefined;
 
     while (true) {
-        const n = reader.read(&chunk) catch |err| switch (err) {
-            error.WouldBlock, error.ConnectionTimedOut => return error.RequestTimeout,
-            else => return err,
+        const n = reader.read(&chunk) catch |err| {
+            if (err == error.Timeout or err == error.WouldBlock) return error.RequestTimeout;
+            return err;
         };
         if (n == 0) return error.IncompleteRequest;
 
@@ -2222,7 +2252,7 @@ fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype, max_
     }
 }
 
-fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream, max_body: usize) ![]u8 {
+fn readHttpRequest(allocator: std.mem.Allocator, stream: *std_compat.net.Stream, max_body: usize) ![]u8 {
     return readHttpRequestFromReader(allocator, stream, max_body);
 }
 
@@ -2248,14 +2278,14 @@ fn formatHttpResponseHeader(
     );
 }
 
-fn writeHttpResponse(stream: *std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
+fn writeHttpResponse(stream: *std_compat.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
     var header_buf: [512]u8 = undefined;
     const header = formatHttpResponseHeader(&header_buf, status, content_type, body.len) catch return;
     _ = stream.write(header) catch return;
     if (body.len > 0) _ = stream.write(body) catch {};
 }
 
-fn writeJsonResponse(stream: *std.net.Stream, status: []const u8, body: []const u8) void {
+fn writeJsonResponse(stream: *std_compat.net.Stream, status: []const u8, body: []const u8) void {
     writeHttpResponse(stream, status, CONTENT_TYPE_JSON, body);
 }
 
@@ -2263,10 +2293,10 @@ fn writeJsonResponse(stream: *std.net.Stream, status: []const u8, body: []const 
 /// Returns the agent's response text. Caller owns the returned memory.
 pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
     // Find our own executable path
-    var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = std.fs.selfExePath(&self_buf) catch "nullclaw";
+    var self_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const self_path = std_compat.fs.selfExePath(&self_buf) catch "nullclaw";
 
-    var child = std.process.Child.init(
+    var child = std_compat.process.Child.init(
         &[_][]const u8{ self_path, "agent", "-m", message },
         allocator,
     );
@@ -2311,7 +2341,8 @@ pub fn sendTelegramReply(
     // JSON-escape the text for the body
     var body_buf: std.ArrayList(u8) = .empty;
     defer body_buf.deinit(allocator);
-    const w = body_buf.writer(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_buf);
+    const w = &body_writer.writer;
     try w.print("{{\"chat_id\":{d},\"text\":\"", .{chat_id});
     for (text) |c| {
         switch (c) {
@@ -2328,10 +2359,11 @@ pub fn sendTelegramReply(
         try w.print(",\"message_thread_id\":{d}", .{thread_id});
     }
     try w.writeAll("}");
+    body_buf = body_writer.toArrayList();
 
     const body = body_buf.items;
 
-    var curl_child = std.process.Child.init(
+    var curl_child = std_compat.process.Child.init(
         &[_][]const u8{
             "curl", "-s",                             "-X", "POST",
             "-H",   "Content-Type: application/json", "-d", body,
@@ -4119,7 +4151,7 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
         const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch null;
         if (reply) |r| {
             defer ctx.root_allocator.free(r);
-            const now_secs = std.time.timestamp();
+            const now_secs = std_compat.time.timestamp();
             const xml = channels.wechat.buildPassiveTextReply(
                 ctx.req_allocator,
                 inbound.from_user,
@@ -4831,7 +4863,7 @@ fn isValidBotFrameworkServiceUrl(url: []const u8) bool {
 /// Store Teams conversation reference (serviceUrl + conversationId) to a JSON file
 /// for proactive messaging. Uses config_dir from the config.
 fn teamsStoreConversationRef(config: *const Config, service_url: []const u8, conversation_id: []const u8) void {
-    const config_dir = std.fs.path.dirname(config.config_path) orelse return;
+    const config_dir = std_compat.fs.path.dirname(config.config_path) orelse return;
     var path_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/teams_conversation_ref.json", .{config_dir}) catch return;
 
@@ -4842,7 +4874,7 @@ fn teamsStoreConversationRef(config: *const Config, service_url: []const u8, con
         .{ service_url, conversation_id },
     ) catch return;
 
-    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+    const file = fs_compat.createPath(path, .{}) catch |err| {
         std.log.scoped(.teams).warn("Failed to save conversation reference: {}", .{err});
         return;
     };
@@ -4861,7 +4893,7 @@ fn applyRuntimeProviderOverrides(config: *const Config) !void {
 const A2aStreamingWorker = struct {
     allocator: std.mem.Allocator,
     body: []u8,
-    stream: std.net.Stream,
+    stream: std_compat.net.Stream,
     registry: *a2a.TaskRegistry,
     session_mgr: *session_mod.SessionManager,
 
@@ -4876,7 +4908,7 @@ const A2aStreamingWorker = struct {
 fn spawnA2aStreamingWorker(
     allocator: std.mem.Allocator,
     body: []const u8,
-    stream: std.net.Stream,
+    stream: std_compat.net.Stream,
     registry: *a2a.TaskRegistry,
     session_mgr: *session_mod.SessionManager,
 ) !void {
@@ -4905,7 +4937,7 @@ fn spawnA2aStreamingWorker(
 // ── Shared scheduler state for cross-thread access ───────────────
 
 var g_shared_scheduler: ?*cron_mod.CronScheduler = null;
-var g_shared_scheduler_mutex: std.Thread.Mutex = .{};
+var g_shared_scheduler_mutex: std_compat.sync.Mutex = .{};
 
 pub fn lockSharedScheduler() void {
     g_shared_scheduler_mutex.lock();
@@ -4928,7 +4960,7 @@ pub fn clearSharedScheduler() void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -5140,13 +5172,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     defer if (sec_tracker_opt) |*tracker| tracker.deinit();
 
     // Resolve the listen address
-    const addr = try std.net.Address.resolveIp(host, port);
+    const addr = try std_compat.net.Address.resolveIp(host, port);
     const daemon_mode = event_bus != null;
 
     // Best-effort probe to detect if the port is already in use.
     // A TOCTOU gap exists between probe and listen(), but listen() will still
     // fail with AddressInUse if another process binds the port in that window.
-    const probe_conn = std.net.tcpConnectToAddress(addr) catch null;
+    const probe_conn = std_compat.net.tcpConnectToAddress(addr) catch null;
     if (probe_conn) |conn| {
         conn.close();
         return error.AddressInUse;
@@ -5161,7 +5193,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     defer server.deinit();
 
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();
@@ -5187,7 +5219,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
         var conn = server.accept() catch |err| switch (err) {
             error.WouldBlock => {
-                std.Thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
+                std_compat.thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
                 continue;
             },
             else => continue,
@@ -5220,12 +5252,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const target = parts.next() orelse continue;
 
         // Simple routing — control endpoints + descriptor-driven channel webhooks.
-        const ControlRoute = enum { health, ready, webhook, pair };
+        const ControlRoute = enum { health, ready, webhook, pair, logout };
         const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
             .{ "/webhook", .webhook },
             .{ "/pair", .pair },
+            .{ "/logout", .logout },
         });
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const is_post = std.mem.eql(u8, method_str, "POST");
@@ -5458,7 +5491,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         switch (guard.attemptPair(pairing_code)) {
                             .paired => |token| {
                                 defer allocator.free(token);
-                                if (formatPairSuccessResponse(&pair_response_buf, token)) |pair_resp| {
+                                if (formatPairSuccessResponse(&pair_response_buf, token, guard.tokenExpiresInSecs())) |pair_resp| {
                                     response_body = pair_resp;
                                 } else {
                                     response_status = "500 Internal Server Error";
@@ -5493,6 +5526,22 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     } else {
                         response_status = "500 Internal Server Error";
                         response_body = "{\"error\":\"pairing unavailable\"}";
+                    }
+                }
+            },
+            .logout => {
+                if (!is_post) {
+                    response_status = "405 Method Not Allowed";
+                    response_body = "{\"error\":\"method not allowed\"}";
+                } else {
+                    const auth_header = extractHeader(raw, "Authorization");
+                    const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                    const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                    if (!revokeAuthorizedBearerToken(pairing_guard, bearer)) {
+                        response_status = "401 Unauthorized";
+                        response_body = "{\"error\":\"unauthorized\"}";
+                    } else {
+                        response_body = "{\"status\":\"revoked\"}";
                     }
                 }
             },
@@ -6178,18 +6227,37 @@ test "isWebhookAuthorized requires valid bearer token when pairing enabled" {
     try std.testing.expect(!isWebhookAuthorized(&guard, "zc_invalid"));
 }
 
+test "revokeAuthorizedBearerToken removes authenticated token" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(revokeAuthorizedBearerToken(&guard, "zc_valid"));
+    try std.testing.expect(!guard.isAuthenticated("zc_valid"));
+}
+
+test "revokeAuthorizedBearerToken rejects missing or invalid tokens" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(!revokeAuthorizedBearerToken(&guard, null));
+    try std.testing.expect(!revokeAuthorizedBearerToken(&guard, "zc_invalid"));
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+}
+
 test "formatPairSuccessResponse includes paired token" {
     var buf: [256]u8 = undefined;
-    const response = formatPairSuccessResponse(&buf, "zc_token_123") orelse unreachable;
+    const response = formatPairSuccessResponse(&buf, "zc_token_123", 3600) orelse unreachable;
     try std.testing.expectEqualStrings(
-        "{\"status\":\"paired\",\"token\":\"zc_token_123\"}",
+        "{\"status\":\"paired\",\"token\":\"zc_token_123\",\"expires_in\":3600}",
         response,
     );
 }
 
 test "formatPairSuccessResponse fails when buffer is too small" {
     var buf: [8]u8 = undefined;
-    try std.testing.expect(formatPairSuccessResponse(&buf, "zc_token_123") == null);
+    try std.testing.expect(formatPairSuccessResponse(&buf, "zc_token_123", 3600) == null);
 }
 
 // ── extractHeader tests ──────────────────────────────────────────
@@ -7964,6 +8032,19 @@ test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
     try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
 }
 
+test "readHttpRequestFromReader maps Timeout to RequestTimeout" {
+    const TimeoutReader = struct {
+        const ReadError = error{ Timeout, ConnectionTimedOut };
+
+        fn read(_: *@This(), _: []u8) ReadError!usize {
+            return error.Timeout;
+        }
+    };
+
+    var reader = TimeoutReader{};
+    try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
+}
+
 test "maybeProbeA2aVision skips probe when a2a is disabled" {
     const ProbeSpy = struct {
         calls: usize = 0,
@@ -8232,13 +8313,15 @@ test "verifySlackSignature accepts valid signature" {
     const secret = "slack_signing_secret";
 
     var ts_buf: [32]u8 = undefined;
-    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch unreachable;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp()}) catch unreachable;
 
     var signed: std.ArrayListUnmanaged(u8) = .empty;
     defer signed.deinit(std.testing.allocator);
-    const sw = signed.writer(std.testing.allocator);
+    var signed_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &signed);
+    const sw = &signed_writer.writer;
     try sw.print("v0:{s}:", .{ts});
     try sw.writeAll(body);
+    signed = signed_writer.toArrayList();
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac: [HmacSha256.mac_length]u8 = undefined;
@@ -8260,13 +8343,15 @@ test "verifySlackSignature rejects stale timestamp" {
     const secret = "slack_signing_secret";
 
     var ts_buf: [32]u8 = undefined;
-    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp() - 900}) catch unreachable;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp() - 900}) catch unreachable;
 
     var signed: std.ArrayListUnmanaged(u8) = .empty;
     defer signed.deinit(std.testing.allocator);
-    const sw = signed.writer(std.testing.allocator);
+    var signed_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &signed);
+    const sw = &signed_writer.writer;
     try sw.print("v0:{s}:", .{ts});
     try sw.writeAll(body);
+    signed = signed_writer.toArrayList();
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac: [HmacSha256.mac_length]u8 = undefined;
@@ -8322,7 +8407,7 @@ test "hasSlackHttpEndpoint respects mode and webhook_path" {
 
 test "findSlackConfigForRequest selects account by verified signature" {
     const body = "{\"type\":\"event_callback\",\"event\":{\"type\":\"message\",\"channel\":\"C1\",\"user\":\"U1\",\"text\":\"hi\"}}";
-    const ts_val = std.time.timestamp();
+    const ts_val = std_compat.time.timestamp();
     var ts_buf: [32]u8 = undefined;
     const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{ts_val}) catch unreachable;
 
@@ -8331,9 +8416,11 @@ test "findSlackConfigForRequest selects account by verified signature" {
 
     var signed: std.ArrayListUnmanaged(u8) = .empty;
     defer signed.deinit(std.testing.allocator);
-    const sw = signed.writer(std.testing.allocator);
+    var signed_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &signed);
+    const sw = &signed_writer.writer;
     try sw.print("v0:{s}:", .{ts});
     try sw.writeAll(body);
+    signed = signed_writer.toArrayList();
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac_b: [HmacSha256.mac_length]u8 = undefined;
@@ -8516,8 +8603,10 @@ test "GatewayState event_bus defaults to null" {
 fn escapeToString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     try jsonEscapeInto(w, input);
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -8756,7 +8845,7 @@ test "jsonWrapChallenge escapes malicious challenge value" {
 
 test "run returns AddressInUse when port is already bound" {
     // Find an available port by binding to port 0
-    const test_addr = try std.net.Address.resolveIp("127.0.0.1", 0);
+    const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
     var listener = try test_addr.listen(.{ .reuse_address = true });
     defer listener.deinit();
 

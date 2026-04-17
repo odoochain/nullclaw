@@ -309,6 +309,7 @@ fn classifyFromFields(
 /// Anthropic, and Gemini APIs.
 pub fn classifyErrorObject(root_obj: anytype) ?ApiErrorKind {
     const err_value = root_obj.get("error") orelse return null;
+    if (err_value == .null) return null;
     if (err_value == .string) {
         return classifyFromFields(null, null, null, err_value.string);
     }
@@ -414,6 +415,14 @@ test "classifyKnownApiError detects vision unsupported payloads" {
 
 test "classifyKnownApiError returns null for non-error payload" {
     const body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(classifyKnownApiError(parsed.value.object) == null);
+}
+
+test "classifyKnownApiError returns null for error:null" {
+    const body = "{\"error\":null,\"output\":[{\"role\":\"assistant\",\"content\":[{\"text\":\"ok\"}]}]}";
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
 

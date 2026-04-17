@@ -4,6 +4,7 @@
 //! for `nullclaw agent`) and the streaming stdout callback.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
@@ -32,6 +33,7 @@ const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
 
 const Agent = @import("root.zig").Agent;
+const turn_persistence = @import("turn_persistence.zig");
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
@@ -60,6 +62,15 @@ fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
 }
 
+fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8) void {
+    const store = agent.session_store orelse return;
+    const session_key = agent.memory_session_id orelse return;
+    turn_persistence.persistTurn(store, .{
+        .history = agent.history.items,
+        .total_tokens = agent.total_tokens,
+    }, session_key, content, response);
+}
+
 fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
@@ -69,7 +80,7 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (builtin.is_test) return;
 
     var buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writer(&buf);
     const wr = &bw.interface;
     wr.print("{s}", .{event.text}) catch {};
     wr.flush() catch {};
@@ -345,7 +356,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
 
     var out_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&out_buf);
+    var bw = std_compat.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
 
     const message_arg = parsed_args.message_arg;
@@ -533,6 +544,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
+        persistCliTurn(&agent, message, response);
+
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("{s}\n", .{response});
         } else {
@@ -619,7 +632,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         agent.stream_ctx = @ptrCast(&stream_ctx);
     }
 
-    const stdin = std.fs.File.stdin();
+    const stdin = std_compat.fs.File.stdin();
     var line_buf: [4096]u8 = undefined;
     var pending_line: ?[]u8 = null;
     defer if (pending_line) |line| allocator.free(line);
@@ -683,6 +696,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
+        persistCliTurn(&agent, debounced_input.current, response);
+
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("\n{s}\n\n", .{response});
         } else {
@@ -694,7 +709,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
 fn collectCliDebouncedInput(
     allocator: std.mem.Allocator,
-    stdin: std.fs.File,
+    stdin: std_compat.fs.File,
     first_line: []const u8,
     debounce_ms: u32,
 ) !CliDebouncedInput {
@@ -720,13 +735,20 @@ fn collectCliDebouncedInput(
             continue;
         }
 
-        var poll_fds = [_]std.posix.pollfd{
-            .{ .fd = stdin.handle, .events = std.posix.POLL.IN, .revents = 0 },
-        };
         const poll_timeout: i32 = if (timeout_ms > std.math.maxInt(i32))
             std.math.maxInt(i32)
         else
             @intCast(timeout_ms);
+        if (comptime builtin.os.tag == .windows) {
+            if (poll_timeout > 0) {
+                std_compat.thread.sleep(@as(u64, @intCast(poll_timeout)) * std.time.ns_per_ms);
+            }
+            try debouncer.flushMatured(inbound_debounce.nowMs(), &ready);
+            continue;
+        }
+        var poll_fds = [_]std.posix.pollfd{
+            .{ .fd = stdin.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        };
         const events = std.posix.poll(&poll_fds, poll_timeout) catch 0;
         if (events > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
             var extra_line_buf: [4096]u8 = undefined;
@@ -745,7 +767,7 @@ fn collectCliDebouncedInput(
     return try buildCliDebouncedInput(allocator, ready.items);
 }
 
-fn readCliLine(stdin: std.fs.File, buf: []u8) ?[]const u8 {
+fn readCliLine(stdin: std_compat.fs.File, buf: []u8) ?[]const u8 {
     var pos: usize = 0;
     while (pos < buf.len) {
         const n = stdin.read(buf[pos .. pos + 1]) catch return null;

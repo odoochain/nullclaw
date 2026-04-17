@@ -1,11 +1,14 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const Sandbox = @import("sandbox.zig").Sandbox;
 const NoopSandbox = @import("sandbox.zig").NoopSandbox;
 const LandlockSandbox = @import("landlock.zig").LandlockSandbox;
 const FirejailSandbox = @import("firejail.zig").FirejailSandbox;
 const BubblewrapSandbox = @import("bubblewrap.zig").BubblewrapSandbox;
-const DockerSandbox = @import("docker.zig").DockerSandbox;
+const docker = @import("docker.zig");
+const DockerSandbox = docker.DockerSandbox;
+const createDockerSandbox = docker.createDockerSandbox;
 
 /// Sandbox backend preference.
 pub const SandboxBackend = enum {
@@ -60,7 +63,7 @@ pub fn createSandbox(
             return storage.noop.sandbox();
         },
         .docker => {
-            storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+            storage.docker = createDockerSandbox(allocator, workspace_dir, null);
             return storage.docker.sandbox();
         },
         .auto => {
@@ -100,8 +103,8 @@ fn detectBest(allocator: std.mem.Allocator, workspace_dir: []const u8, storage: 
         }
     }
 
-    // Docker works on any platform if installed
-    storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+    // Docker works on any platform when the client can reach a daemon.
+    storage.docker = createDockerSandbox(allocator, workspace_dir, null);
     if (storage.docker.sandbox().isAvailable()) {
         return storage.docker.sandbox();
     }
@@ -132,7 +135,7 @@ pub fn detectAvailable(allocator: std.mem.Allocator, workspace_dir: []const u8) 
     storage.bubblewrap = .{ .workspace_dir = workspace_dir };
     const bw_avail = storage.bubblewrap.sandbox().isAvailable();
 
-    storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+    storage.docker = createDockerSandbox(allocator, workspace_dir, null);
     const dk_avail = storage.docker.sandbox().isAvailable();
 
     return .{
@@ -184,9 +187,93 @@ test "create sandbox with docker returns docker" {
     try std.testing.expectEqualStrings("docker", sb.name());
 }
 
+test "create sandbox with docker prebuilds mount arg" {
+    var storage: SandboxStorage = .{};
+    _ = createSandbox(std.testing.allocator, .docker, "/tmp/workspace", &storage);
+
+    // Regression: detect.zig must use the Docker sandbox factory so wrapCommand
+    // never passes an empty -v argument to docker.
+    try std.testing.expectEqualStrings("/tmp/workspace:/tmp/workspace", storage.docker.mount_arg_buf[0..storage.docker.mount_arg_len]);
+}
+
 test "sandbox storage default initialization" {
     const storage = SandboxStorage{};
     try std.testing.expectEqualStrings("", storage.landlock.workspace_dir);
     try std.testing.expectEqualStrings("", storage.firejail.workspace_dir);
     try std.testing.expectEqualStrings(DockerSandbox.default_image, storage.docker.image);
+}
+
+test "auto detect skips version-only linux sandbox shims" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const platform = @import("../platform.zig");
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const shim =
+        \\#!/bin/sh
+        \\if [ "$1" = "--version" ]; then
+        \\  exit 0
+        \\fi
+        \\exit 9
+        \\
+    ;
+
+    inline for (.{ "firejail", "bwrap" }) |name| {
+        try std_compat.fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+            .sub_path = name,
+            .data = shim,
+            .flags = .{ .permissions = std_compat.fs.permissionsFromMode(0o755) },
+        });
+    }
+
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const key_z = try std.testing.allocator.dupeZ(u8, "PATH");
+    defer std.testing.allocator.free(key_z);
+
+    const old_path = platform.getEnvOrNull(std.testing.allocator, "PATH");
+    defer if (old_path) |path| std.testing.allocator.free(path);
+
+    const old_path_z = if (old_path) |path| try std.testing.allocator.dupeZ(u8, path) else null;
+    defer if (old_path_z) |path| std.testing.allocator.free(path);
+
+    const effective_path = if (old_path) |path|
+        try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}{c}{s}",
+            .{ tmp_path, std_compat.fs.path.delimiter, path },
+        )
+    else
+        try std.testing.allocator.dupe(u8, tmp_path);
+    defer std.testing.allocator.free(effective_path);
+
+    const tmp_path_z = try std.testing.allocator.dupeZ(u8, effective_path);
+    defer std.testing.allocator.free(tmp_path_z);
+
+    defer {
+        if (old_path_z) |path| {
+            _ = c.setenv(key_z.ptr, path.ptr, 1);
+        } else {
+            _ = c.unsetenv(key_z.ptr);
+        }
+    }
+
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, tmp_path_z.ptr, 1));
+
+    // Regression for #791: do not treat shims that only answer `--version`
+    // as runnable Linux sandbox backends in auto-detect.
+    const avail = detectAvailable(std.testing.allocator, "/tmp/workspace");
+    try std.testing.expect(!avail.firejail);
+    try std.testing.expect(!avail.bubblewrap);
+
+    var storage: SandboxStorage = .{};
+    const sandbox = createSandbox(std.testing.allocator, .auto, "/tmp/workspace", &storage);
+    try std.testing.expect(!std.mem.eql(u8, sandbox.name(), "firejail"));
+    try std.testing.expect(!std.mem.eql(u8, sandbox.name(), "bubblewrap"));
 }

@@ -57,9 +57,9 @@ nullclaw gateway
 建议在长期运行场景使用 service 子命令：
 
 - macOS 走 `launchctl`。
-- Linux 环境会优先使用 `systemd --user`，在 Alpine / OpenRC 系统上会自动切换为 OpenRC。
+- Linux 环境会优先使用 `systemd --user`，在检测到 OpenRC 或 SysVinit 运行环境时自动切换到对应实现。
 - Windows 走 Service Control Manager。
-- 如果 Linux 上既没有可用的 `systemd --user`，也缺少必需的 OpenRC 命令，这组子命令会失败；此时应改用前台 `nullclaw gateway` 或其他外部 supervisor。
+- 如果 Linux 上既没有可用的 `systemd --user`，也缺少必需的 OpenRC / SysVinit 支持，这组子命令会失败；此时应改用前台 `nullclaw gateway` 或其他外部 supervisor。
 
 ```bash
 nullclaw service install

@@ -9,11 +9,13 @@
 //! sessions are processed in parallel.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
 const fs_compat = @import("fs_compat.zig");
 const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
+const turn_persistence = @import("agent/turn_persistence.zig");
 const Agent = agent_mod.Agent;
 const NamedAgentConfig = @import("config_types.zig").NamedAgentConfig;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -22,6 +24,7 @@ const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
 const Memory = memory_mod.Memory;
+const util = @import("util.zig");
 const onboard = @import("onboard.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
@@ -70,10 +73,16 @@ const ClaimStateSnapshot = struct {
 };
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
-    if (text.len <= MESSAGE_LOG_MAX_BYTES) {
-        return .{ .slice = text, .truncated = false };
-    }
-    return .{ .slice = text[0..MESSAGE_LOG_MAX_BYTES], .truncated = true };
+    const preview = util.previewUtf8(text, MESSAGE_LOG_MAX_BYTES);
+    return .{ .slice = preview.slice, .truncated = preview.truncated };
+}
+
+test "messageLogPreview keeps UTF-8 intact when truncating" {
+    const prefix = "a" ** (MESSAGE_LOG_MAX_BYTES - 1);
+    const preview = messageLogPreview(prefix ++ "\xd0\x99tail");
+    try std.testing.expectEqualStrings(prefix, preview.slice);
+    try std.testing.expect(preview.truncated);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
 }
 
 fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
@@ -83,13 +92,6 @@ fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
         total += agent_mod.estimate_text_tokens(entry.content);
     }
     return total;
-}
-
-fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8 {
-    if (agent.history.items.len == 0) return response;
-    const last = agent.history.items[agent.history.items.len - 1];
-    if (last.role != .assistant) return response;
-    return last.content;
 }
 
 fn restorePersistedSessionState(session: *Session, entries: []const memory_mod.MessageEntry) void {
@@ -173,7 +175,7 @@ pub const Session = struct {
     session_key: []const u8, // owned copy
     turn_count: u64,
     turn_running: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
@@ -227,9 +229,9 @@ pub const SessionManager = struct {
     /// false = model rejected images (ProviderDoesNotSupportVision).
     vision_capable: ?bool = null,
 
-    mutex: std.Thread.Mutex,
-    usage_log_mutex: std.Thread.Mutex,
-    claim_state_io_mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
+    usage_log_mutex: std_compat.sync.Mutex,
+    claim_state_io_mutex: std_compat.sync.Mutex,
     usage_ledger_state_initialized: bool,
     usage_ledger_window_started_at: i64,
     usage_ledger_line_count: u64,
@@ -258,8 +260,8 @@ pub const SessionManager = struct {
         const claim_state_path = blk: {
             const secret = config.session.claim_secret orelse break :blk null;
             if (std.mem.trim(u8, secret, " \t\r\n").len == 0) break :blk null;
-            const config_dir = std.fs.path.dirname(config.config_path) orelse ".";
-            break :blk std.fs.path.join(allocator, &.{ config_dir, "state", CLAIM_STATE_FILENAME }) catch null;
+            const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
+            break :blk std_compat.fs.path.join(allocator, &.{ config_dir, "state", CLAIM_STATE_FILENAME }) catch null;
         };
 
         var manager: SessionManager = .{
@@ -740,7 +742,7 @@ pub const SessionManager = struct {
         self.claim_state_loaded = true;
         const path = self.claim_state_path orelse return;
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch return;
+        const file = std_compat.fs.openFileAbsolute(path, .{}) catch return;
         defer file.close();
         const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return;
         defer self.allocator.free(content);
@@ -750,7 +752,7 @@ pub const SessionManager = struct {
         if (parsed.value != .object) return;
         const root = parsed.value.object;
 
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
 
         if (root.get("bindings")) |bindings_val| {
             if (bindings_val == .array) {
@@ -830,12 +832,13 @@ pub const SessionManager = struct {
         if (self.claim_state_path == null) return null;
         if (self.claim_state_generation <= self.claim_state_persisted_generation) return null;
 
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         self.clearExpiredClaimNoncesLocked(now_ts);
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        const w = &buf_writer.writer;
 
         w.print("{{\"version\":{d},\"bindings\":[", .{CLAIM_STATE_VERSION}) catch return null;
 
@@ -895,6 +898,7 @@ pub const SessionManager = struct {
         }
 
         w.writeAll("]}") catch return null;
+        buf = buf_writer.toArrayList();
         const content = buf.toOwnedSlice(self.allocator) catch return null;
         return .{
             .generation = self.claim_state_generation,
@@ -916,8 +920,8 @@ pub const SessionManager = struct {
         self.mutex.unlock();
         if (is_stale) return;
 
-        if (std.fs.path.dirname(path)) |parent| {
-            std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+        if (std_compat.fs.path.dirname(path)) |parent| {
+            std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
                     fs_compat.makePath(parent) catch return;
@@ -928,17 +932,17 @@ pub const SessionManager = struct {
         const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path}) catch return;
         defer self.allocator.free(tmp_path);
 
-        var tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return;
+        var tmp_file = std_compat.fs.createFileAbsolute(tmp_path, .{}) catch return;
         tmp_file.writeAll(claim_snapshot.content) catch {
             tmp_file.close();
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
             return;
         };
         tmp_file.close();
 
-        std.fs.renameAbsolute(tmp_path, path) catch {
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
-            const file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+        std_compat.fs.renameAbsolute(tmp_path, path) catch {
+            std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+            const file = std_compat.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
             defer file.close();
             file.writeAll(claim_snapshot.content) catch return;
         };
@@ -980,7 +984,7 @@ pub const SessionManager = struct {
         if (!std.mem.startsWith(u8, parseAgentIdFromSessionKey(session_key), "peer-")) return null;
 
         const direct_ctx = directContextForClaims(session_key, conversation_context) orelse return null;
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
 
         if (revokeSecretArg(content)) |provided_revoke_secret| {
             const admin_secret = self.claimAdminSecret() orelse {
@@ -1142,10 +1146,10 @@ pub const SessionManager = struct {
             }
         }
 
-        const config_dir = std.fs.path.dirname(self.config.config_path) orelse ".";
+        const config_dir = std_compat.fs.path.dirname(self.config.config_path) orelse ".";
         const normalized = try sanitizePathComponent(self.allocator, agent_id);
         defer self.allocator.free(normalized);
-        return std.fs.path.join(self.allocator, &.{ config_dir, "agents", normalized, "workspace" });
+        return std_compat.fs.path.join(self.allocator, &.{ config_dir, "agents", normalized, "workspace" });
     }
 
     fn makeAgentConfig(base: *const Config, workspace_dir: []const u8, named_agent: ?NamedAgentConfig) Config {
@@ -1289,7 +1293,7 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         if (self.sessions.get(session_key)) |session| {
-            session.last_active = std.time.timestamp();
+            session.last_active = std_compat.time.timestamp();
             return session;
         }
 
@@ -1378,8 +1382,8 @@ pub const SessionManager = struct {
             .provider_holder = session_provider_holder,
             .owned_provider_api_key = session_owned_provider_api_key,
             .owned_memory_session_id = owned_memory_session_id,
-            .created_at = std.time.timestamp(),
-            .last_active = std.time.timestamp(),
+            .created_at = std_compat.time.timestamp(),
+            .last_active = std_compat.time.timestamp(),
             .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
@@ -1462,8 +1466,8 @@ pub const SessionManager = struct {
 
     fn usageLedgerPath(self: *SessionManager) ?[]u8 {
         if (!self.config.diagnostics.token_usage_ledger_enabled) return null;
-        const config_dir = std.fs.path.dirname(self.config.config_path) orelse return null;
-        return std.fs.path.join(self.allocator, &.{ config_dir, TOKEN_USAGE_LEDGER_FILENAME }) catch null;
+        const config_dir = std_compat.fs.path.dirname(self.config.config_path) orelse return null;
+        return std_compat.fs.path.join(self.allocator, &.{ config_dir, TOKEN_USAGE_LEDGER_FILENAME }) catch null;
     }
 
     fn usageWindowSeconds(self: *SessionManager) i64 {
@@ -1472,7 +1476,7 @@ pub const SessionManager = struct {
         return @as(i64, @intCast(hours)) * 60 * 60;
     }
 
-    fn countLedgerLines(file: *std.fs.File) !u64 {
+    fn countLedgerLines(file: *std_compat.fs.File) !u64 {
         try file.seekTo(0);
         var lines: u64 = 0;
         var saw_data = false;
@@ -1491,8 +1495,8 @@ pub const SessionManager = struct {
 
     fn initializeUsageLedgerState(
         self: *SessionManager,
-        file: *std.fs.File,
-        stat: std.fs.File.Stat,
+        file: *std_compat.fs.File,
+        stat: std_compat.fs.File.Stat,
         now_ts: i64,
     ) void {
         if (self.usage_ledger_state_initialized) return;
@@ -1513,7 +1517,7 @@ pub const SessionManager = struct {
 
     fn shouldResetUsageLedger(
         self: *SessionManager,
-        stat: std.fs.File.Stat,
+        stat: std_compat.fs.File.Stat,
         now_ts: i64,
         pending_bytes: usize,
         pending_lines: u64,
@@ -1543,14 +1547,11 @@ pub const SessionManager = struct {
         const ledger_path = self.usageLedgerPath() orelse return;
         defer self.allocator.free(ledger_path);
 
-        var file = std.fs.openFileAbsolute(ledger_path, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => std.fs.createFileAbsolute(ledger_path, .{ .truncate = false, .read = true }) catch return,
-            else => return,
-        };
+        var file = fs_compat.openPathForAppend(ledger_path) catch return;
         var file_needs_close = true;
         defer if (file_needs_close) file.close();
 
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         const stat = fs_compat.stat(file) catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
 
@@ -1573,7 +1574,7 @@ pub const SessionManager = struct {
         if (self.shouldResetUsageLedger(stat, now_ts, pending_bytes, 1)) {
             file.close();
             file_needs_close = false;
-            file = std.fs.createFileAbsolute(ledger_path, .{ .truncate = true, .read = true }) catch return;
+            file = std_compat.fs.createFileAbsolute(ledger_path, .{ .truncate = true, .read = true }) catch return;
             file_needs_close = true;
             self.usage_ledger_state_initialized = true;
             self.usage_ledger_window_started_at = now_ts;
@@ -1677,8 +1678,6 @@ pub const SessionManager = struct {
             session.agent.stream_ctx = null;
         }
 
-        const turn_input = agent_mod.commands.planTurnInput(content);
-
         // Record agent start event with channel attribution
         const start_event = @import("observability.zig").ObserverEvent{ .agent_start = .{
             .provider = session.agent.provider.getName(),
@@ -1690,43 +1689,19 @@ pub const SessionManager = struct {
 
         const response = try session.agent.turn(content);
         session.turn_count += 1;
-        session.last_active = std.time.timestamp();
+        session.last_active = std_compat.time.timestamp();
 
         // Track consolidation timestamp
         if (session.agent.last_turn_compacted) {
-            session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
+            session.last_consolidated = @intCast(@max(0, std_compat.time.timestamp()));
         }
 
         // Persist messages via session store
         if (session.agent.session_store) |store| {
-            if (turn_input.clear_session) {
-                // Clear persisted messages on session reset
-                store.clearMessages(session_key) catch {};
-                // Clear stale auto-saved memories
-                store.clearAutoSaved(session_key) catch {};
-            }
-
-            if (agent_mod.commands.persistedRuntimeCommand(content)) |runtime_command| {
-                store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
-            }
-
-            if (turn_input.llm_user_message) |persisted_user| {
-                // Persist canonical conversation history.
-                // Local-only slash commands are skipped, but any input that
-                // reached the LLM must persist with the exact same routing
-                // decision used by Agent.turn().
-                // When the turn ends with an assistant history message, prefer
-                // that canonical text over the rendered reply so restored
-                // sessions do not replay /usage footers or reasoning blocks.
-                // Some degraded turns return a fallback response without
-                // appending a final assistant history entry; in that case we
-                // must persist the actual response instead of stale tool-step
-                // assistant text from earlier in the turn.
-                const persisted_assistant = persistedAssistantReply(&session.agent, response);
-                store.saveMessage(session_key, "user", persisted_user) catch {};
-                store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
-                store.saveUsage(session_key, session.agent.total_tokens) catch {};
-            }
+            turn_persistence.persistTurn(store, .{
+                .history = session.agent.history.items,
+                .total_tokens = session.agent.total_tokens,
+            }, session_key, content, response);
         }
 
         if (self.config.diagnostics.log_message_payloads) {
@@ -1948,13 +1923,13 @@ pub const SessionManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         var evicted: usize = 0;
 
         // Collect keys to remove (can't modify map while iterating).
         // Active turns keep stale last_active until the turn finishes, so skip
         // any session that is currently executing.
-        var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var it = self.sessions.iterator();
@@ -2425,7 +2400,7 @@ fn testClaimCommand(allocator: Allocator, token: []const u8) ![]u8 {
 
 fn toNativePathFragment(allocator: Allocator, unix_path_fragment: []const u8) ![]u8 {
     const native = try allocator.dupe(u8, unix_path_fragment);
-    if (std.fs.path.sep == '\\') {
+    if (std_compat.fs.path.sep == '\\') {
         for (native) |*ch| {
             if (ch.* == '/') ch.* = '\\';
         }
@@ -2464,7 +2439,7 @@ test "usage ledger appends records when retention limits are disabled" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2498,7 +2473,7 @@ test "usage ledger appends records when retention limits are disabled" {
         .success = true,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2512,7 +2487,7 @@ test "usage ledger resets when max line limit is reached" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2553,7 +2528,7 @@ test "usage ledger resets when max line limit is reached" {
         .success = true,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2568,7 +2543,7 @@ test "usage ledger resets when window expires" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2596,7 +2571,7 @@ test "usage ledger resets when window expires" {
     });
 
     sm.usage_ledger_state_initialized = true;
-    sm.usage_ledger_window_started_at = std.time.timestamp() - 2 * 60 * 60;
+    sm.usage_ledger_window_started_at = std_compat.time.timestamp() - 2 * 60 * 60;
 
     sm.appendUsageRecord(.{
         .ts = 11,
@@ -2606,7 +2581,7 @@ test "usage ledger resets when window expires" {
         .success = true,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2621,7 +2596,7 @@ test "usage ledger resets when byte limit would be exceeded" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2655,7 +2630,7 @@ test "usage ledger resets when byte limit would be exceeded" {
         .success = true,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2670,7 +2645,7 @@ test "usage ledger records failed response flag" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2697,7 +2672,7 @@ test "usage ledger records failed response flag" {
         .success = false,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2793,11 +2768,11 @@ test "getOrCreate uses named agent workspace namespace when workspace_path is se
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
-    const config_path = try std.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(testing.allocator, &.{ base, "config.json" });
     defer testing.allocator.free(config_path);
-    const expected_workspace = try std.fs.path.join(testing.allocator, &.{ base, "agents", "coder-agent" });
+    const expected_workspace = try std_compat.fs.path.join(testing.allocator, &.{ base, "agents", "coder-agent" });
     defer testing.allocator.free(expected_workspace);
 
     var mock = MockProvider{ .response = "ok" };
@@ -2826,9 +2801,9 @@ test "getOrCreate preserves named agent system prompt when workspace_path is set
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
-    const config_path = try std.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(testing.allocator, &.{ base, "config.json" });
     defer testing.allocator.free(config_path);
 
     const expected_prompt = "Focus on implementation and tests.";
@@ -2870,7 +2845,7 @@ test "getOrCreate auto-provisioned peer uses dedicated runtime workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2897,7 +2872,7 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2929,7 +2904,7 @@ test "claim gate blocks unverified peer when dm_scope is main" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2961,7 +2936,7 @@ test "claim gate attempts are scoped by account_id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3012,7 +2987,7 @@ test "claim gate blocks unverified peer before session provisioning" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3040,7 +3015,7 @@ test "claim gate unlocks peer runtime after valid signed token" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3059,7 +3034,7 @@ test "claim gate unlocks peer runtime after valid signed token" {
     const token = try testBuildClaimToken(
         testing.allocator,
         cfg.session.claim_secret.?,
-        std.time.timestamp() + 600,
+        std_compat.time.timestamp() + 600,
         "void",
         "nonce-001",
     );
@@ -3082,7 +3057,7 @@ test "claim gate persists verified identity across manager restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3103,7 +3078,7 @@ test "claim gate persists verified identity across manager restart" {
         const token = try testBuildClaimToken(
             testing.allocator,
             cfg.session.claim_secret.?,
-            std.time.timestamp() + 600,
+            std_compat.time.timestamp() + 600,
             "void",
             "nonce-persist",
         );
@@ -3130,7 +3105,7 @@ test "claim gate rejects replayed nonce across peers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3148,7 +3123,7 @@ test "claim gate rejects replayed nonce across peers" {
     const token = try testBuildClaimToken(
         testing.allocator,
         cfg.session.claim_secret.?,
-        std.time.timestamp() + 600,
+        std_compat.time.timestamp() + 600,
         "void",
         "nonce-replay",
     );
@@ -3173,7 +3148,7 @@ test "claim gate locks out after max failed attempts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3211,7 +3186,7 @@ test "claim gate supports revoke and returns peer to quarantine mode" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3231,7 +3206,7 @@ test "claim gate supports revoke and returns peer to quarantine mode" {
     const token = try testBuildClaimToken(
         testing.allocator,
         cfg.session.claim_secret.?,
-        std.time.timestamp() + 600,
+        std_compat.time.timestamp() + 600,
         "void",
         "nonce-revoke",
     );
@@ -3612,7 +3587,7 @@ test "processMessage updates last_active" {
     const before = session.last_active;
 
     // Small sleep so timestamp changes
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
 
     const resp = try sm.processMessage("user:2", "hello", null);
     defer testing.allocator.free(resp);
@@ -4309,7 +4284,7 @@ test "evictIdle removes old sessions" {
 
     const session = try sm.getOrCreate("old:1");
     // Force last_active to the past
-    session.last_active = std.time.timestamp() - 1000;
+    session.last_active = std_compat.time.timestamp() - 1000;
 
     const evicted = sm.evictIdle(500);
     try testing.expectEqual(@as(usize, 1), evicted);
@@ -4320,7 +4295,7 @@ test "evictIdle prunes unused dedicated agent runtimes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -4337,7 +4312,7 @@ test "evictIdle prunes unused dedicated agent runtimes" {
     const session = try sm.getOrCreate("agent:peer-0011223344556677:whatsapp_web:direct:5511");
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
 
-    session.last_active = std.time.timestamp() - 1000;
+    session.last_active = std_compat.time.timestamp() - 1000;
     const evicted = sm.evictIdle(1);
     try testing.expectEqual(@as(usize, 1), evicted);
     try testing.expectEqual(@as(usize, 0), sm.sessionCount());
@@ -4369,8 +4344,8 @@ test "evictIdle returns correct count" {
     const s2 = try sm.getOrCreate("s2");
     _ = try sm.getOrCreate("s3");
 
-    s1.last_active = std.time.timestamp() - 2000;
-    s2.last_active = std.time.timestamp() - 2000;
+    s1.last_active = std_compat.time.timestamp() - 2000;
+    s2.last_active = std_compat.time.timestamp() - 2000;
     // s3 stays recent
 
     const evicted = sm.evictIdle(1000);
@@ -4394,7 +4369,7 @@ test "evictIdle preserves sessions with active turns" {
     defer sm.deinit();
 
     const session = try sm.getOrCreate("busy:1");
-    session.last_active = std.time.timestamp() - 1000;
+    session.last_active = std_compat.time.timestamp() - 1000;
     session.turn_running.store(true, .release);
     defer session.turn_running.store(false, .release);
 

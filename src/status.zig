@@ -23,12 +23,21 @@ fn appendNullableString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.All
     }
 }
 
-fn overallStatus(snapshot: health.HealthSnapshot) []const u8 {
+fn appendNullablePid(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: ?u32) !void {
+    if (value) |pid| {
+        var int_buf: [24]u8 = undefined;
+        const text = try std.fmt.bufPrint(&int_buf, "{d}", .{pid});
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn overallStatus(components: []const health.SnapshotComponent) []const u8 {
     var saw_starting = false;
-    var iter = snapshot.components.iterator();
-    while (iter.next()) |entry| {
-        if (std.mem.eql(u8, entry.value_ptr.status, "error")) return "error";
-        if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) saw_starting = true;
+    for (components) |entry| {
+        if (std.mem.eql(u8, entry.health.status, "error")) return "error";
+        if (!std.mem.eql(u8, entry.health.status, "ok")) saw_starting = true;
     }
     return if (saw_starting) "starting" else "ok";
 }
@@ -60,18 +69,12 @@ fn appendComponentJson(
 }
 
 pub fn buildRuntimeStatusJson(allocator: std.mem.Allocator) ![]u8 {
-    const snapshot = health.snapshot();
+    var snapshot = try health.snapshot(allocator);
+    defer snapshot.deinit(allocator);
 
-    var names = std.ArrayListUnmanaged([]const u8).empty;
-    defer names.deinit(allocator);
-
-    var iter = snapshot.components.iterator();
-    while (iter.next()) |entry| {
-        try names.append(allocator, entry.key_ptr.*);
-    }
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-            return std.mem.order(u8, lhs, rhs) == .lt;
+    std.mem.sort(health.SnapshotComponent, snapshot.components, {}, struct {
+        fn lessThan(_: void, lhs: health.SnapshotComponent, rhs: health.SnapshotComponent) bool {
+            return std.mem.order(u8, lhs.name, rhs.name) == .lt;
         }
     }.lessThan);
 
@@ -81,36 +84,97 @@ pub fn buildRuntimeStatusJson(allocator: std.mem.Allocator) ![]u8 {
     try buf.appendSlice(allocator, "{");
     try json_util.appendJsonKeyValue(&buf, allocator, "version", version.string);
     try buf.appendSlice(allocator, ",");
-    try json_util.appendJsonInt(&buf, allocator, "pid", snapshot.pid);
+    try json_util.appendJsonKey(&buf, allocator, "pid");
+    try appendNullablePid(&buf, allocator, snapshot.pid);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonInt(&buf, allocator, "uptime_seconds", @intCast(snapshot.uptime_seconds));
     try buf.appendSlice(allocator, ",");
-    try json_util.appendJsonKeyValue(&buf, allocator, "overall_status", overallStatus(snapshot));
+    try json_util.appendJsonKeyValue(&buf, allocator, "overall_status", overallStatus(snapshot.components));
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(&buf, allocator, "components");
     try buf.appendSlice(allocator, "{");
-    for (names.items, 0..) |name, idx| {
+    for (snapshot.components, 0..) |entry, idx| {
         if (idx > 0) try buf.appendSlice(allocator, ",");
-        try appendComponentJson(&buf, allocator, name, snapshot.components.get(name).?);
+        try appendComponentJson(&buf, allocator, entry.name, entry.health);
     }
     try buf.appendSlice(allocator, "}}");
 
     return try buf.toOwnedSlice(allocator);
 }
 
-fn printGatewayRuntimeStatusJson(allocator: std.mem.Allocator) bool {
+fn buildFallbackStatusJson(
+    allocator: std.mem.Allocator,
+    overall_status: []const u8,
+    message: ?[]const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&buf, allocator, "version", version.string);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "pid");
+    try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "uptime_seconds", 0);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "overall_status", overall_status);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "components");
+    try buf.appendSlice(allocator, "{}");
+    if (message) |msg| {
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "message", msg);
+    }
+    try buf.appendSlice(allocator, "}");
+    return try buf.toOwnedSlice(allocator);
+}
+
+const GatewayStatusFetch = enum {
+    printed,
+    unavailable,
+    unauthorized,
+    failed,
+};
+
+fn printGatewayRuntimeStatusJson(allocator: std.mem.Allocator) GatewayStatusFetch {
     switch (cron.requestGatewayGet(allocator, "/status")) {
-        .unavailable => return false,
+        .unavailable => return .unavailable,
         .response => |resp| {
             defer allocator.free(resp.body);
-            if (resp.status_code < 200 or resp.status_code >= 300) return false;
-            printStdoutBytes(resp.body);
-            if (resp.body.len == 0 or resp.body[resp.body.len - 1] != '\n') {
-                printStdoutBytes("\n");
+            if (resp.status_code >= 200 and resp.status_code < 300) {
+                printStdoutBytes(resp.body);
+                if (resp.body.len == 0 or resp.body[resp.body.len - 1] != '\n') {
+                    printStdoutBytes("\n");
+                }
+                return .printed;
             }
-            return true;
+            if (resp.status_code == 401 or resp.status_code == 403) return .unauthorized;
+            return .failed;
         },
     }
+}
+
+fn printFallbackStatusJson(allocator: std.mem.Allocator, fetch: GatewayStatusFetch) !void {
+    const status_json = try buildFallbackStatusJson(
+        allocator,
+        switch (fetch) {
+            .printed => unreachable,
+            .unavailable => "unavailable",
+            .unauthorized => "unauthorized",
+            .failed => "gateway_error",
+        },
+        switch (fetch) {
+            .printed => null,
+            .unavailable => "Gateway unavailable",
+            .unauthorized => "Gateway status requires authentication",
+            .failed => "Gateway status request failed",
+        },
+    );
+    defer allocator.free(status_json);
+
+    printStdoutBytes(status_json);
+    printStdoutBytes("\n");
 }
 
 pub fn run(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -122,16 +186,10 @@ pub fn run(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     };
 
     if (json_mode) {
-        if (printGatewayRuntimeStatusJson(allocator)) return;
-
-        const status_json = buildRuntimeStatusJson(allocator) catch |err| {
-            std.debug.print("Failed to build status JSON: {s}\n", .{@errorName(err)});
-            std_compat.process.exit(1);
-        };
-        defer allocator.free(status_json);
-
-        printStdoutBytes(status_json);
-        printStdoutBytes("\n");
+        switch (printGatewayRuntimeStatusJson(allocator)) {
+            .printed => return,
+            else => |fetch| try printFallbackStatusJson(allocator, fetch),
+        }
         return;
     }
 
@@ -255,4 +313,13 @@ test "buildRuntimeStatusJson reports unhealthy components" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"overall_status\":\"error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"last_error\":\"connection refused\"") != null);
+}
+
+test "buildFallbackStatusJson reports unavailable status without pid" {
+    const json = try buildFallbackStatusJson(std.testing.allocator, "unavailable", "Gateway unavailable");
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"pid\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"overall_status\":\"unavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"message\":\"Gateway unavailable\"") != null);
 }

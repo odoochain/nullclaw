@@ -5484,6 +5484,42 @@ test "hasStartupProviderCredentials rejects blank configured key" {
 
 test "hasStartupProviderCredentials rejects missing provider and fallback credentials" {
     // Regression: channel startup must still fail fast when neither the primary provider nor fallbacks can authenticate.
+    const env_c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const env_vars = [_][]const u8{ "ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "NULLCLAW_API_KEY", "API_KEY" };
+    var saved: [env_vars.len]?[:0]u8 = .{null} ** env_vars.len;
+    defer for (&saved, env_vars) |*s, name| {
+        const name_z = std.testing.allocator.dupeZ(u8, name) catch continue;
+        defer std.testing.allocator.free(name_z);
+        if (s.*) |prev| {
+            if (comptime builtin.os.tag == .windows)
+                _ = env_c._putenv_s(name_z.ptr, prev.ptr)
+            else
+                _ = env_c.setenv(name_z.ptr, prev.ptr, 1);
+            std.testing.allocator.free(prev);
+            s.* = null;
+        } else {
+            if (comptime builtin.os.tag == .windows)
+                _ = env_c._putenv_s(name_z.ptr, "")
+            else
+                _ = env_c.unsetenv(name_z.ptr);
+        }
+    };
+
+    for (&saved, env_vars) |*s, name| {
+        const name_z = try std.testing.allocator.dupeZ(u8, name);
+        defer std.testing.allocator.free(name_z);
+        if (env_c.getenv(name_z.ptr)) |val| {
+            s.* = try std.testing.allocator.dupeZ(u8, std.mem.span(val));
+        }
+        if (comptime builtin.os.tag == .windows)
+            _ = env_c._putenv_s(name_z.ptr, "")
+        else
+            _ = env_c.unsetenv(name_z.ptr);
+    }
+
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",

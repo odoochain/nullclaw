@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zig fmt *)",
+      "Bash(zig version *)",
+      "Bash(zig build *)"
+    ]
+  }
+}

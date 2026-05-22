@@ -35,6 +35,62 @@ NullClaw follows secure-by-default behavior: local bind by default, pairing auth
 | Resource limits | Enabled | Configurable memory/CPU/subprocess limits |
 | Audit logging | Enabled | Optional audit trail with retention policy |
 
+## Privacy Redaction Boundary
+
+When PII redaction is enabled, NullClaw replaces detected sensitive values with
+deterministic placeholders such as `[EMAIL_1]`, `[PHONE_1]`, or `[CARD_1]`
+before provider calls, local session persistence, memory autosave, diagnostics,
+and vector embedding sync.
+
+The reusable redactor defaults to one-way operation: it keys values by
+HMAC-SHA256 fingerprints and does not retain the original plaintext. The agent
+uses an opt-in in-memory reverse map for its per-conversation redactor so it can
+rehydrate placeholders for same-principal, single-user display paths. Shared
+channel, group, and thread sessions keep placeholders in the outbound response.
+Tool arguments keep literal placeholders by default; this prevents provider
+output from becoming a provider-to-tool exfiltration channel. The reverse map
+lives only in process RAM, is bounded, is reset with the conversation, and is
+not written to memory, history, JSONL export, or diagnostics.
+
+The redactor is a lightweight text scanner, not a full DLP/OCR engine. It covers
+common text forms for emails, phone numbers, Luhn-valid cards, anchored
+passport/ID values, and token/secret patterns. Binary image contents, OCR text,
+EXIF metadata, and unsupported locale-specific document formats are outside
+this boundary unless another tool extracts them as text first.
+
+## Governed Memory Workflows
+
+Use `nullclaw memory export-jsonl` when memory needs to become a DS artifact.
+The command emits JSONL with a stable schema and excludes bootstrap/autosave
+internal entries by default. Content is PII-redacted by default. Use
+`--include-pii` only when exporting inside a trusted local boundary; the older
+`--redact-pii` flag is still accepted as a compatibility no-op.
+
+Use `nullclaw memory hygiene-report` before cleanup work. The command is always
+a dry run: it reports exact and normalized duplicate groups without deleting,
+rewriting, or reindexing memory entries.
+
+## On-Demand Anonymization Tool
+
+The `anonymize_text` tool exposes the same lightweight redaction primitive to
+the agent for one-off text snippets. It accepts a required `text` field and
+optional `redact_email`, `redact_phone`, `redact_card`, `redact_id`, and
+`redact_tokens` booleans. All categories are enabled by default; explicitly
+disabled categories pass through unchanged.
+
+The model-facing `sqlite_query` tool always returns redacted results. Raw
+sensitive SQLite output is not exposed through the agent tool schema. It also
+rejects common text transform / encoding functions such as `hex(...)` and
+`substr(...)`, because those can turn PII into a form the text redactor cannot
+recover after query execution.
+
+Each call uses a fresh one-way redactor, so placeholder counters restart from
+`[EMAIL_1]` / `[PHONE_1]` inside that call and no plaintext reverse map is kept
+after the tool returns. Use it before putting user-supplied text into tickets,
+notebooks, logs, exports, or downstream tools that do not need the original
+sensitive values. The tool is text-only and bounded to 256 KiB input; it does
+not inspect binary image contents, OCR text, or EXIF metadata.
+
 ## Channel Allowlists
 
 - `allow_from` behavior is channel-specific; do not assume `[]` is a deny-by-default switch across every runtime.
@@ -115,7 +171,69 @@ These settings significantly widen trust boundaries and should be used only in c
 - `autonomy.level = "yolo"`
 - `allowed_commands = ["*"]`
 - `allowed_paths = ["*"]`
+- `block_high_risk_commands = false` — enables destructive commands (`rm`, `sudo`, `dd`, `mkfs`, etc.)
+- `block_medium_risk_commands = false` — enables medium-risk commands, including network/transfer commands (`curl`, `wget`, `nc`, `scp`, etc.) and local mutations such as `git commit`, `npm install`, or `touch`
 - `gateway.allow_public_bind = true`
+
+## Workspace Secret Audit
+
+`nullclaw workspace audit` scans the workspace, a staged Git diff, or a Git revision range for likely secret leaks. Detection runs entirely on the local machine and emits findings in a stable JSON shape suitable for CI integration.
+
+### What is detected
+
+| Detector | Source |
+|---|---|
+| Known token-prefix fingerprints | `AKIA…`, `ghp_`, `gho_`, `ghs_`, `glpat-`, `xoxb-`, `xoxp-`, `sk-`, `sk-proj-` and friends |
+| Score-based assignment matcher | Decomposes `KEY=value` / `key: value` into named components scored against a secret-keyword dictionary |
+| Format detectors | `-----BEGIN PRIVATE KEY-----` PEM blocks; credentials embedded in URLs (`scheme://user:pass@host/...`) |
+| High-entropy walker | Any token-shaped run of ≥ 16 characters with Shannon entropy ≥ 4.0 that is not a UUID, git commit hash, or placeholder string |
+
+Exit codes follow `--fail-on <none\|medium\|high\|critical>` (default `high`). Combine with `--json` for CI pipelines.
+
+### Optional LLM triage
+
+The `--llm-triage` flag adds an opt-in second stage that classifies findings using the agent's configured LLM provider. The classifier receives a **privacy-preserving envelope** that omits the raw secret value:
+
+| In the envelope | NOT in the envelope |
+|---|---|
+| `variable_name`, `file_path`, `extension`, `detector` | the secret value itself |
+| `token_type_fingerprint` (deterministic local lookup) | any substring of the secret |
+| `length`, `charset`, `entropy` | line content around the secret |
+| Masked line context (e.g. `KEY=<SECRET:len=40,charset=base64url,entropy=5.3>`) | non-canonical surrounding words |
+| `nearby_keywords` filtered through a whitelist of ~60 canonical security/service terms | customer names, internal hostnames, business identifiers |
+| Deterministic flags: `is_test_path`, `is_example_file`, `is_in_comment`, `is_in_docstring` | the LLM's inference of those flags |
+
+The envelope schema is versioned (`schema_version: "1"`) and each envelope carries a SHA-256 `envelope_hash` for traceability.
+
+Three modes:
+
+- `--llm-triage off` (default) — no LLM activity; behavior identical to a baseline scan.
+- `--llm-triage dry-run` — print the envelopes that *would* be sent (to stderr) without making any network call. Use this to confirm what would leave the machine before turning the feature on.
+- `--llm-triage external` — submit envelopes through the configured provider vtable. Uses `workspace_audit.llm_triage.{provider,model}` when present, then the configured primary provider/model, unless overridden by `--llm-provider` / `--llm-model`. When the provider is local (e.g. Ollama) the envelopes do not leave the machine at all.
+
+To pin audit triage to a smaller/local model without changing the normal agent model, set:
+
+```json
+{
+  "workspace_audit": {
+    "llm_triage": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "max_calls": 20
+    }
+  }
+}
+```
+
+This config does not enable external LLM calls by itself; the operator still has to pass `--llm-triage external`. CLI flags `--llm-provider`, `--llm-model`, and `--llm-max-calls` override these config values for a single run. Unknown provider names are rejected unless that provider has an explicit `models.providers.<name>.base_url`, so a typo cannot silently route audit envelopes through a fallback provider.
+
+Every `external` request is appended to `<config-dir>/audit-log.jsonl`. NullClaw writes a `sent` event containing the envelope before the LLM call, then a `verdict` event keyed by `envelope_hash` after the response. The log is append-only and intended for after-the-fact verification of what metadata was sent.
+
+### Operator notes
+
+- Default `--llm-triage off` means no behavior change for existing scans. Enable explicitly when triaging false positives is a problem.
+- For privacy-sensitive deployments, pin `workspace_audit.llm_triage.provider` to `ollama` (or another local-only provider) before enabling `--llm-triage external`.
+- Verdict values are advisory: a `false_positive` decision drops the finding; a `real_secret` decision may adjust severity. The deterministic Stage 1 detectors remain authoritative on whether a candidate is surfaced at all.
 
 ## Next Steps
 

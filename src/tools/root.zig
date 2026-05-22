@@ -9,9 +9,9 @@ const builtin = @import("builtin");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
+const config_types = @import("../config_types.zig");
 const mcp_mod = @import("../mcp.zig");
 const SandboxBackend = @import("../security/sandbox.zig").SandboxBackend;
-const createSandbox = @import("../security/sandbox.zig").createSandbox;
 const ConfigSandboxBackend = @import("../config.zig").SandboxBackend;
 
 fn mapConfigSandboxBackend(backend: ConfigSandboxBackend) SandboxBackend {
@@ -127,6 +127,8 @@ pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 pub const calculator = @import("calculator.zig");
+pub const sqlite_query = @import("sqlite_query.zig");
+pub const anonymize_text = @import("anonymize_text.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -167,6 +169,7 @@ pub const ToolSpec = struct {
 pub const Tool = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    custom_description: ?[]const u8 = null,
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult,
@@ -185,6 +188,7 @@ pub const Tool = struct {
     }
 
     pub fn description(self: Tool) []const u8 {
+        if (self.custom_description) |desc| return desc;
         return self.vtable.description(self.ptr);
     }
 
@@ -208,6 +212,38 @@ pub const Tool = struct {
         }
     }
 };
+
+fn findToolCustomization(customizations: []const config_types.ToolCustomization, tool_name: []const u8) ?config_types.ToolCustomization {
+    for (customizations) |cust| {
+        if (std.mem.eql(u8, tool_name, cust.name)) return cust;
+    }
+    return null;
+}
+
+fn applyToolCustomizations(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Tool),
+    customizations: []const config_types.ToolCustomization,
+) void {
+    if (customizations.len == 0) return;
+
+    var write_idx: usize = 0;
+    for (list.items) |*tool_item| {
+        if (findToolCustomization(customizations, tool_item.name())) |cust| {
+            if (!cust.enabled) {
+                tool_item.deinit(allocator);
+                continue;
+            }
+            if (cust.system_prompt) |prompt| {
+                tool_item.custom_description = prompt;
+            }
+        }
+
+        list.items[write_idx] = tool_item.*;
+        write_idx += 1;
+    }
+    list.shrinkRetainingCapacity(write_idx);
+}
 
 /// Generate a Tool.VTable from a tool struct type at comptime.
 ///
@@ -355,17 +391,14 @@ pub fn allTools(
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
         .path_env_vars = tc.path_env_vars,
-        // sandbox and sandbox_storage initialized below if enabled
     };
     if (opts.sandbox_enabled and comptime builtin.os.tag != .windows) {
         // Windows shells use cmd.exe/PowerShell, which Unix-oriented sandboxes
         // cannot wrap without breaking command execution semantics.
-        st.sandbox = createSandbox(
-            allocator,
-            mapConfigSandboxBackend(opts.sandbox_backend),
-            workspace_dir,
-            &st.sandbox_storage,
-        );
+        // Delay sandbox auto-detection until the shell tool is actually used so
+        // channel/runtime startup does not spawn probe children preemptively.
+        st.sandbox_backend = mapConfigSandboxBackend(opts.sandbox_backend);
+        st.sandbox_allocator = allocator;
     }
     try list.append(allocator, st.tool());
 
@@ -445,6 +478,17 @@ pub fn allTools(
     const calt = try allocator.create(calculator.CalculatorTool);
     calt.* = .{};
     try list.append(allocator, calt.tool());
+
+    const sqt = try allocator.create(sqlite_query.SqliteQueryTool);
+    sqt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+    };
+    try list.append(allocator, sqt.tool());
+
+    const ant = try allocator.create(anonymize_text.AnonymizeTextTool);
+    ant.* = .{};
+    try list.append(allocator, ant.tool());
 
     // Memory tools (work gracefully without a backend)
     const mst = try allocator.create(memory_store.MemoryStoreTool);
@@ -563,6 +607,8 @@ pub fn allTools(
             try list.append(allocator, t);
         }
     }
+
+    applyToolCustomizations(allocator, &list, opts.tools_config.tool_customizations);
 
     return list.toOwnedSlice(allocator);
 }
@@ -731,6 +777,8 @@ pub fn subagentTools(
         try list.append(allocator, ht.tool());
     }
 
+    applyToolCustomizations(allocator, &list, opts.tools_config.tool_customizations);
+
     return list.toOwnedSlice(allocator);
 }
 
@@ -888,10 +936,10 @@ test "all tools includes extras when enabled" {
 
     // Order: shell, file_read, file_write, file_edit, file_append, file_delete,
     //        file_read_hashed, file_edit_hashed, git, image_info, calculator,
-    //        memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn, pushover, http_request, web_search,
-    //        web_fetch, browser = 23
-    try std.testing.expectEqual(@as(usize, 23), tools.len);
+    //        sqlite_query, anonymize_text, memory_store, memory_recall,
+    //        memory_list, memory_forget, delegate, schedule, spawn, pushover,
+    //        http_request, web_search, web_fetch, browser = 25
+    try std.testing.expectEqual(@as(usize, 25), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -900,12 +948,38 @@ test "all tools excludes extras when disabled" {
 
     // Order: shell, file_read, file_write, file_edit, file_append, file_delete,
     //        file_read_hashed, file_edit_hashed, git, image_info, calculator,
-    //        memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn = 18
-    try std.testing.expectEqual(@as(usize, 18), tools.len);
+    //        sqlite_query, anonymize_text, memory_store, memory_recall,
+    //        memory_list, memory_forget, delegate, schedule, spawn = 20
+    try std.testing.expectEqual(@as(usize, 20), tools.len);
 }
 
-test "all tools wires shell sandbox by default" {
+test "all tools apply configured descriptions and enabled filters" {
+    const customizations = [_]config_types.ToolCustomization{
+        .{ .name = "shell", .enabled = false },
+        .{ .name = "file_read", .system_prompt = "Read only small files" },
+    };
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tools_config = .{ .tool_customizations = &customizations },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_shell = false;
+    var saw_file_read = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "shell")) saw_shell = true;
+        if (std.mem.eql(u8, t.name(), "file_read")) {
+            saw_file_read = true;
+            try std.testing.expectEqualStrings("Read only small files", t.description());
+        }
+    }
+
+    try std.testing.expect(!saw_shell);
+    try std.testing.expect(saw_file_read);
+    try std.testing.expectEqual(@as(usize, 19), tools.len);
+}
+
+test "all tools defers shell sandbox initialization by default" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
@@ -915,7 +989,9 @@ test "all tools wires shell sandbox by default" {
     for (tools) |t| {
         if (!std.mem.eql(u8, t.name(), "shell")) continue;
         const st: *shell.ShellTool = @ptrCast(@alignCast(t.ptr));
-        try std.testing.expect(st.sandbox != null);
+        try std.testing.expect(st.sandbox == null);
+        try std.testing.expectEqual(SandboxBackend.auto, st.sandbox_backend.?);
+        try std.testing.expect(st.sandbox_allocator != null);
         saw_shell = true;
         break;
     }
@@ -1238,6 +1314,34 @@ test "subagent tools wire http allowlist, response limit, and timeout" {
     try std.testing.expect(saw_http);
 }
 
+test "subagent tools apply configured descriptions and enabled filters" {
+    // Regression: subagentTools receives ToolsConfig and must honor tool customizations
+    // the same way allTools does.
+    const customizations = [_]config_types.ToolCustomization{
+        .{ .name = "git_operations", .enabled = false },
+        .{ .name = "shell", .system_prompt = "Use shell only for deterministic commands" },
+    };
+
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tools_config = .{ .tool_customizations = &customizations },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_git = false;
+    var saw_shell = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "git_operations")) saw_git = true;
+        if (std.mem.eql(u8, t.name(), "shell")) {
+            saw_shell = true;
+            try std.testing.expectEqualStrings("Use shell only for deterministic commands", t.description());
+        }
+    }
+
+    try std.testing.expect(!saw_git);
+    try std.testing.expect(saw_shell);
+    try std.testing.expectEqual(@as(usize, 8), tools.len);
+}
+
 test "bindMemoryTools matches by vtable, not by colliding tool name" {
     const FakeCollidingTool = struct {
         sentinel: usize = 0xDEADBEEF,
@@ -1271,6 +1375,129 @@ test "bindMemoryTools matches by vtable, not by colliding tool name" {
 
     try std.testing.expect(real_memory_store.memory != null);
     try std.testing.expectEqual(@as(usize, 0xDEADBEEF), fake_memory_store_name.sentinel);
+}
+
+test "every tool from allTools exposes non-empty metadata and survives lifecycle" {
+    const alloc = std.testing.allocator;
+
+    // Use a tmp workspace to satisfy path-touching tools.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(alloc, ".");
+    defer alloc.free(ws_path);
+
+    const tools = try allTools(alloc, ws_path, .{});
+    defer deinitTools(alloc, tools);
+
+    // The ToolVTable name/description/parameters_json slots take an
+    // anyopaque ptr but never dereference it — they return compile-time
+    // T.tool_name / T.tool_description / T.tool_params constants. So this
+    // loop verifies metadata-presence only; the ptr itself is exercised
+    // by `every tool from allTools has useful schema semantics` below
+    // (which calls execute() through the vtable). The leak-free lifecycle
+    // is enforced by std.testing.allocator at scope exit.
+    for (tools) |tool| {
+        const n = tool.name();
+        try std.testing.expect(n.len > 0);
+        const desc = tool.description();
+        try std.testing.expect(desc.len > 0);
+        const params = tool.parametersJson();
+        try std.testing.expect(params.len > 0);
+    }
+}
+
+fn toolSchemaHasRequiredFields(schema_value: JsonValue) !bool {
+    try std.testing.expect(schema_value == .object);
+
+    const type_field = schema_value.object.get("type") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(type_field == .string);
+    try std.testing.expectEqualStrings("object", type_field.string);
+
+    const properties = schema_value.object.get("properties") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(properties == .object);
+
+    const required = schema_value.object.get("required") orelse return false;
+    try std.testing.expect(required == .array);
+
+    var has_required = false;
+    for (required.array.items) |field| {
+        try std.testing.expect(field == .string);
+        has_required = true;
+        try std.testing.expect(properties.object.contains(field.string));
+    }
+
+    return has_required;
+}
+
+test "every tool from allTools has useful schema semantics" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(alloc, ".");
+    defer alloc.free(ws_path);
+
+    const browser_domains = [_][]const u8{"example.com"};
+    const tools = try allTools(alloc, ws_path, .{
+        .http_enabled = true,
+        .browser_enabled = true,
+        .screenshot_enabled = true,
+        .browser_open_domains = &browser_domains,
+    });
+    defer deinitTools(alloc, tools);
+
+    var seen_names = std.StringHashMap(void).init(alloc);
+    defer seen_names.deinit();
+
+    for (tools) |tool| {
+        const name = tool.name();
+        try std.testing.expect(name.len > 0);
+        const gop = try seen_names.getOrPut(name);
+        try std.testing.expect(!gop.found_existing);
+
+        const description = tool.description();
+        try std.testing.expect(description.len > 0);
+        try std.testing.expectEqualStrings(description, std.mem.trim(u8, description, " \t\r\n"));
+
+        const params = tool.parametersJson();
+        try std.testing.expect(params.len > 0);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, params, .{});
+        defer parsed.deinit();
+
+        if (try toolSchemaHasRequiredFields(parsed.value)) {
+            const empty_args = try parseTestArgs("{}");
+            defer empty_args.deinit();
+
+            var result_arena = std.heap.ArenaAllocator.init(alloc);
+            defer result_arena.deinit();
+
+            const result = try tool.execute(result_arena.allocator(), empty_args.value.object);
+            try std.testing.expect(!result.success);
+            try std.testing.expect(result.output.len > 0 or (result.error_msg != null and result.error_msg.?.len > 0));
+        }
+    }
+}
+
+test "all tools wires anonymize_text and end-to-end redacts an email" {
+    // Ensure the tool is registered in the default set and that calling it
+    // through the vtable produces a redacted output.
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_anonymize = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "anonymize_text")) continue;
+        saw_anonymize = true;
+        const parsed = try parseTestArgs("{\"text\":\"reach me at user@example.com\"}");
+        defer parsed.deinit();
+        const result = try t.execute(std.testing.allocator, parsed.value.object);
+        defer std.testing.allocator.free(result.output);
+        try std.testing.expect(result.success);
+        try std.testing.expectEqualStrings("reach me at [EMAIL_1]", result.output);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "user@example.com") == null);
+        break;
+    }
+    try std.testing.expect(saw_anonymize);
 }
 
 test {

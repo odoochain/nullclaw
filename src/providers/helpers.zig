@@ -2,7 +2,6 @@ const std = @import("std");
 const std_compat = @import("compat");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
-const config_types = @import("../config_types.zig");
 const root = @import("root.zig");
 const ToolSpec = root.ToolSpec;
 
@@ -134,127 +133,6 @@ pub fn extractReasoningTextFromDetails(allocator: std.mem.Allocator, details: st
     if (trimmed.len == 0) return null;
     const owned = try allocator.dupe(u8, trimmed);
     return owned;
-}
-
-/// Extract api_key from a config-like struct (supports both Config.defaultProviderKey() and plain .api_key field).
-fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
-    const T = @TypeOf(cfg);
-    const Struct = switch (@typeInfo(T)) {
-        .pointer => |p| p.child,
-        else => T,
-    };
-    if (@hasField(Struct, "api_key")) return cfg.api_key;
-    if (@hasDecl(Struct, "defaultProviderKey")) return cfg.defaultProviderKey();
-    return null;
-}
-
-/// High-level complete function that routes to the right provider via HTTP.
-/// Used by agent.zig for backward compatibility.
-pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) ![]const u8 {
-    const api_key = resolveApiKeyFromCfg(cfg) orelse return error.NoApiKey;
-    const url = providerUrl(cfg.default_provider);
-    const model = cfg.default_model orelse return error.NoDefaultModel;
-    const body_str = try buildRequestBody(allocator, model, prompt, cfg.temperature, cfg.max_tokens orelse config_types.DEFAULT_MODEL_MAX_TOKENS);
-    defer allocator.free(body_str);
-
-    var auth_buf: [512]u8 = undefined;
-    const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
-
-    var client = try http_util.ProxyHttpClient.init(allocator);
-    defer client.deinit();
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const result = try client.client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body_str,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_val },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .response_writer = &aw.writer,
-    });
-
-    if (result.status != .ok) return error.ProviderError;
-
-    const response_body = aw.writer.buffer[0..aw.writer.end];
-    return try extractContent(allocator, response_body);
-}
-
-/// Like complete() but prepends a system prompt. OpenAI-compatible format.
-pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_prompt: []const u8, prompt: []const u8) ![]const u8 {
-    const api_key = resolveApiKeyFromCfg(cfg) orelse return error.NoApiKey;
-    const url = providerUrl(cfg.default_provider);
-    const model = cfg.default_model orelse return error.NoDefaultModel;
-    const max_tok: u32 = if (cfg.max_tokens) |mt| @intCast(@min(mt, std.math.maxInt(u32))) else config_types.DEFAULT_MODEL_MAX_TOKENS;
-    const body_str = try buildRequestBodyWithSystem(allocator, model, system_prompt, prompt, cfg.temperature, max_tok);
-    defer allocator.free(body_str);
-
-    var auth_buf: [512]u8 = undefined;
-    const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
-
-    var client = try http_util.ProxyHttpClient.init(allocator);
-    defer client.deinit();
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const result = try client.client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body_str,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_val },
-            .{ .name = "Content-Type", .value = "application/json" },
-        },
-        .response_writer = &aw.writer,
-    });
-
-    if (result.status != .ok) return error.ProviderError;
-
-    const response_body = aw.writer.buffer[0..aw.writer.end];
-    return try extractContent(allocator, response_body);
-}
-
-/// Provider URL mapping for the legacy complete() function.
-pub fn providerUrl(provider_name: []const u8) []const u8 {
-    const map = std.StaticStringMap([]const u8).initComptime(.{
-        .{ "anthropic", "https://api.anthropic.com/v1/messages" },
-        .{ "openai", "https://api.openai.com/v1/chat/completions" },
-        .{ "ollama", "http://localhost:11434/api/chat" },
-        .{ "gemini", "https://generativelanguage.googleapis.com/v1beta" },
-        .{ "google", "https://generativelanguage.googleapis.com/v1beta" },
-        .{ "vertex", "https://aiplatform.googleapis.com/v1" },
-    });
-    return map.get(provider_name) orelse "https://openrouter.ai/api/v1/chat/completions";
-}
-
-/// Build a JSON request body for the legacy complete() function.
-pub fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt: []const u8, temperature: f64, max_tokens: u32) ![]const u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"model\":");
-    try json_util.appendJsonString(&buf, allocator, model);
-    try buf.appendSlice(allocator, ",\"messages\":[{\"role\":\"user\",\"content\":");
-    try json_util.appendJsonString(&buf, allocator, prompt);
-    try buf.print(allocator, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
-    return try buf.toOwnedSlice(allocator);
-}
-
-/// Build a JSON request body with a system prompt (OpenAI-compatible format).
-pub fn buildRequestBodyWithSystem(allocator: std.mem.Allocator, model: []const u8, system: []const u8, prompt: []const u8, temperature: f64, max_tokens: u32) ![]const u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"model\":\"");
-    try buf.appendSlice(allocator, model);
-    try buf.appendSlice(allocator, "\",\"messages\":[{\"role\":\"system\",\"content\":");
-    try json_util.appendJsonString(&buf, allocator, system);
-    try buf.appendSlice(allocator, "},{\"role\":\"user\",\"content\":");
-    try json_util.appendJsonString(&buf, allocator, prompt);
-    try buf.print(allocator, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
-    return try buf.toOwnedSlice(allocator);
 }
 
 /// Append OpenAI-compatible request extras:
@@ -627,7 +505,7 @@ pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []cons
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
-        error.InvalidUrl, error.LocalAddressBlocked, error.HostResolutionFailed => return err,
+        error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);
@@ -647,7 +525,7 @@ pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
     const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
-        error.InvalidUrl, error.LocalAddressBlocked, error.HostResolutionFailed => return err,
+        error.InvalidUrl, error.HostResolutionFailed, error.LocalAddressBlocked => return err,
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer if (resolve_entry) |entry| allocator.free(entry);
@@ -659,35 +537,6 @@ pub fn curlPostFormTimed(allocator: std.mem.Allocator, url: []const u8, body: []
         return http_util.curlPostFormWithProxyAndResolve(allocator, url, body, proxy, timeout_str, resolve_entry);
     }
     return http_util.curlPostFormWithProxyAndResolve(allocator, url, body, proxy, null, resolve_entry);
-}
-
-/// Extract text content from a provider JSON response.
-pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    defer parsed.deinit();
-    const root_obj = parsed.value.object;
-
-    // OpenAI/OpenRouter format: choices[0].message.content
-    if (root_obj.get("choices")) |choices| {
-        if (choices == .array and choices.array.items.len > 0) {
-            if (choices.array.items[0].object.get("message")) |msg| {
-                if (msg.object.get("content")) |content| {
-                    if (content == .string) return try allocator.dupe(u8, content.string);
-                }
-            }
-        }
-    }
-
-    // Anthropic format: content[0].text
-    if (root_obj.get("content")) |content| {
-        if (content == .array and content.array.items.len > 0) {
-            if (content.array.items[0].object.get("text")) |text| {
-                if (text == .string) return try allocator.dupe(u8, text.string);
-            }
-        }
-    }
-
-    return error.UnexpectedResponse;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -813,103 +662,6 @@ test "convertToolsResponses empty tools" {
     defer buf.deinit(alloc);
     try convertToolsResponses(&buf, alloc, &.{});
     try std.testing.expectEqualStrings("[]", buf.items);
-}
-
-test "providerUrl returns correct URLs" {
-    try std.testing.expectEqualStrings(
-        "https://api.anthropic.com/v1/messages",
-        providerUrl("anthropic"),
-    );
-    try std.testing.expectEqualStrings(
-        "https://api.openai.com/v1/chat/completions",
-        providerUrl("openai"),
-    );
-    try std.testing.expectEqualStrings(
-        "https://openrouter.ai/api/v1/chat/completions",
-        providerUrl("openrouter"),
-    );
-    try std.testing.expectEqualStrings(
-        "http://localhost:11434/api/chat",
-        providerUrl("ollama"),
-    );
-}
-
-test "extractContent parses OpenAI format" {
-    const allocator = std.testing.allocator;
-    const body =
-        \\{"choices":[{"message":{"content":"Hello there!"}}]}
-    ;
-    const result = try extractContent(allocator, body);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Hello there!", result);
-}
-
-test "extractContent parses Anthropic format" {
-    const allocator = std.testing.allocator;
-    const body =
-        \\{"content":[{"type":"text","text":"Hello from Claude"}]}
-    ;
-    const result = try extractContent(allocator, body);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Hello from Claude", result);
-}
-
-test "extractContent skips null choices and parses Anthropic format" {
-    // Regression: some OpenAI-compatible providers return `"choices": null`.
-    const allocator = std.testing.allocator;
-    const body =
-        \\{"choices":null,"content":[{"type":"text","text":"Hello from Claude"}]}
-    ;
-    const result = try extractContent(allocator, body);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Hello from Claude", result);
-}
-
-test "extractContent null content fails cleanly" {
-    const allocator = std.testing.allocator;
-    const body =
-        \\{"content":null}
-    ;
-    try std.testing.expectError(error.UnexpectedResponse, extractContent(allocator, body));
-}
-
-test "buildRequestBody escapes double quotes in prompt" {
-    const allocator = std.testing.allocator;
-    const body = try buildRequestBody(allocator, "gpt-4o", "say \"hello\"", 0.7, 100);
-    defer allocator.free(body);
-    // Raw quote would break JSON; escaped form must be present
-    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"hello\\\"") != null);
-    // Verify it's valid JSON
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    parsed.deinit();
-}
-
-test "buildRequestBody escapes newlines in prompt" {
-    const allocator = std.testing.allocator;
-    const body = try buildRequestBody(allocator, "gpt-4o", "line1\nline2", 0.7, 100);
-    defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\\n") != null);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    parsed.deinit();
-}
-
-test "buildRequestBody escapes backslash in prompt" {
-    const allocator = std.testing.allocator;
-    const body = try buildRequestBody(allocator, "gpt-4o", "path\\to\\file", 0.7, 100);
-    defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\\\\") != null);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    parsed.deinit();
-}
-
-test "buildRequestBodyWithSystem escapes special chars in both fields" {
-    const allocator = std.testing.allocator;
-    const body = try buildRequestBodyWithSystem(allocator, "gpt-4o", "sys \"role\"", "user\nprompt", 0.7, 100);
-    defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"role\\\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\\n") != null);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    parsed.deinit();
 }
 
 test "serializeMessageContent plain text" {

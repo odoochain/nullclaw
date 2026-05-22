@@ -1,5 +1,6 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 const agent_routing = @import("agent_routing.zig");
 const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
@@ -126,6 +127,8 @@ pub const CostConfig = config_types.CostConfig;
 pub const PeripheralBoardConfig = config_types.PeripheralBoardConfig;
 pub const PeripheralsConfig = config_types.PeripheralsConfig;
 pub const HardwareConfig = config_types.HardwareConfig;
+pub const WorkspaceAuditTriageConfig = config_types.WorkspaceAuditTriageConfig;
+pub const WorkspaceAuditConfig = config_types.WorkspaceAuditConfig;
 pub const SandboxConfig = config_types.SandboxConfig;
 pub const ResourceLimitsConfig = config_types.ResourceLimitsConfig;
 pub const AuditConfig = config_types.AuditConfig;
@@ -151,6 +154,7 @@ const SerializedNamedAgentConfig = struct {
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
+    enable_pii_redaction: bool = true,
 };
 
 const SerializedModelRouteConfig = struct {
@@ -236,6 +240,7 @@ pub const Config = struct {
     cost: CostConfig = .{},
     peripherals: PeripheralsConfig = .{},
     hardware: HardwareConfig = .{},
+    workspace_audit: WorkspaceAuditConfig = .{},
     security: SecurityConfig = .{},
     tools: ToolsConfig = .{},
     session: SessionConfig = .{},
@@ -467,6 +472,28 @@ pub const Config = struct {
             };
         } else |_| {
             // Config file doesn't exist yet — use defaults
+        }
+
+        if (cfg.tools.tool_customizations_file) |customizations_file| {
+            const customizations_path = if (std_compat.fs.path.isAbsolute(customizations_file))
+                try allocator.dupe(u8, customizations_file)
+            else
+                try std_compat.fs.path.join(allocator, &.{ config_dir, customizations_file });
+            defer allocator.free(customizations_path);
+
+            if (std_compat.fs.openFileAbsolute(customizations_path, .{})) |file| {
+                defer file.close();
+                if (file.readToEndAlloc(allocator, 128 * 1024)) |content| {
+                    defer allocator.free(content);
+                    config_parse.mergeToolCustomizations(&cfg, content) catch |err| {
+                        std.debug.print("Warning: failed to parse tool_customizations_file: {s}\n", .{@errorName(err)});
+                    };
+                } else |err| {
+                    std.debug.print("Warning: failed to read tool_customizations_file: {s}\n", .{@errorName(err)});
+                }
+            } else |_| {
+                // Missing optional customization files keep inline configuration usable.
+            }
         }
 
         // Use workspace_dir_override if set, otherwise use default
@@ -774,7 +801,7 @@ pub const Config = struct {
         try w.print("[", .{});
         for (values, 0..) |value, i| {
             if (i > 0) try w.print(", ", .{});
-            try w.print("\"{s}\"", .{value});
+            try writeJsonStr(w, value);
         }
         try w.print("]", .{});
     }
@@ -1190,6 +1217,7 @@ pub const Config = struct {
                             .api_key = encrypted_key,
                             .temperature = agent_cfg.temperature,
                             .max_depth = agent_cfg.max_depth,
+                            .enable_pii_redaction = agent_cfg.enable_pii_redaction,
                         };
                         agent_count += 1;
                     }
@@ -1214,6 +1242,29 @@ pub const Config = struct {
         }
         if (self.mcp_servers.len > 0) {
             try self.writeMcpServersSection(w);
+        }
+
+        const audit_triage = self.workspace_audit.llm_triage;
+        if (audit_triage.provider != null or audit_triage.model != null or audit_triage.max_calls != null) {
+            try w.print("  \"workspace_audit\": {{\n", .{});
+            try w.print("    \"llm_triage\": {{", .{});
+            var wrote_triage_field = false;
+            if (audit_triage.provider) |provider| {
+                try w.print("\n      \"provider\": ", .{});
+                try writeJsonStr(w, provider);
+                wrote_triage_field = true;
+            }
+            if (audit_triage.model) |model| {
+                if (wrote_triage_field) try w.print(",", .{});
+                try w.print("\n      \"model\": ", .{});
+                try writeJsonStr(w, model);
+                wrote_triage_field = true;
+            }
+            if (audit_triage.max_calls) |max_calls| {
+                if (wrote_triage_field) try w.print(",", .{});
+                try w.print("\n      \"max_calls\": {d}", .{max_calls});
+            }
+            try w.print("\n    }}\n  }},\n", .{});
         }
 
         // Diagnostics (with nested otel)
@@ -1288,6 +1339,7 @@ pub const Config = struct {
             .timezone = self.agent.timezone,
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
+            .enable_pii_redaction = self.agent.enable_pii_redaction,
         }, ",\n");
 
         // Channels
@@ -1309,7 +1361,38 @@ pub const Config = struct {
         try writePrettyField(self.allocator, w, "  ", "memory", serialized_memory, ",\n");
         try writePrettyField(self.allocator, w, "  ", "gateway", self.gateway, ",\n");
         try writePrettyField(self.allocator, w, "  ", "a2a", self.a2a, ",\n");
-        try writePrettyField(self.allocator, w, "  ", "tunnel", self.tunnel, ",\n");
+        var serialized_tunnel = self.tunnel;
+        if (serialized_tunnel.cloudflare) |*cloudflare| {
+            cloudflare.token = try self.encryptConfigSecret(&store, cloudflare.token);
+        }
+        defer if (serialized_tunnel.cloudflare) |cloudflare| {
+            if (cloudflare.token) |token| {
+                if (self.tunnel.cloudflare == null or self.tunnel.cloudflare.?.token == null or token.ptr != self.tunnel.cloudflare.?.token.?.ptr) {
+                    self.allocator.free(token);
+                }
+            }
+        };
+        if (serialized_tunnel.ngrok) |*ngrok| {
+            ngrok.auth_token = try self.encryptConfigSecret(&store, ngrok.auth_token);
+        }
+        defer if (serialized_tunnel.ngrok) |ngrok| {
+            if (ngrok.auth_token) |token| {
+                if (self.tunnel.ngrok == null or self.tunnel.ngrok.?.auth_token == null or token.ptr != self.tunnel.ngrok.?.auth_token.?.ptr) {
+                    self.allocator.free(token);
+                }
+            }
+        };
+        if (serialized_tunnel.tailscale) |*tailscale| {
+            tailscale.auth_key = try self.encryptConfigSecret(&store, tailscale.auth_key);
+        }
+        defer if (serialized_tunnel.tailscale) |tailscale| {
+            if (tailscale.auth_key) |auth_key| {
+                if (self.tunnel.tailscale == null or self.tunnel.tailscale.?.auth_key == null or auth_key.ptr != self.tunnel.tailscale.?.auth_key.?.ptr) {
+                    self.allocator.free(auth_key);
+                }
+            }
+        };
+        try writePrettyField(self.allocator, w, "  ", "tunnel", serialized_tunnel, ",\n");
         var serialized_composio = self.composio;
         if (serialized_composio.api_key) |api_key| {
             serialized_composio.api_key = try store.encryptSecret(self.allocator, api_key);
@@ -1373,6 +1456,14 @@ pub const Config = struct {
         try w.print("    \"web_fetch_max_chars\": {d},\n", .{self.tools.web_fetch_max_chars});
         try w.print("    \"path_env_vars\": ", .{});
         try writePrettyJsonInline(self.allocator, w, self.tools.path_env_vars, "    ");
+        try w.print(",\n    \"tool_customizations\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations, "    ");
+        try w.print(",\n    \"tool_customizations_file\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations_file, "    ");
+        try w.print(",\n    \"trigger_modifiers\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.trigger_modifiers, "    ");
+        try w.print(",\n    \"trigger_punctuation\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.trigger_punctuation, "    ");
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -1417,6 +1508,7 @@ pub const Config = struct {
         InvalidHttpProxyUrl,
         InvalidApiErrorMaxChars,
         InvalidOtelEndpoint,
+        InvalidOtelHeader,
         InvalidHttpSearchBaseUrl,
         InvalidHttpSearchProvider,
         InvalidHttpSearchFallbackProvider,
@@ -1436,6 +1528,7 @@ pub const Config = struct {
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
+        InvalidTeamsWebhookSecret,
         InvalidWebMessageAuthMode,
         InvalidWebMessageAuthTransport,
         InvalidWebOrigin,
@@ -1513,6 +1606,13 @@ pub const Config = struct {
         if (self.diagnostics.otel_endpoint) |otel_endpoint| {
             if (!config_types.DiagnosticsConfig.isValidOtelEndpoint(otel_endpoint)) {
                 return ValidationError.InvalidOtelEndpoint;
+            }
+        }
+        for (self.diagnostics.otel_headers) |entry| {
+            if (!config_types.DiagnosticsConfig.isValidOtelHeaderName(entry.key) or
+                !config_types.DiagnosticsConfig.isValidOtelHeaderValue(entry.value))
+            {
+                return ValidationError.InvalidOtelHeader;
             }
         }
         if (self.http_request.search_base_url) |search_base_url| {
@@ -1640,6 +1740,13 @@ pub const Config = struct {
                 }
             }
         }
+        for (self.channels.teams) |teams_cfg| {
+            if (teams_cfg.webhook_secret) |webhook_secret| {
+                if (!config_types.TeamsConfig.isValidWebhookSecret(webhook_secret)) {
+                    return ValidationError.InvalidTeamsWebhookSecret;
+                }
+            }
+        }
     }
 
     /// Print a human-readable validation error to stderr.
@@ -1670,6 +1777,7 @@ pub const Config = struct {
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
             ValidationError.InvalidApiErrorMaxChars => std.debug.print("Config error: diagnostics.api_error_max_chars must be in [200, 10000].\n", .{}),
             ValidationError.InvalidOtelEndpoint => std.debug.print("Config error: diagnostics.otel.endpoint/otel_endpoint must be an absolute https:// URL (or http:// for localhost/private or container-local collector hosts).\n", .{}),
+            ValidationError.InvalidOtelHeader => std.debug.print("Config error: diagnostics.otel.headers/otel_headers must contain valid HTTP header names/values (no CR/LF).\n", .{}),
             ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host[/search] or local http://host[:port][/search] (no query/fragment).\n", .{}),
             ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
@@ -1689,6 +1797,7 @@ pub const Config = struct {
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
+            ValidationError.InvalidTeamsWebhookSecret => std.debug.print("Config error: channels.teams.accounts.<id>.webhook_secret must be 16-128 printable chars without whitespace when provided.\n", .{}),
             ValidationError.InvalidWebMessageAuthMode => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode must be 'pairing' or 'token'.\n", .{}),
             ValidationError.InvalidWebMessageAuthTransport => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode='token' is supported only when transport='local'.\n", .{}),
             ValidationError.InvalidWebOrigin => std.debug.print("Config error: channels.web.accounts.<id>.allowed_origins entries must be '*', 'null', or absolute origins (scheme://...).\n", .{}),
@@ -2486,6 +2595,7 @@ test "save roundtrip preserves extended config sections" {
             .api_key = "rk_test",
             .temperature = 0.2,
             .max_depth = 5,
+            .enable_pii_redaction = false,
         },
     };
     cfg.agent_bindings = &.{
@@ -2540,6 +2650,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.status_show_emojis = false;
     cfg.agent.message_timeout_secs = 60;
     cfg.agent.timezone = "UTC+08:00";
+    cfg.agent.enable_pii_redaction = false;
 
     cfg.memory.search.provider = "openai";
     cfg.memory.search.model = "text-embedding-3-small";
@@ -2564,9 +2675,17 @@ test "save roundtrip preserves extended config sections" {
     cfg.gateway.paired_tokens = &.{ "tok-1", "tok-2" };
 
     cfg.tunnel.provider = "ngrok";
+    cfg.tunnel.cloudflare = .{
+        .token = "cloudflare-test-token",
+    };
     cfg.tunnel.ngrok = .{
         .auth_token = "ngrok-test-token",
         .domain = "test.ngrok-free.app",
+    };
+    cfg.tunnel.tailscale = .{
+        .funnel = true,
+        .hostname = "nullclaw.ts.net",
+        .auth_key = "tskey-auth-k123",
     };
 
     cfg.composio.enabled = true;
@@ -2649,6 +2768,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("gsk_test", loaded.model_routes[0].api_key.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.agents.len);
     try std.testing.expectEqualStrings("helper", loaded.agents[0].name);
+    try std.testing.expect(!loaded.agents[0].enable_pii_redaction);
     try std.testing.expectEqual(@as(usize, 1), loaded.agent_bindings.len);
     try std.testing.expectEqualStrings("discord", loaded.agent_bindings[0].match.channel.?);
     try std.testing.expectEqualStrings("main", loaded.agent_bindings[0].match.account_id.?);
@@ -2666,6 +2786,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(loaded.agent.parallel_tools);
     try std.testing.expect(!loaded.agent.status_show_emojis);
     try std.testing.expectEqualStrings("UTC+08:00", loaded.agent.timezone);
+    try std.testing.expect(!loaded.agent.enable_pii_redaction);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
     try std.testing.expect(loaded.memory.response_cache.enabled);
@@ -2674,9 +2795,15 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), loaded.gateway.max_body_size_bytes);
     try std.testing.expectEqual(@as(u64, 45), loaded.gateway.request_timeout_secs);
     try std.testing.expectEqualStrings("ngrok", loaded.tunnel.provider);
+    try std.testing.expect(loaded.tunnel.cloudflare != null);
+    try std.testing.expectEqualStrings("cloudflare-test-token", loaded.tunnel.cloudflare.?.token.?);
     try std.testing.expect(loaded.tunnel.ngrok != null);
     try std.testing.expectEqualStrings("ngrok-test-token", loaded.tunnel.ngrok.?.auth_token.?);
     try std.testing.expectEqualStrings("test.ngrok-free.app", loaded.tunnel.ngrok.?.domain.?);
+    try std.testing.expect(loaded.tunnel.tailscale != null);
+    try std.testing.expect(loaded.tunnel.tailscale.?.funnel);
+    try std.testing.expectEqualStrings("nullclaw.ts.net", loaded.tunnel.tailscale.?.hostname.?);
+    try std.testing.expectEqualStrings("tskey-auth-k123", loaded.tunnel.tailscale.?.auth_key.?);
     try std.testing.expect(loaded.composio.enabled);
     try std.testing.expect(!loaded.secrets.encrypt);
     try std.testing.expect(loaded.browser.enabled);
@@ -2819,6 +2946,54 @@ test "save outputs pretty-printed nested sections" {
     try std.testing.expect(loaded.security.audit.enabled);
     try std.testing.expect(loaded.agent.compact_context);
     try std.testing.expectEqual(@as(u32, 42), loaded.agent.max_tool_iterations);
+}
+
+test "save escapes string arrays safely" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.default_model = "gpt-5";
+    cfg.reliability.fallback_providers = &.{
+        "provider\"one",
+        "path\\two",
+    };
+    cfg.gateway.paired_tokens = &.{
+        "tok\"one",
+        "tok\\two",
+    };
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.reliability.fallback_providers.len);
+    try std.testing.expectEqualStrings("provider\"one", loaded.reliability.fallback_providers[0]);
+    try std.testing.expectEqualStrings("path\\two", loaded.reliability.fallback_providers[1]);
+    try std.testing.expectEqual(@as(u32, 2), loaded.gateway.paired_tokens.len);
+    try std.testing.expectEqualStrings("tok\"one", loaded.gateway.paired_tokens[0]);
+    try std.testing.expectEqualStrings("tok\\two", loaded.gateway.paired_tokens[1]);
 }
 
 test "syncFlatFields propagates nested values" {
@@ -3130,6 +3305,71 @@ test "validation rejects malformed web auth token" {
     try std.testing.expectError(Config.ValidationError.InvalidWebAuthToken, cfg.validate());
 }
 
+test "validation accepts teams config without webhook secret" {
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "teams-client",
+            .client_secret = "teams-secret",
+            .tenant_id = "teams-tenant",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .teams = &teams_accounts,
+        },
+    };
+    try cfg.validate();
+}
+
+test "validation rejects malformed teams webhook secret" {
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "teams-client",
+            .client_secret = "teams-secret",
+            .tenant_id = "teams-tenant",
+            .webhook_secret = "short",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .teams = &teams_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidTeamsWebhookSecret, cfg.validate());
+}
+
+test "validation accepts teams config with valid webhook secret" {
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "teams-client",
+            .client_secret = "teams-secret",
+            .tenant_id = "teams-tenant",
+            .webhook_secret = "teams-webhook-secret-012345",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .teams = &teams_accounts,
+        },
+    };
+    try cfg.validate();
+}
+
 test "validation rejects malformed web origin entry" {
     const origins = [_][]const u8{"relay.nullclaw.io"};
     const web_accounts = [_]WebConfig{
@@ -3274,6 +3514,35 @@ test "validation rejects mcp http transport with malformed header" {
         .mcp_servers = &mcp_servers,
     };
     try std.testing.expectError(Config.ValidationError.InvalidMcpHeader, cfg.validate());
+}
+
+test "validation rejects remote http otel endpoint" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .diagnostics = .{
+            .otel_endpoint = "http://otel.example.com:4318",
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidOtelEndpoint, cfg.validate());
+}
+
+test "validation rejects malformed otel header" {
+    const headers = [_]DiagnosticsConfig.OtelHeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer ok\r\nX-Injected: yes" },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .diagnostics = .{
+            .otel_headers = &headers,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidOtelHeader, cfg.validate());
 }
 
 test "validation rejects mcp http transport with invalid timeout_ms" {
@@ -3643,12 +3912,12 @@ test "json parse diagnostics section" {
 test "json parse diagnostics section accepts flat otel fields for compatibility" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "otel_endpoint": "https://otel:4318", "otel_service_name": "nullclaw", "otel_headers": {"Authorization": "Bearer test"}}}
+        \\{"diagnostics": {"backend": "otel", "otel_endpoint": "https://otel.example.com:4318", "otel_service_name": "nullclaw", "otel_headers": {"Authorization": "Bearer test"}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("otel", cfg.diagnostics.backend);
-    try std.testing.expectEqualStrings("https://otel:4318", cfg.diagnostics.otel_endpoint.?);
+    try std.testing.expectEqualStrings("https://otel.example.com:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("nullclaw", cfg.diagnostics.otel_service_name.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.diagnostics.otel_headers.len);
     try std.testing.expectEqualStrings("Authorization", cfg.diagnostics.otel_headers[0].key);
@@ -3666,12 +3935,12 @@ test "json parse diagnostics section accepts flat otel fields for compatibility"
 test "json parse diagnostics section prefers nested otel fields over flat compatibility aliases" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "otel_endpoint": "https://flat:4318", "otel_service_name": "flat-service", "otel_headers": {"Authorization": "Bearer flat"}, "otel": {"endpoint": "https://nested:4318", "service_name": "nested-service", "headers": {"Authorization": "Bearer nested"}}}}
+        \\{"diagnostics": {"backend": "otel", "otel_endpoint": "https://flat.example.com:4318", "otel_service_name": "flat-service", "otel_headers": {"Authorization": "Bearer flat"}, "otel": {"endpoint": "https://nested.example.com:4318", "service_name": "nested-service", "headers": {"Authorization": "Bearer nested"}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("otel", cfg.diagnostics.backend);
-    try std.testing.expectEqualStrings("https://nested:4318", cfg.diagnostics.otel_endpoint.?);
+    try std.testing.expectEqualStrings("https://nested.example.com:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("nested-service", cfg.diagnostics.otel_service_name.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.diagnostics.otel_headers.len);
     try std.testing.expectEqualStrings("Authorization", cfg.diagnostics.otel_headers[0].key);
@@ -3911,6 +4180,83 @@ test "json parse tools.path_env_vars" {
     allocator.free(cfg.tools.path_env_vars);
 }
 
+fn freeToolCustomizationsForTest(allocator: std.mem.Allocator, items: []const config_types.ToolCustomization) void {
+    for (items) |item| {
+        allocator.free(item.name);
+        if (item.system_prompt) |system_prompt| allocator.free(system_prompt);
+        for (item.triggers) |trigger| allocator.free(trigger);
+        allocator.free(item.triggers);
+    }
+    allocator.free(items);
+}
+
+fn findToolCustomizationForTest(items: []const config_types.ToolCustomization, name: []const u8) ?config_types.ToolCustomization {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.name, name)) return item;
+    }
+    return null;
+}
+
+test "json parse tools.tool_customizations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"tools": {
+        \\  "tool_customizations": [
+        \\    {"name": "shell", "system_prompt": "Use safe shell", "triggers": ["run", "exec"], "priority": 300, "enabled": false},
+        \\    {"name": "browser", "triggers": ["open"], "priority": -1},
+        \\    {"system_prompt": "missing name"},
+        \\    "ignored"
+        \\  ],
+        \\  "tool_customizations_file": "tool-customizations.json",
+        \\  "trigger_modifiers": ["please", "now"],
+        \\  "trigger_punctuation": "!?;"
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations.len);
+    try std.testing.expectEqualStrings("shell", cfg.tools.tool_customizations[0].name);
+    try std.testing.expectEqualStrings("Use safe shell", cfg.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations[0].triggers.len);
+    try std.testing.expectEqualStrings("run", cfg.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqualStrings("exec", cfg.tools.tool_customizations[0].triggers[1]);
+    try std.testing.expectEqual(@as(u8, 255), cfg.tools.tool_customizations[0].priority);
+    try std.testing.expect(!cfg.tools.tool_customizations[0].enabled);
+    try std.testing.expectEqualStrings("browser", cfg.tools.tool_customizations[1].name);
+    try std.testing.expectEqual(@as(u8, 0), cfg.tools.tool_customizations[1].priority);
+    try std.testing.expect(cfg.tools.tool_customizations[1].enabled);
+    try std.testing.expectEqualStrings("tool-customizations.json", cfg.tools.tool_customizations_file.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.trigger_modifiers.len);
+    try std.testing.expectEqualStrings("please", cfg.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("now", cfg.tools.trigger_modifiers[1]);
+    try std.testing.expectEqualStrings("!?;", cfg.tools.trigger_punctuation);
+}
+
+fn parseToolCustomizationsForAllocationTest(allocator: std.mem.Allocator, json: []const u8) !void {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    freeToolCustomizationsForTest(allocator, cfg.tools.tool_customizations);
+}
+
+test "json parse tools.tool_customizations frees partial allocations on out-of-memory" {
+    const json =
+        \\{"tools": {"tool_customizations": [
+        \\  {"name": "shell", "system_prompt": "Use safe shell", "triggers": ["run", "exec"], "priority": 200, "enabled": false},
+        \\  {"name": "browser", "triggers": ["open", "visit"], "priority": 10}
+        \\]}}
+    ;
+    // Regression: nested tool customization fields must not leak when parsing
+    // fails after partially allocating a customization entry.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseToolCustomizationsForAllocationTest, .{json});
+}
+
 test "save roundtrip preserves tools.path_env_vars" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3947,6 +4293,125 @@ test "save roundtrip preserves tools.path_env_vars" {
     try std.testing.expectEqualStrings("PYTHONHOME", loaded.tools.path_env_vars[1]);
 }
 
+test "save roundtrip preserves tools customization schema" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.tools.tool_customizations = &.{
+        .{
+            .name = "shell",
+            .system_prompt = "Use safe shell",
+            .triggers = &.{ "run", "exec" },
+            .priority = 7,
+            .enabled = false,
+        },
+        .{
+            .name = "browser",
+            .triggers = &.{"open"},
+            .priority = 3,
+        },
+    };
+    cfg.tools.tool_customizations_file = "tool-customizations.json";
+    cfg.tools.trigger_modifiers = &.{ "please", "now" };
+    cfg.tools.trigger_punctuation = "!?;";
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.tools.tool_customizations.len);
+    try std.testing.expectEqualStrings("shell", loaded.tools.tool_customizations[0].name);
+    try std.testing.expectEqualStrings("Use safe shell", loaded.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqualStrings("run", loaded.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqual(@as(u8, 7), loaded.tools.tool_customizations[0].priority);
+    try std.testing.expect(!loaded.tools.tool_customizations[0].enabled);
+    try std.testing.expectEqualStrings("browser", loaded.tools.tool_customizations[1].name);
+    try std.testing.expectEqualStrings("tool-customizations.json", loaded.tools.tool_customizations_file.?);
+    try std.testing.expectEqualStrings("please", loaded.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("!?;", loaded.tools.trigger_punctuation);
+}
+
+test "load merges relative tool_customizations_file with inline customizations" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tmp_dir = @import("compat").fs.Dir.wrap(tmp.dir);
+    try tmp_dir.makeDir("home");
+
+    const config_json =
+        \\{"tools": {
+        \\  "tool_customizations": [
+        \\    {"name": "shell", "system_prompt": "inline shell", "triggers": ["inline"], "priority": 1}
+        \\  ],
+        \\  "tool_customizations_file": "tool-customizations.json",
+        \\  "trigger_modifiers": ["please"],
+        \\  "trigger_punctuation": "!"
+        \\}}
+    ;
+    const external_json =
+        \\{
+        \\  "shell": {"system_prompt": "external shell", "triggers": ["external"], "priority": 8, "enabled": false},
+        \\  "file_read": {"system_prompt": "external read", "triggers": ["inspect"], "priority": 4}
+        \\}
+    ;
+    try tmp_dir.writeFile(.{ .sub_path = "home/config.json", .data = config_json });
+    try tmp_dir.writeFile(.{ .sub_path = "home/tool-customizations.json", .data = external_json });
+
+    const home = try tmp_dir.realpathAlloc(allocator, "home");
+    defer allocator.free(home);
+    const key_z = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(key_z);
+    const home_z = try allocator.dupeZ(u8, home);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, home_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    var loaded = try Config.load(allocator);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.tools.tool_customizations.len);
+    const shell = findToolCustomizationForTest(loaded.tools.tool_customizations, "shell").?;
+    try std.testing.expectEqualStrings("external shell", shell.system_prompt.?);
+    try std.testing.expectEqualStrings("external", shell.triggers[0]);
+    try std.testing.expectEqual(@as(u8, 8), shell.priority);
+    try std.testing.expect(!shell.enabled);
+
+    const file_read = findToolCustomizationForTest(loaded.tools.tool_customizations, "file_read").?;
+    try std.testing.expectEqualStrings("external read", file_read.system_prompt.?);
+    try std.testing.expectEqualStrings("inspect", file_read.triggers[0]);
+    try std.testing.expectEqual(@as(u8, 4), file_read.priority);
+    try std.testing.expectEqualStrings("tool-customizations.json", loaded.tools.tool_customizations_file.?);
+    try std.testing.expectEqualStrings("please", loaded.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("!", loaded.tools.trigger_punctuation);
+}
+
 test "json parse autonomy allow_raw_url_chars" {
     const allocator = std.testing.allocator;
     const json =
@@ -3955,6 +4420,16 @@ test "json parse autonomy allow_raw_url_chars" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(cfg.autonomy.allow_raw_url_chars);
+}
+
+test "json parse autonomy block_medium_risk_commands" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"block_medium_risk_commands": false}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(!cfg.autonomy.block_medium_risk_commands);
 }
 
 test "json parse gateway paired tokens" {
@@ -3981,6 +4456,39 @@ test "json parse gateway configurable limits" {
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(usize, 20 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
     try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
+}
+
+test "json parse gateway webhook_sync_for_workers" {
+    const allocator = std.testing.allocator;
+
+    // Default: field absent → false. Same shape as other defaulted bool fields.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"port\": 3000}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Explicit true → true.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": true}}");
+        try std.testing.expect(cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Explicit false → false.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": false}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
+
+    // Wrong JSON type (string instead of bool) → field stays at default false,
+    // matching how the parser handles type mismatches for sibling fields.
+    {
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson("{\"gateway\": {\"webhook_sync_for_workers\": \"yes\"}}");
+        try std.testing.expect(!cfg.gateway.webhook_sync_for_workers);
+    }
 }
 
 test "json parse browser allowed domains" {
@@ -4139,7 +4647,7 @@ test "json parse agents" {
     const json =
         \\{"agents": {"list": [
         \\  {"name": "researcher", "provider": "anthropic", "model": "claude-sonnet-4", "system_prompt": "Research things", "max_depth": 5},
-        \\  {"name": "coder", "provider": "openai", "model": "gpt-4o", "api_key": "sk-test", "temperature": 0.3}
+        \\  {"name": "coder", "provider": "openai", "model": "gpt-4o", "api_key": "sk-test", "temperature": 0.3, "enable_pii_redaction": false}
         \\]}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
@@ -4158,6 +4666,17 @@ test "json parse agents" {
     try std.testing.expectEqualStrings("sk-test", cfg.agents[1].api_key.?);
     try std.testing.expectEqual(@as(f64, 0.3), cfg.agents[1].temperature.?);
     try std.testing.expectEqual(@as(u32, 3), cfg.agents[1].max_depth);
+    try std.testing.expect(!cfg.agents[1].enable_pii_redaction);
+}
+
+test "json parse root agent pii redaction flag" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agent": {"enable_pii_redaction": false}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(!cfg.agent.enable_pii_redaction);
 }
 
 test "json parse agents skips invalid entries" {
@@ -4355,6 +4874,81 @@ test "parse agents.defaults.model supports explicit provider field" {
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("custom:https://example.com/api", cfg.default_provider);
     try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", cfg.default_model.?);
+}
+
+test "parse workspace audit llm triage config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"workspace_audit":{"llm_triage":{"provider":"ollama","model":"qwen2.5-coder:7b","max_calls":12}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqualStrings("ollama", cfg.workspace_audit.llm_triage.provider.?);
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", cfg.workspace_audit.llm_triage.model.?);
+    try std.testing.expectEqual(@as(?usize, 12), cfg.workspace_audit.llm_triage.max_calls);
+}
+
+test "parse workspace audit llm triage model ref" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "models": {"providers": {"openrouter": {}}},
+        \\  "workspace_audit": {"llm_triage": {"model": "openrouter/anthropic/claude-sonnet-4.6", "max_llm_calls": 3}}
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqualStrings("openrouter", cfg.workspace_audit.llm_triage.provider.?);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", cfg.workspace_audit.llm_triage.model.?);
+    try std.testing.expectEqual(@as(?usize, 3), cfg.workspace_audit.llm_triage.max_calls);
+}
+
+test "save writes workspace audit llm triage config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+        .workspace_audit = .{
+            .llm_triage = .{
+                .provider = "ollama",
+                .model = "qwen2.5-coder:7b",
+                .max_calls = 12,
+            },
+        },
+    };
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"workspace_audit\"") != null);
+    try std.testing.expectEqualStrings("ollama", loaded.workspace_audit.llm_triage.provider.?);
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", loaded.workspace_audit.llm_triage.model.?);
+    try std.testing.expectEqual(@as(?usize, 12), loaded.workspace_audit.llm_triage.max_calls);
 }
 
 test "parse legacy default_provider with model-only primary preserves model" {
@@ -5502,6 +6096,19 @@ test "save encrypts persisted api keys and parse decrypts them" {
     cfg.memory.search.store.qdrant_api_key = "qdrant-secret";
     cfg.memory.api.api_key = "memory-secret";
     cfg.composio.api_key = "comp-secret";
+    cfg.tunnel.provider = "tailscale";
+    cfg.tunnel.cloudflare = .{
+        .token = "cloudflare-secret",
+    };
+    cfg.tunnel.ngrok = .{
+        .auth_token = "ngrok-secret",
+        .domain = "test.ngrok-free.app",
+    };
+    cfg.tunnel.tailscale = .{
+        .funnel = true,
+        .hostname = "nullclaw.ts.net",
+        .auth_key = "tskey-secret",
+    };
 
     try cfg.save();
 
@@ -5519,6 +6126,9 @@ test "save encrypts persisted api keys and parse decrypts them" {
         "qdrant-secret",
         "memory-secret",
         "comp-secret",
+        "cloudflare-secret",
+        "ngrok-secret",
+        "tskey-secret",
     };
     for (secret_values) |secret| {
         try std.testing.expect(std.mem.indexOf(u8, content, secret) == null);
@@ -5542,6 +6152,9 @@ test "save encrypts persisted api keys and parse decrypts them" {
     try std.testing.expectEqualStrings("qdrant-secret", loaded.memory.search.store.qdrant_api_key);
     try std.testing.expectEqualStrings("memory-secret", loaded.memory.api.api_key);
     try std.testing.expectEqualStrings("comp-secret", loaded.composio.api_key.?);
+    try std.testing.expectEqualStrings("cloudflare-secret", loaded.tunnel.cloudflare.?.token.?);
+    try std.testing.expectEqualStrings("ngrok-secret", loaded.tunnel.ngrok.?.auth_token.?);
+    try std.testing.expectEqualStrings("tskey-secret", loaded.tunnel.tailscale.?.auth_key.?);
 }
 
 test "json parse tools.media.audio section" {
@@ -6160,7 +6773,7 @@ test "parse irc accounts" {
 test "parse matrix accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "dm_policy": "open", "group_policy": "open", "require_mention": true}}}}}
+        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "dm_policy": "open", "group_policy": "open", "require_mention": true, "pantalaimon_proxy_url": "http://127.0.0.1:8008"}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -6176,6 +6789,9 @@ test "parse matrix accounts" {
     try std.testing.expect(mc.require_mention);
     try std.testing.expectEqual(@as(usize, 1), mc.group_allow_from.len);
     try std.testing.expectEqualStrings("@alice:matrix.org", mc.group_allow_from[0]);
+    // Regression: Pantalaimon config must survive JSON parsing before
+    // MatrixChannel can route E2EE traffic through the proxy.
+    try std.testing.expectEqualStrings("http://127.0.0.1:8008", mc.pantalaimon_proxy_url.?);
     allocator.free(mc.account_id);
     allocator.free(mc.homeserver);
     allocator.free(mc.access_token);
@@ -6183,6 +6799,7 @@ test "parse matrix accounts" {
     allocator.free(mc.user_id.?);
     allocator.free(mc.dm_policy);
     allocator.free(mc.group_policy);
+    allocator.free(mc.pantalaimon_proxy_url.?);
     for (mc.group_allow_from) |entry| allocator.free(entry);
     allocator.free(mc.group_allow_from);
     allocator.free(cfg.channels.matrix);
@@ -7262,4 +7879,22 @@ test "validation accepts named agent provider aliases from configured providers"
     };
 
     try cfg.validate();
+}
+
+test "Config parseJson rejects truncated JSON" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Truncated JSON must fail before partially parsed config is accepted.
+    const malformed_json = "{\"models\":{\"providers\":{\"openai\":";
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    const result = cfg.parseJson(malformed_json);
+    try std.testing.expect(std.meta.isError(result));
 }

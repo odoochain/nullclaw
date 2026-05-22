@@ -22,6 +22,7 @@ const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
 const util = @import("../util.zig");
+const cost_mod = @import("../cost.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -88,6 +89,7 @@ const SlashCommandKind = enum {
     skill,
     doctor,
     memory,
+    cost,
     unknown,
 };
 
@@ -132,7 +134,8 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "poll")) return .poll;
     if (isSlashName(cmd, "skill") or isSlashName(cmd, "skills") or isSlashName(cmd, "iskill")) return .skill;
     if (isSlashName(cmd, "doctor")) return .doctor;
-    if (isSlashName(cmd, "memory")) return .memory;
+    if (isSlashName(cmd, "memory") or isSlashName(cmd, "mem")) return .memory;
+    if (isSlashName(cmd, "cost") or isSlashName(cmd, "costs") or isSlashName(cmd, "pricing")) return .cost;
     return .unknown;
 }
 
@@ -1023,6 +1026,15 @@ test "planTurnInput keeps known slash commands local-only" {
 
 test "planTurnInput keeps /menu on local-only path" {
     const plan = planTurnInput("/menu");
+    try std.testing.expect(!plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expect(plan.llm_user_message == null);
+}
+
+test "planTurnInput keeps interactive skill activation local-only" {
+    // Regression: /iskill must stay on the local handler path so it can arm an
+    // interactive session skill instead of being treated as unknown slash text.
+    const plan = planTurnInput("/iskill news-digest");
     try std.testing.expect(!plan.clear_session);
     try std.testing.expect(plan.invoke_local_handler);
     try std.testing.expect(plan.llm_user_message == null);
@@ -1940,6 +1952,20 @@ fn setActiveSkillSession(self: anytype, skill: *const skills_mod.Skill, interact
     self.active_skill_path = owned_path;
     self.active_skill_path_owned = owned_path != null;
     self.active_skill_interactive = interactive;
+}
+
+/// Activate a skill session by name. Returns true when found and activated,
+/// false when no skill with that name exists.
+pub fn activateSkillByName(self: anytype, name: []const u8) !bool {
+    const skills = try skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer);
+    defer skills_mod.freeSkills(self.allocator, skills);
+    switch (findSkillByNameNormalized(skills, name)) {
+        .unique => |skill| {
+            try setActiveSkillSession(self, skill, false);
+            return true;
+        },
+        else => return false,
+    }
 }
 
 fn activeSkillModeLabel(interactive: bool) []const u8 {
@@ -3122,6 +3148,83 @@ test "handleSubagentsCommand help documents both agent flag forms" {
     try std.testing.expect(std.mem.indexOf(u8, response, "--agent=<name>") != null);
 }
 
+test "refreshSubagentToolContext uses conversation origin route" {
+    var spawn_tool = spawn_tool_mod.SpawnTool{};
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = "agent:main:discord:direct:user-42",
+        conversation_context: ?struct {
+            channel: ?[]const u8 = null,
+            account_id: ?[]const u8 = null,
+            delivery_chat_id: ?[]const u8 = null,
+            peer_id: ?[]const u8 = null,
+        } = .{
+            .channel = "discord",
+            .account_id = "discord-main",
+            .delivery_chat_id = "dm-channel-42",
+            .peer_id = "user-42",
+        },
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    refreshSubagentToolContext(&harness);
+
+    try std.testing.expectEqualStrings("discord", spawn_tool.default_channel.?);
+    try std.testing.expectEqualStrings("discord-main", spawn_tool.default_account_id.?);
+    try std.testing.expectEqualStrings("dm-channel-42", spawn_tool.default_chat_id.?);
+    try std.testing.expectEqualStrings("agent:main:discord:direct:user-42", spawn_tool.default_session_key.?);
+}
+
+test "handleSubagentsCommand spawn stores conversation origin route" {
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    manager.task_runner = testSubagentRunnerEcho;
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = "agent:main:discord:direct:user-42",
+        conversation_context: ?struct {
+            channel: ?[]const u8 = null,
+            account_id: ?[]const u8 = null,
+            delivery_chat_id: ?[]const u8 = null,
+            peer_id: ?[]const u8 = null,
+        } = .{
+            .channel = "discord",
+            .account_id = "discord-main",
+            .delivery_chat_id = "dm-channel-42",
+            .peer_id = "user-42",
+        },
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    // Regression: #849 also applies to slash-command subagent spawns, not only
+    // LLM tool-call spawns.
+    const response = try handleSubagentsCommand(&harness, "spawn check route");
+    defer std.testing.allocator.free(response);
+
+    manager.mutex.lock();
+    defer manager.mutex.unlock();
+    const state = manager.tasks.get(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("discord", state.origin_channel);
+    try std.testing.expectEqualStrings("discord-main", state.origin_account_id.?);
+    try std.testing.expectEqualStrings("dm-channel-42", state.origin_chat_id);
+    try std.testing.expectEqualStrings("agent:main:discord:direct:user-42", state.session_key.?);
+}
+
 fn parseTaskId(raw: []const u8) ?u64 {
     if (raw.len == 0) return null;
     return std.fmt.parseInt(u64, raw, 10) catch null;
@@ -3140,10 +3243,45 @@ fn findSubagentManager(self: anytype) ?*subagent_mod.SubagentManager {
     return spawn_tool.manager;
 }
 
+const SubagentOriginRoute = struct {
+    channel: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+    session_key: []const u8,
+};
+
+fn resolveSubagentOriginRoute(self: anytype) SubagentOriginRoute {
+    var route_channel: []const u8 = "agent";
+    var route_chat_id: []const u8 = self.memory_session_id orelse "agent";
+    var route_account_id: ?[]const u8 = null;
+
+    if (@hasField(@TypeOf(self.*), "conversation_context")) {
+        if (self.conversation_context) |ctx| {
+            if (ctx.channel) |channel| route_channel = channel;
+            route_account_id = ctx.account_id;
+            if (ctx.delivery_chat_id) |delivery_chat_id| {
+                route_chat_id = delivery_chat_id;
+            } else if (ctx.peer_id) |peer_id| {
+                route_chat_id = peer_id;
+            }
+        }
+    }
+
+    return .{
+        .channel = route_channel,
+        .account_id = route_account_id,
+        .chat_id = route_chat_id,
+        .session_key = self.memory_session_id orelse route_chat_id,
+    };
+}
+
 pub fn refreshSubagentToolContext(self: anytype) void {
     const spawn_tool = findSpawnTool(self) orelse return;
-    spawn_tool.default_channel = "agent";
-    spawn_tool.default_chat_id = self.memory_session_id orelse "agent";
+    const route = resolveSubagentOriginRoute(self);
+    spawn_tool.default_channel = route.channel;
+    spawn_tool.default_account_id = route.account_id;
+    spawn_tool.default_chat_id = route.chat_id;
+    spawn_tool.default_session_key = route.session_key;
 }
 
 fn findShellTool(self: anytype) ?Tool {
@@ -3582,15 +3720,18 @@ fn handleQueueCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handleUsageCommand(self: anytype, arg: []const u8) ![]const u8 {
     const mode = firstToken(arg);
     if (mode.len == 0 or std.ascii.eqlIgnoreCase(mode, "status")) {
+        const turn_cost = @import("../cost.zig").TokenUsage.fromProviders(self.model_name, self.last_turn_usage).cost();
         return try std.fmt.allocPrint(
             self.allocator,
-            "Usage: {s}\nLast turn: prompt={d} completion={d} total={d}\nSession total: {d}",
+            "Usage: {s}\nLast turn: prompt={d} completion={d} total={d} (${d:.4})\nSession total: {d} tokens, ${d:.4} total",
             .{
                 self.usage_mode.toSlice(),
                 self.last_turn_usage.prompt_tokens,
                 self.last_turn_usage.completion_tokens,
                 self.last_turn_usage.total_tokens,
+                turn_cost,
                 self.total_tokens,
+                self.total_cost_usd,
             },
         );
     }
@@ -3598,6 +3739,23 @@ fn handleUsageCommand(self: anytype, arg: []const u8) ![]const u8 {
     self.usage_mode = parseUsageMode(@TypeOf(self.usage_mode), mode) orelse
         return try self.allocator.dupe(u8, "Invalid /usage value. Use: off|tokens|full|cost");
     return try std.fmt.allocPrint(self.allocator, "Usage mode set to: {s}", .{self.usage_mode.toSlice()});
+}
+
+fn handleToggleCostCommand(self: anytype, arg: []const u8) ![]const u8 {
+    if (arg.len > 0) {
+        // If argument is provided, behave like /usage
+        return try handleUsageCommand(self, arg);
+    }
+
+    // Toggle logic: off -> full, anything else -> off
+    const new_mode: @TypeOf(self.usage_mode) = if (self.usage_mode == .off) .full else .off;
+    self.usage_mode = new_mode;
+
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "Cost display {s}.",
+        .{if (new_mode == .off) "disabled" else "enabled"},
+    );
 }
 
 fn handleTtsCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -4017,6 +4175,9 @@ fn freeSubagentTaskState(manager: *subagent_mod.SubagentManager, state: *subagen
     }
     if (state.result) |r| manager.allocator.free(r);
     if (state.error_msg) |e| manager.allocator.free(e);
+    manager.allocator.free(state.origin_channel);
+    manager.allocator.free(state.origin_chat_id);
+    if (state.origin_account_id) |aid| manager.allocator.free(aid);
     if (state.session_key) |sk| manager.allocator.free(sk);
     manager.allocator.free(state.label);
     manager.allocator.destroy(state);
@@ -4078,8 +4239,8 @@ fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8, agent_n
     const manager = findSubagentManager(self) orelse
         return try self.allocator.dupe(u8, "Spawn tool is not enabled.");
 
-    const origin_chat = self.memory_session_id orelse "agent";
-    const task_id = manager.spawnWithAgent(trimmed_task, label, "agent", origin_chat, agent_name) catch |err| {
+    const route = resolveSubagentOriginRoute(self);
+    const task_id = manager.spawnWithAgent(trimmed_task, label, route.channel, route.chat_id, route.account_id, route.session_key, agent_name) catch |err| {
         return switch (err) {
             error.TooManyConcurrentSubagents => try self.allocator.dupe(u8, "Too many concurrent subagents. Wait for a task to finish."),
             error.UnknownAgent => if (agent_name) |name|
@@ -4272,6 +4433,48 @@ fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     return try self.allocator.dupe(u8, "Unknown /subagents action. Use /subagents help.");
+}
+
+test "handleKillCommand frees completed subagent origin route" {
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = "session:42",
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    const state = try std.testing.allocator.create(subagent_mod.TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try std.testing.allocator.dupe(u8, "done-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "chat-42"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "primary"),
+        .session_key = try std.testing.allocator.dupe(u8, "session:42"),
+        .result = try std.testing.allocator.dupe(u8, "done"),
+        .started_at = std_compat.time.milliTimestamp(),
+        .completed_at = std_compat.time.milliTimestamp(),
+    };
+    try manager.tasks.put(std.testing.allocator, 1, state);
+
+    // Regression: #849 made origin route fields owned by TaskState; /kill must
+    // free them when it removes completed tasks.
+    const response = try handleKillCommand(&harness, "1");
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqual(@as(usize, 0), manager.tasks.count());
+    try std.testing.expect(std.mem.indexOf(u8, response, "removed") != null);
 }
 
 fn handleSteerCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -5142,7 +5345,10 @@ pub fn composeFinalReply(
     reasoning_content: ?[]const u8,
     usage: providers.TokenUsage,
 ) ![]const u8 {
-    const show_reasoning = self.reasoning_mode != .off and reasoning_content != null and reasoning_content.?.len > 0;
+    // For reasoning_mode == .stream the thinking content is already printed
+    // live during streaming via ThinkPassthroughFilter, so we must not
+    // prepend it again here. Only .on mode shows the post-turn block.
+    const show_reasoning = self.reasoning_mode == .on and reasoning_content != null and reasoning_content.?.len > 0;
     if (!show_reasoning and self.usage_mode == .off) {
         return try self.allocator.dupe(u8, base_text);
     }
@@ -5171,10 +5377,21 @@ pub fn composeFinalReply(
             "\n\n[usage] prompt={d} completion={d} total={d} session_total={d}",
             .{ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, self.total_tokens },
         ),
-        .cost => try w.print(
-            "\n\n[usage] prompt={d} completion={d} total={d} (cost estimate unavailable)",
-            .{ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
-        ),
+        .cost => {
+            const model_name = if (comptime @hasField(@TypeOf(self.*), "model_name")) self.model_name else "";
+            const turn_cost = cost_mod.TokenUsage.fromProviders(model_name, usage).cost();
+            if (comptime @hasField(@TypeOf(self.*), "total_cost_usd")) {
+                try w.print(
+                    "\n\n[usage] prompt={d} completion={d} total={d} cost=${d:.4} session_cost=${d:.4}",
+                    .{ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, turn_cost, self.total_cost_usd },
+                );
+            } else {
+                try w.print(
+                    "\n\n[usage] prompt={d} completion={d} total={d} cost=${d:.4}",
+                    .{ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, turn_cost },
+                );
+            }
+        },
     }
 
     out = out_writer.toArrayList();
@@ -5336,6 +5553,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .tell => return try handleTellCommand(self, cmd.arg),
         .config => return try handleConfigCommand(self, cmd.arg),
         .capabilities => return try handleCapabilitiesCommand(self, cmd.arg),
+        .cost => return try handleToggleCostCommand(self, cmd.arg),
         .debug => {
             if (std.ascii.eqlIgnoreCase(cmd.arg, "show") or cmd.arg.len == 0) return try formatStatus(self);
             if (std.ascii.eqlIgnoreCase(cmd.arg, "reset")) {
@@ -5553,4 +5771,182 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     return try self.allocator.dupe(u8, usage);
+}
+
+test "activateSkillByName activates matching skill" {
+    const allocator = std.testing.allocator;
+    const fs_compat = @import("compat").fs;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try fs_compat.Dir.wrap(tmp.dir).makePath("skills/news-digest");
+    {
+        const f = try fs_compat.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try fs_compat.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news.");
+    }
+
+    const workspace = try fs_compat.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        workspace_dir: []const u8,
+        observer: ?@import("../observability.zig").Observer = null,
+        active_skill_name: ?[]const u8 = null,
+        active_skill_name_owned: bool = false,
+        active_skill_description: ?[]const u8 = null,
+        active_skill_description_owned: bool = false,
+        active_skill_instructions: ?[]const u8 = null,
+        active_skill_instructions_owned: bool = false,
+        active_skill_path: ?[]const u8 = null,
+        active_skill_path_owned: bool = false,
+        active_skill_interactive: bool = false,
+    }{
+        .allocator = allocator,
+        .workspace_dir = workspace,
+    };
+    defer {
+        if (harness.active_skill_name_owned) if (harness.active_skill_name) |v| allocator.free(v);
+        if (harness.active_skill_description_owned) if (harness.active_skill_description) |v| allocator.free(v);
+        if (harness.active_skill_instructions_owned) if (harness.active_skill_instructions) |v| allocator.free(v);
+        if (harness.active_skill_path_owned) if (harness.active_skill_path) |v| allocator.free(v);
+    }
+
+    const found = try activateSkillByName(&harness, "news-digest");
+    try std.testing.expect(found);
+    try std.testing.expectEqualStrings("news-digest", harness.active_skill_name.?);
+}
+
+test "activateSkillByName returns false when skill not found" {
+    const allocator = std.testing.allocator;
+    const fs_compat = @import("compat").fs;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try fs_compat.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        workspace_dir: []const u8,
+        observer: ?@import("../observability.zig").Observer = null,
+        active_skill_name: ?[]const u8 = null,
+        active_skill_name_owned: bool = false,
+        active_skill_description: ?[]const u8 = null,
+        active_skill_description_owned: bool = false,
+        active_skill_instructions: ?[]const u8 = null,
+        active_skill_instructions_owned: bool = false,
+        active_skill_path: ?[]const u8 = null,
+        active_skill_path_owned: bool = false,
+        active_skill_interactive: bool = false,
+    }{
+        .allocator = allocator,
+        .workspace_dir = workspace,
+    };
+
+    const found = try activateSkillByName(&harness, "ghost-skill");
+    try std.testing.expect(!found);
+    try std.testing.expect(harness.active_skill_name == null);
+}
+
+// ── composeFinalReply ────────────────────────────────────────────────────────
+
+// Local enum mirrors for testing: composeFinalReply uses `anytype` so it only
+// needs structural compatibility — the values .off / .on / .stream are matched
+// by name, not by type identity.
+const FakeReasoningMode = enum { off, on, stream };
+const FakeUsageMode = enum { off, tokens, full, cost };
+
+const FakeAgent = struct {
+    allocator: std.mem.Allocator,
+    reasoning_mode: FakeReasoningMode = .off,
+    usage_mode: FakeUsageMode = .off,
+    model_name: []const u8 = "gpt-4o",
+    total_tokens: u64 = 0,
+    total_cost_usd: f64 = 0.0,
+};
+
+test "composeFinalReply off mode returns base text unchanged" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Hello", "secret thinking", usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello", result);
+}
+
+test "composeFinalReply on mode prepends reasoning block" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", "step by step", usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "Reasoning:\n> step by step\n"));
+    try std.testing.expect(std.mem.endsWith(u8, result, "Answer"));
+}
+
+test "composeFinalReply stream mode does not prepend reasoning block" {
+    // Regression: .stream mode used to show the block twice — once live during
+    // streaming and again via composeFinalReply. Now only .on shows the block.
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .stream };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", "private chain", usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Answer", result);
+}
+
+test "composeFinalReply on mode with null reasoning_content returns base text" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", null, usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Answer", result);
+}
+
+test "composeFinalReply on mode with empty reasoning_content returns base text" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", "", usage);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Answer", result);
+}
+
+test "composeFinalReply appends token usage when usage_mode is tokens" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off, .usage_mode = .tokens };
+    const usage = providers.TokenUsage{ .total_tokens = 42 };
+    const result = try composeFinalReply(&agent, "Hi", null, usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "total_tokens=42") != null);
+}
+
+test "composeFinalReply cost mode appends estimated cost" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{
+        .allocator = allocator,
+        .reasoning_mode = .off,
+        .usage_mode = .cost,
+        .total_cost_usd = 0.0123,
+    };
+    const usage = providers.TokenUsage{ .prompt_tokens = 1000, .completion_tokens = 500, .total_tokens = 1500 };
+    const result = try composeFinalReply(&agent, "Hi", null, usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cost=$0.0075") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "session_cost=$0.0123") != null);
 }

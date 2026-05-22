@@ -76,7 +76,7 @@ nullclaw onboard --interactive
 - 用于控制运行时诊断与可观测性输出。
 - 配置 OpenTelemetry 时，请使用嵌套的 `diagnostics.otel` 对象。
 - OTEL spans 会在回合完成、agent 结束等自然运行边界触发 flush；更长运行流程仍保留批量 flush 作为兜底。
-- OTEL endpoint 应优先使用 HTTPS；只有 localhost、私有网络 collector，或 `host.docker.internal`、`host.containers.internal`、`otel` 这类容器本地目标才适合使用明文 HTTP。
+- `diagnostics.otel.endpoint` 连接远程 collector 时应优先使用 `https://...`；`http://...` 仅适用于 localhost、私有网络 collector，或 `host.docker.internal`、`host.containers.internal`、`otel` 这类容器本地目标。
 
 示例：
 
@@ -89,7 +89,7 @@ nullclaw onboard --interactive
     "log_message_payloads": true,
     "log_llm_io": true,
     "otel": {
-      "endpoint": "https://otel:4318",
+      "endpoint": "https://otel.example.com:4318",
       "service_name": "nullclaw",
       "headers": {
         "Authorization": "Bearer example-token"
@@ -129,8 +129,30 @@ nullclaw onboard --interactive
 
 ### `agents.defaults.model.primary`
 
-- 设置默认模型路由，格式通常为：`provider/vendor/model`。
+- 设置默认模型路由，通常是 `provider/vendor/model`。
 - 示例：`openrouter/anthropic/claude-sonnet-4`
+
+### `workspace_audit.llm_triage`
+
+- 选择 `nullclaw workspace audit --llm-triage external` 使用的 provider/model。
+- 该配置本身不会启用 LLM triage；命令行模式仍然必须显式开启。
+- 省略时回退到 `agents.defaults.model.primary`。
+
+示例：
+
+```json
+{
+  "workspace_audit": {
+    "llm_triage": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "max_calls": 20
+    }
+  }
+}
+```
+
+如果 provider 已在 `models.providers` 中配置，也可以把 model 写成带 provider 前缀的引用，例如 `"model": "openrouter/anthropic/claude-sonnet-4"`。
 
 ### `model_routes`
 
@@ -445,6 +467,7 @@ WeChat 说明：
 
 - 空 `allow_from` 的行为因渠道而异。有些渠道（例如 WeChat 和 Discord）会把省略或留空视为“关闭过滤”，而不是“拒绝所有”；如果要做私有机器人，请显式填写 ID/OpenID。
 - `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
+- Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams[].webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
 
 Telegram forum topics：
 
@@ -588,6 +611,7 @@ Telegram forum topics：
 
 - 想使用“先连上再配对”的本地体验，保持 `listen = "127.0.0.1"`。
 - 在 local transport 下，只有 loopback 才允许未鉴权的 WebSocket upgrade；这样 UI 才能先连上，再发送 `pairing_request`。
+- local loopback 配对流程不再依赖固定共享码。`pairing_request` 可以省略 `payload.pairing_code`，仍然发送旧值 `123456` 的 loopback 客户端也保持兼容。
 - 如果把 `listen` 改成 `0.0.0.0` 或其他非 loopback 地址，那么 WebSocket upgrade 一开始就必须带上 channel token：
   - `ws://host:32123/ws?token=<auth_token>`
   - 或 `Authorization: Bearer <auth_token>`
@@ -672,6 +696,8 @@ Max 说明：
   - `host = "127.0.0.1"`
   - `require_pairing = true`
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
+- 如果绑定到非 loopback 地址，像 `/webhook`、`/cron/*`、`/a2a` 这类通用网关端点即使关闭了交互式 pairing，也仍然要求已存储的 bearer token，因此应保持 `require_pairing = true`，或者预先配置 `paired_tokens`。
+- 如果绑定到非 loopback 地址，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `paired_tokens`。
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
@@ -726,16 +752,37 @@ Max 说明：
 }
 ```
 
+**Tailscale 示例：**
+
+```json
+{
+  "tunnel": {
+    "provider": "tailscale",
+    "tailscale": {
+      "funnel": true,
+      "hostname": "nullclaw.ts.net",
+      "auth_key": "tskey-auth-..."
+    }
+  }
+}
+```
+
 **注意：**
 
 - 隧道会在网关启动前自动启动。
 - 启动后公网 URL 会打印到控制台，同时写入 `daemon_state.json`。
+- `tailscale.auth_key` 是可选项；当你希望启动 `serve`/`funnel` 之前自动执行 `tailscale up` 时再配置它。
+- `cloudflare.token`、`ngrok.auth_token`、`tailscale.auth_key` 这类隧道凭据在 `secrets.encrypt = true` 时会以加密形式落盘。
 
 ### `autonomy`
 
 - `level`: 推荐先用 `supervised`。
 - `workspace_only`: 建议保持 `true`，限制文件访问范围。
 - `max_actions_per_hour`: 建议保守设置，避免高频自动动作。
+- `block_high_risk_commands`（默认：`true`）：屏蔽破坏性命令，如 `rm`、`sudo`、`mkfs`、`dd`、`shutdown`、`ssh`。
+- `block_medium_risk_commands`（默认：`true`）：屏蔽中风险命令，包括网络/传输类命令（如 `curl`、`wget`、`nc`、`scp`、`ftp`、`telnet`）以及会改变状态的命令（如 `git commit`、`npm install`、`touch`、`mkdir`）。设为 `false` 可允许这些命令，同时仍屏蔽高风险命令。
+- `require_approval_for_medium_risk`（默认：`true`）：当 `block_medium_risk_commands` 为 `false` 时，在 `supervised` 模式下执行中风险命令前需要明确批准。
+- `allowed_commands`：允许的命令基础名称列表。仅在 full 自主模式下可使用 `["*"]` 通配符。高风险与中风险的运行时拦截无论此列表如何设置都会生效。
 
 ### `security`
 
@@ -760,6 +807,7 @@ Max 说明：
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
+    "block_medium_risk_commands": false,
     "block_high_risk_commands": false
   }
 }

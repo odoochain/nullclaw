@@ -56,24 +56,11 @@ pub fn runTaskWithTools(
     request: subagent_mod.TaskRunRequest,
 ) ![]const u8 {
     const provider_entry = findProviderEntry(request.default_provider, request.configured_providers);
-    const provider_base_url = if (provider_entry) |entry| entry.base_url else null;
-    const provider_native_tools = if (provider_entry) |entry| entry.native_tools else true;
-    const provider_user_agent = if (provider_entry) |entry| entry.user_agent else null;
-    const provider_api_mode = if (provider_entry) |entry| entry.api_mode else .chat_completions;
-    const provider_max_streaming_prompt_bytes = if (provider_entry) |entry| entry.max_streaming_prompt_bytes else null;
-    const provider_extra_body_params = if (provider_entry) |entry| entry.extra_body_params else null;
-
-    var provider_holder = providers.ProviderHolder.fromConfigWithApiMode(
+    var provider_holder = providers.holderFromEntry(
         allocator,
         request.default_provider,
         request.api_key,
-        provider_base_url,
-        provider_native_tools,
-        provider_user_agent,
-        provider_api_mode,
-        provider_max_streaming_prompt_bytes,
-        if (provider_entry) |entry| entry.chat_template_enable_thinking_param else false,
-        provider_extra_body_params,
+        provider_entry,
     );
     defer provider_holder.deinit();
 
@@ -87,6 +74,7 @@ pub fn runTaskWithTools(
         .max_actions_per_hour = request.max_actions_per_hour,
         .require_approval_for_medium_risk = request.require_approval_for_medium_risk,
         .block_high_risk_commands = request.block_high_risk_commands,
+        .block_medium_risk_commands = request.block_medium_risk_commands,
         .allow_raw_url_chars = request.allow_raw_url_chars,
         .tracker = &tracker,
     };
@@ -136,6 +124,7 @@ pub fn runTaskWithTools(
             .max_actions_per_hour = request.max_actions_per_hour,
             .require_approval_for_medium_risk = request.require_approval_for_medium_risk,
             .block_high_risk_commands = request.block_high_risk_commands,
+            .block_medium_risk_commands = request.block_medium_risk_commands,
             .allow_raw_url_chars = request.allow_raw_url_chars,
             .allowed_commands = request.allowed_commands,
             .allowed_paths = request.allowed_paths,

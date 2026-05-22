@@ -2,7 +2,21 @@
 
 NullClaw uses [CalVer](https://calver.org/) with the format `YYYY.M.D` (e.g., `v2026.3.12`).
 
-Pushing a tag matching `v*` triggers the [Release workflow](.github/workflows/release.yml), which builds binaries for all supported platforms and publishes a GitHub Release.
+Pushing a tag matching `v*` triggers the [Release workflow](.github/workflows/release.yml), which calls the shared `nullclaw/nullbuilder` Zig release workflow. It builds binaries for all supported platforms and publishes a GitHub Release.
+
+## Nightly builds
+
+The [Nightly workflow](.github/workflows/nightly.yml) runs at `02:23 UTC` every day and can also be started manually from GitHub Actions. It delegates the build matrix and artifact packaging to `nullclaw/nullbuilder`.
+
+Nightly builds:
+
+- build `ReleaseSmall` binaries for the same target matrix as releases
+- upload per-target artifacts with SHA-256 files and a small JSON manifest
+- keep artifacts for 14 days
+- do not create GitHub Releases, move tags, or publish Docker images
+- skip scheduled duplicate work when the current `main` commit already has a successful nightly run
+
+Use the manual `force` input if you need to rebuild the same commit intentionally.
 
 ## Steps
 

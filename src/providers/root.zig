@@ -24,6 +24,7 @@ pub const api_error_details = @import("api_error_details.zig");
 pub const scrub = @import("scrub.zig");
 pub const api_key = @import("api_key.zig");
 pub const factory = @import("factory.zig");
+pub const configured = @import("configured.zig");
 pub const helpers = @import("helpers.zig");
 
 // Re-exports from scrub.zig
@@ -46,13 +47,10 @@ pub const detectProviderByApiKey = factory.detectProviderByApiKey;
 pub const compatibleProviderUrl = factory.compatibleProviderUrl;
 pub const compatibleProviderDisplayName = factory.compatibleProviderDisplayName;
 pub const ProviderHolder = factory.ProviderHolder;
+pub const holderFromConfig = configured.holderFromConfig;
+pub const holderFromEntry = configured.holderFromEntry;
 
 // Re-exports from helpers.zig
-pub const complete = helpers.complete;
-pub const completeWithSystem = helpers.completeWithSystem;
-pub const providerUrl = helpers.providerUrl;
-pub const buildRequestBody = helpers.buildRequestBody;
-pub const buildRequestBodyWithSystem = helpers.buildRequestBodyWithSystem;
 pub const isReasoningModel = helpers.isReasoningModel;
 pub const appendGenerationFields = helpers.appendGenerationFields;
 pub const appendGeminiThinkingConfig = helpers.appendGeminiThinkingConfig;
@@ -64,7 +62,6 @@ pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const convertToolsResponses = helpers.convertToolsResponses;
 pub const curlPostTimed = helpers.curlPostTimed;
 pub const curlPostFormTimed = helpers.curlPostFormTimed;
-pub const extractContent = helpers.extractContent;
 pub const SplitThinkContent = helpers.SplitThinkContent;
 pub const splitThinkContent = helpers.splitThinkContent;
 pub const stripThinkBlocks = helpers.stripThinkBlocks;
@@ -216,6 +213,25 @@ pub const ChatResponse = struct {
     /// Convenience: return text content or empty string.
     pub fn contentOrEmpty(self: ChatResponse) []const u8 {
         return self.content orelse "";
+    }
+
+    pub fn deinit(self: *ChatResponse, allocator: std.mem.Allocator) void {
+        if (self.content) |c| allocator.free(c);
+        if (self.reasoning_content) |rc| allocator.free(rc);
+        if (self.model.len > 0) allocator.free(self.model);
+        if (self.provider.len > 0) allocator.free(self.provider);
+        for (self.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(self.tool_calls);
+        self.content = null;
+        self.tool_calls = &.{};
+        self.usage = .{};
+        self.provider = "";
+        self.model = "";
+        self.reasoning_content = null;
     }
 };
 
@@ -818,6 +834,24 @@ test "shouldRecoverPartialStream returns true after partial output" {
 
 test "shouldRecoverPartialStream returns false without output" {
     try std.testing.expect(!shouldRecoverPartialStream(0, false));
+}
+
+test "ChatResponse deinit resets owned fields" {
+    const allocator = std.testing.allocator;
+    var response = ChatResponse{
+        .content = try allocator.dupe(u8, "hello"),
+        .provider = try allocator.dupe(u8, "provider"),
+        .model = try allocator.dupe(u8, "model"),
+        .reasoning_content = try allocator.dupe(u8, "reasoning"),
+    };
+
+    response.deinit(allocator);
+
+    try std.testing.expect(response.content == null);
+    try std.testing.expect(response.reasoning_content == null);
+    try std.testing.expectEqual(@as(usize, 0), response.tool_calls.len);
+    try std.testing.expectEqualStrings("", response.provider);
+    try std.testing.expectEqualStrings("", response.model);
 }
 
 test "emitChatResponseAsStream frees unused chat response fields" {

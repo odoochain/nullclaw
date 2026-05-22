@@ -1458,6 +1458,13 @@ fn cronJsonPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
     const dir = try config_paths.defaultConfigDir(allocator);
     defer allocator.free(dir);
+
+    if (builtin.is_test) {
+        const leaf = try std.fmt.allocPrint(allocator, "cron-{d}.json", .{std.Thread.getCurrentId()});
+        defer allocator.free(leaf);
+        return config_paths.pathFromConfigDir(allocator, dir, leaf);
+    }
+
     return cronJsonPathFromDir(allocator, dir);
 }
 
@@ -2490,6 +2497,25 @@ pub const Task = CronJob;
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+var cron_store_test_mutex: std_compat.sync.Mutex = .{};
+
+fn resetCronStoreForTest(allocator: std.mem.Allocator) !void {
+    const path = try cronJsonPath(allocator);
+    defer allocator.free(path);
+
+    std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    std_compat.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
 test "parseDuration minutes" {
     try std.testing.expectEqual(@as(i64, 1800), try parseDuration("30m"));
 }
@@ -2680,6 +2706,11 @@ test "CronScheduler getJob found and missing" {
 }
 
 test "save and load roundtrip" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2712,6 +2743,11 @@ test "save and load roundtrip" {
 }
 
 test "load agent job without command field falls back to prompt" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2734,6 +2770,11 @@ test "load agent job without command field falls back to prompt" {
 }
 
 test "load agent job without prompt field falls back to command" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2764,6 +2805,11 @@ test "trimOwnedRight duplicates trimmed allocation" {
 }
 
 test "save and load roundtrip keeps delivery account routing" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2800,6 +2846,11 @@ test "save and load roundtrip keeps delivery account routing" {
 }
 
 test "cliRunJob persists last status and timestamp" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2832,6 +2883,11 @@ test "resolveRunnableCwd returns null for missing cwd" {
 }
 
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
     _ = try scheduler.addJob("*/10 * * * *", "echo keep");
@@ -2859,6 +2915,11 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
 }
 
 test "save and load roundtrip with JSON-sensitive command characters" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2875,6 +2936,11 @@ test "save and load roundtrip with JSON-sensitive command characters" {
 }
 
 test "save and load roundtrip keeps agent fields" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -3657,4 +3723,100 @@ test "buildSchedulerStatusJson reports scheduler summary" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"job_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"active_jobs\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paused_jobs\":1") != null);
+}
+
+test "cron register + cancel leaks zero bytes for every job kind" {
+    // Uses the leak-detecting GPA (std.testing.allocator). Any allocation
+    // in addJob / addOnce / addAgentJob / addAgentOnce that is not freed
+    // by removeJob will be reported as a leak when the test runner tears
+    // down the allocator.
+    //
+    // The agent-job path is the most leak-prone — it allocates id,
+    // expression, command, prompt, model (optional), delivery.channel,
+    // delivery.account_id, delivery.to, delivery.peer_id, and
+    // delivery.thread_id, each behind its own _owned flag in freeJobOwned.
+    // The original new test only covered addJob + addOnce and would have
+    // missed a regression in any of those agent-only fields.
+    const alloc = std.testing.allocator;
+
+    var sched = CronScheduler.init(alloc, 10, true);
+    defer sched.deinit();
+
+    // Recurring shell job.
+    const recurring = try sched.addJob("*/5 * * * *", "echo recurring");
+    // dupe the id because removeJob takes ownership of (frees) the matched
+    // job's heap-owned id; passing the original `recurring.id` slice would
+    // be a use-after-free pattern.
+    const recurring_id = try alloc.dupe(u8, recurring.id);
+    defer alloc.free(recurring_id);
+    try std.testing.expect(sched.removeJob(recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot shell job: extra `@once:<delay>` expression allocation.
+    const once = try sched.addOnce("10m", "echo once");
+    const once_id = try alloc.dupe(u8, once.id);
+    defer alloc.free(once_id);
+    try std.testing.expect(sched.removeJob(once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // Recurring agent job: every delivery field non-null to exercise the
+    // full _owned-flag matrix in freeJobOwned.
+    const agent_recurring = try sched.addAgentJob("*/15 * * * *", "be helpful", "claude-sonnet", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "12345",
+        .peer_kind = .direct,
+        .peer_id = "user-99",
+        .thread_id = "topic-7",
+        .best_effort = false,
+    });
+    const agent_recurring_id = try alloc.dupe(u8, agent_recurring.id);
+    defer alloc.free(agent_recurring_id);
+    try std.testing.expect(sched.removeJob(agent_recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot agent job: same field matrix, plus the `@once:<delay>` expr.
+    // Pass `null` for model to exercise the optional-skip path.
+    const agent_once = try sched.addAgentOnce("5m", "remind me", null, .{
+        .mode = .on_success,
+        .channel = "discord",
+        .account_id = "guild-42",
+        .to = "channel-7",
+        .peer_kind = .group,
+        .peer_id = "guild-42",
+        .thread_id = null,
+        .best_effort = true,
+    });
+    const agent_once_id = try alloc.dupe(u8, agent_once.id);
+    defer alloc.free(agent_once_id);
+    try std.testing.expect(sched.removeJob(agent_once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // removeJob on an unknown id must return false without leaking or
+    // crashing, regardless of whether jobs are present.
+    try std.testing.expect(!sched.removeJob("nonexistent-id"));
+}
+
+test "cron rejects obviously malformed expressions" {
+    // Each input exercises a distinct branch in parseCronExpression /
+    // parseCronField. Note: "* * * * * * *" (7 fields) is valid per the
+    // spec and is excluded.
+    const malformed = [_][]const u8{
+        "", // empty
+        "garbage", // single non-cron token
+        "* * *", // wrong field count (3, not 5/6/7)
+        "60 * * * *", // minute out of range
+        "* 24 * * *", // hour out of range
+        "* * 32 * *", // day-of-month out of range
+        "* * * 13 *", // month out of range
+        "* * * * 8", // day-of-week out of range (allow_sunday_7 caps at 7)
+        "*/0 * * * *", // step = 0 — divide-by-zero classic
+        "5-3 * * * *", // reversed range (start > end)
+        "abc * * * *", // alphabetic in numeric field
+    };
+    for (malformed) |input| {
+        const result = nextRunForCronExpression(input, 0);
+        try std.testing.expect(std.meta.isError(result));
+    }
 }

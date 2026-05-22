@@ -116,17 +116,11 @@ pub const RuntimeProviderBundle = struct {
 
         const primary_holder = try allocator.create(ProviderHolder);
         bundle.primary_holder = primary_holder;
-        primary_holder.* = ProviderHolder.fromConfigWithApiMode(
+        primary_holder.* = @import("root.zig").holderFromConfig(
             allocator,
+            cfg,
             cfg.default_provider,
             bundle.primary_key,
-            cfg.getProviderBaseUrl(cfg.default_provider),
-            cfg.getProviderNativeTools(cfg.default_provider),
-            cfg.getProviderUserAgent(cfg.default_provider),
-            cfg.getProviderApiMode(cfg.default_provider),
-            cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
-            cfg.getProviderChatTemplateEnableThinkingParam(cfg.default_provider),
-            cfg.getProviderExtraBodyParams(cfg.default_provider),
         );
 
         if (cfg.model_routes.len > 0) {
@@ -294,17 +288,11 @@ pub const RuntimeProviderBundle = struct {
                     cfg.providers,
                 ) catch null;
                 bundle.extra_keys.?[extra_i] = fb_key;
-                bundle.extra_holders.?[extra_i] = ProviderHolder.fromConfigWithApiMode(
+                bundle.extra_holders.?[extra_i] = @import("root.zig").holderFromConfig(
                     allocator,
+                    cfg,
                     provider_name,
                     fb_key,
-                    cfg.getProviderBaseUrl(provider_name),
-                    cfg.getProviderNativeTools(provider_name),
-                    cfg.getProviderUserAgent(provider_name),
-                    cfg.getProviderApiMode(provider_name),
-                    cfg.getProviderMaxStreamingPromptBytes(provider_name),
-                    cfg.getProviderChatTemplateEnableThinkingParam(provider_name),
-                    cfg.getProviderExtraBodyParams(provider_name),
                 );
                 bundle.extra_holders_initialized = extra_i + 1;
                 bundle.reliable_entries.?[extra_i] = .{
@@ -324,17 +312,11 @@ pub const RuntimeProviderBundle = struct {
 
                     const key_copy = try allocator.dupe(u8, trimmed);
                     bundle.extra_keys.?[extra_i] = key_copy;
-                    bundle.extra_holders.?[extra_i] = ProviderHolder.fromConfigWithApiMode(
+                    bundle.extra_holders.?[extra_i] = @import("root.zig").holderFromConfig(
                         allocator,
+                        cfg,
                         cfg.default_provider,
                         key_copy,
-                        cfg.getProviderBaseUrl(cfg.default_provider),
-                        cfg.getProviderNativeTools(cfg.default_provider),
-                        cfg.getProviderUserAgent(cfg.default_provider),
-                        cfg.getProviderApiMode(cfg.default_provider),
-                        cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
-                        cfg.getProviderChatTemplateEnableThinkingParam(cfg.default_provider),
-                        cfg.getProviderExtraBodyParams(cfg.default_provider),
                     );
                     bundle.extra_holders_initialized = extra_i + 1;
                     bundle.reliable_entries.?[extra_i] = .{

@@ -15,6 +15,7 @@ Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](ht
 
 <p align="center">
   <a href="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/nullclaw/nullclaw/actions/workflows/nightly.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/nightly.yml/badge.svg" alt="Nightly" /></a>
   <a href="https://nullclaw.github.io"><img src="https://img.shields.io/badge/docs-nullclaw.github.io-informational" alt="Documentation" /></a>
   <a href="https://discord.gg/Bfmdua22Ud"><img src="https://img.shields.io/badge/discord-join%20community-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
@@ -79,6 +80,7 @@ Localized documentation lives under `docs/en/` and `docs/zh/`. Use the links bel
 |---|---|---|
 | Start here | [`docs/en/README.md`](docs/en/README.md) | [`docs/zh/README.md`](docs/zh/README.md) |
 | Install | [`docs/en/installation.md`](docs/en/installation.md) | [`docs/zh/installation.md`](docs/zh/installation.md) |
+| Install Zig | [`docs/en/zig-installation.md`](docs/en/zig-installation.md) | [`docs/zh/zig-installation.md`](docs/zh/zig-installation.md) |
 | Configure | [`docs/en/configuration.md`](docs/en/configuration.md) | [`docs/zh/configuration.md`](docs/zh/configuration.md) |
 | Commands | [`docs/en/commands.md`](docs/en/commands.md) | [`docs/zh/commands.md`](docs/zh/commands.md) |
 | Development | [`docs/en/development.md`](docs/en/development.md) | [`docs/zh/development.md`](docs/zh/development.md) |
@@ -121,6 +123,7 @@ nullclaw --help
 > **Prerequisite:** use **Zig 0.16.0** (exact version).
 > Other Zig versions are currently unsupported and may fail to build.
 > Verify before building: `zig version` should print `0.16.0`.
+> Debian users who need Zig first can follow [`docs/en/zig-installation.md`](docs/en/zig-installation.md).
 
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
@@ -196,6 +199,10 @@ nullclaw channel start signal
 # Linux supports systemd user services and OpenRC
 nullclaw service install
 nullclaw service status
+
+# Optional secret injection hook for service mode:
+# if ~/.nullclaw/service-env is executable, the installed service launcher runs it
+# before starting `nullclaw gateway` (for example via dotenvx or sops)
 
 # Migrate memory from OpenClaw
 nullclaw migrate openclaw --dry-run
@@ -619,6 +626,7 @@ Use this when you want full web-search provider control plus unrestricted shell 
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
+    "block_medium_risk_commands": false,
     "block_high_risk_commands": false
   }
 }
@@ -632,6 +640,7 @@ Use this when you want full web-search provider control plus unrestricted shell 
 - `allowed_commands` entries support `"cmd"`, `"cmd *"`, and `"*"` formats.
   - `"cmd"` and `"cmd *"` both allow that command family at the allowlist stage.
   - `"*"` allows any command at the allowlist stage.
+- High-risk and medium-risk runtime gates still apply after the allowlist check; set `block_medium_risk_commands: false` when you intentionally allow network/transfer commands such as `curl`/`wget` or other medium-risk mutations.
 - `allowed_paths: ["*"]` allows access outside workspace, except system-protected paths.
 
 ### Web UI / Browser Relay
@@ -664,6 +673,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
   - `"token"` (local transport only): include `auth_token` in each `user_message` payload (`access_token` is also accepted for compatibility).
 - `auth_token` hardens the WebSocket upgrade and becomes required when binding non-loopback addresses.
 - Unauthenticated WebSocket upgrade is loopback-only. Pairing-first local UX works on `127.0.0.1`, but a public/LAN bind must authenticate the `/ws` upgrade on the first hop with `?token=<auth_token>` or `Authorization: Bearer <auth_token>`.
+- Local loopback pairing no longer depends on a fixed shared code. `pairing_request` may omit `payload.pairing_code`, and legacy loopback clients that still send `123456` remain compatible.
 - `/ws` is the WebSocket endpoint. `/pair` belongs to the HTTP gateway API and is not part of the web channel handshake.
 - Remote/headless host: if you bind `"listen": "0.0.0.0"`, prefer a stable configured token plus `message_auth_mode: "token"` behind TLS/reverse proxy, or keep loopback bind and expose it through SSH tunnel/proxy.
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
@@ -740,7 +750,8 @@ Enable in `~/.nullclaw/config.json`:
 
 ```bash
 # 1. Get a bearer token
-TOKEN=$(curl -s -X POST -H "X-Pairing-Code: 123456" http://localhost:3000/pair | jq -r .token)
+# Set PAIRING_CODE to the one-time code for this gateway session.
+TOKEN=$(curl -s -X POST -H "X-Pairing-Code: $PAIRING_CODE" http://localhost:3000/pair | jq -r .token)
 
 # 2. Discover the agent
 curl http://localhost:3000/.well-known/agent-card.json
@@ -762,6 +773,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `onboard --interactive` | Full interactive wizard |
 | `onboard --channels-only` | Reconfigure channels/allowlists only |
 | `agent -m "..."` | Single message mode |
+| `acp` | Start the Agent Client Protocol stdio adapter for ACP-compatible editors |
 | `agent` | Interactive chat mode |
 | `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
 | `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
@@ -771,7 +783,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `cron list\|status\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs, including `install --name <query>` registry search |
 | `history list\|show` | View session conversation history |
-| `memory stats\|count\|reindex\|search\|get\|list\|drain-outbox\|forget` | Inspect and maintain memory |
+| `memory stats\|count\|reindex\|search\|get\|list\|export-jsonl\|hygiene-report\|drain-outbox\|forget` | Inspect, export, and maintain memory |
 | `hardware scan\|flash\|monitor` | Hardware device management |
 | `config show\|get`, `models list\|summary\|info\|benchmark\|refresh` | Read config/model admin state and manage the model catalog |
 | `workspace edit\|reset-md` | Maintain workspace markdown/bootstrap files |
@@ -860,12 +872,13 @@ Implement a vtable interface, submit a PR:
 - New `Tunnel` -> `src/tunnel.zig`
 - New `Sandbox` backend -> `src/security/`
 - New `Peripheral` -> `src/peripherals.zig`
-- New `Skill` -> `~/.nullclaw/workspace/skills/<name>/`
+- New `Skill` -> `~/.nullclaw/workspace/skills/<name>/` or `~/.nullclaw/workspace/skills/<category>/<name>/`
 
 ## Chinese Docs (中文文档)
 
 - [Chinese docs overview (中文文档总览)](docs/zh/README.md)
 - [Installation guide (安装指南)](docs/zh/installation.md)
+- [Zig installation (Zig 安装指南)](docs/zh/zig-installation.md)
 - [Configuration guide (配置指南)](docs/zh/configuration.md)
 - [Usage and operations (使用与运维)](docs/zh/usage.md)
 - [Architecture overview (架构总览)](docs/zh/architecture.md)
@@ -878,6 +891,7 @@ Implement a vtable interface, submit a PR:
 
 - [English docs overview](docs/en/README.md)
 - [Installation](docs/en/installation.md)
+- [Zig Installation](docs/en/zig-installation.md)
 - [Configuration](docs/en/configuration.md)
 - [Usage and operations](docs/en/usage.md)
 - [Architecture](docs/en/architecture.md)

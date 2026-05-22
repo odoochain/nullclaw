@@ -357,17 +357,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
-    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+    var holder = providers.holderFromConfig(
         allocator,
+        &cfg,
         provider,
         api_key,
-        provider_base_url,
-        cfg.getProviderNativeTools(provider),
-        cfg.getProviderUserAgent(provider),
-        cfg.getProviderApiMode(provider),
-        cfg.getProviderMaxStreamingPromptBytes(provider),
-        cfg.getProviderChatTemplateEnableThinkingParam(provider),
-        cfg.getProviderExtraBodyParams(provider),
     );
     defer holder.deinit();
 

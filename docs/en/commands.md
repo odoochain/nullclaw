@@ -43,7 +43,11 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw onboard --api-key ... --provider ... --model ... --memory ...` | Set provider, model, and memory backend in one command |
 | `nullclaw onboard --channels-only` | Reconfigure channels and allowlists only |
 | `nullclaw agent -m "..."` | Run a single prompt |
+| `nullclaw agent --workspace /path/to/workspace -m "..."` | Run the agent against a specific workspace for this process |
+| `nullclaw agent --skill news-digest -m "..."` | Run a single prompt with a named skill active |
 | `nullclaw agent` | Start interactive chat mode |
+| `nullclaw acp` | Run the Agent Client Protocol stdio adapter for ACP-compatible editors |
+| `nullclaw acp --provider openai --model gpt-5.2` | Pin the ACP adapter to a provider/model for editor-launched sessions |
 
 ### Interactive model routing
 
@@ -56,6 +60,8 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 - `/model auto` clears the user pin, restores the configured default model, and re-enables `model_routes` for later turns in the same session.
 - If no `model_routes` are configured, `/model auto` still clears the pin and returns the session to the configured default model.
 - Starting `nullclaw agent` with `--model` or `--provider` also pins the run and bypasses `model_routes`.
+- Starting `nullclaw agent` with `--skill <name>` activates that skill before the first message or REPL turn.
+- `nullclaw acp` speaks newline-delimited JSON-RPC on stdio. Editors create ACP sessions with an absolute `cwd`; NullClaw forwards that cwd as the workspace for `agent invoke`.
 
 ## Runtime and operations
 
@@ -64,6 +70,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw gateway` | Start the long-running runtime using configured host and port |
 | `nullclaw gateway --port 8080` | Override the gateway port from the CLI |
 | `nullclaw gateway --host 0.0.0.0 --port 8080` | Override host and port from the CLI |
+| `nullclaw gateway --workspace /path/to/workspace` | Override the workspace directory for this gateway process |
 | `nullclaw service install` | Install the background service |
 | `nullclaw service start` | Start the background service |
 | `nullclaw service stop` | Stop the background service |
@@ -83,6 +90,7 @@ Notes:
 
 - `auth` currently supports only `openai-codex`.
 - `gateway --host/--port` overrides only the bind settings; the rest of gateway security still comes from config.
+- `agent --workspace` and `gateway --workspace` override the resolved workspace for the current process, equivalent to setting `NULLCLAW_WORKSPACE`.
 
 ## Channels, scheduling, and extensions
 
@@ -119,7 +127,7 @@ Notes:
 | Command | Purpose |
 |---|---|
 | `nullclaw skills list` | List installed skills |
-| `nullclaw skills install <source>` | Install from a GitHub URL or local path |
+| `nullclaw skills install <source>` | Install from a Git URL, local path, or HTTPS well-known skill endpoint |
 | `nullclaw skills install --name <query>` | Search the skill registry and install the best matching skill |
 | `nullclaw skills remove <name>` | Remove a skill |
 | `nullclaw skills info <name>` | Show skill metadata |
@@ -143,8 +151,21 @@ Notes:
 | `nullclaw memory search "query" --limit 10` | Run retrieval against memory |
 | `nullclaw memory get <key>` | Show one memory entry |
 | `nullclaw memory list --category task --limit 20` | List memory entries by category |
+| `nullclaw memory export-jsonl --limit 1000` | Export a governed, PII-redacted JSONL dataset from memory |
+| `nullclaw memory hygiene-report --json` | Dry-run exact/normalized duplicate report for memory |
 | `nullclaw memory drain-outbox` | Drain the durable vector outbox queue |
 | `nullclaw memory forget <key>` | Delete one memory entry |
+
+`memory export-jsonl` emits one JSON object per line with a stable
+`schema_version`, `key`, `category`, `timestamp`, `session_id`, and `content`
+schema. Bootstrap/autosave internals are excluded unless `--include-internal`
+is passed. Content is PII-redacted by default for DS notebooks, model
+evaluation, and external review; use `--include-pii` only for trusted local raw
+exports.
+
+`memory hygiene-report` is non-destructive. It scans the selected memory slice
+and reports exact duplicates plus normalized duplicates where case and
+whitespace differ. It does not delete or rewrite entries.
 
 ### `workspace`, `capabilities`, `models`, `migrate`
 
@@ -153,6 +174,12 @@ Notes:
 | `nullclaw workspace edit AGENTS.md` | Open a bootstrap markdown file in `$EDITOR` |
 | `nullclaw workspace reset-md --dry-run` | Preview workspace markdown reset |
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | Reset bundled markdown files and optionally clear extra files |
+| `nullclaw workspace audit` | Scan workspace files for likely secret leaks (token prefixes, PEM blocks, credentials in URLs, high-entropy strings) |
+| `nullclaw workspace audit --staged \| --commit <sha> \| --range a..b` | Audit a staged diff, a historical commit, or a git revision range instead of the workspace tree |
+| `nullclaw workspace audit --json [--only-secrets] [--fail-on <level>]` | Machine-readable output for CI integration; non-zero exit when findings meet the threshold |
+| `nullclaw workspace audit --llm-triage external` | Re-classify findings via `workspace_audit.llm_triage` or the configured primary LLM provider using privacy-preserving envelopes (no raw secret value leaves the machine) |
+| `nullclaw workspace audit --llm-provider ollama --llm-model qwen2.5-coder:7b --llm-max-calls 20` | Override the configured audit triage provider, model, and external-call budget for one run |
+| `nullclaw workspace audit --llm-triage dry-run` | Print the envelopes that would be sent without calling the LLM |
 | `nullclaw capabilities` | Show a text capability summary |
 | `nullclaw capabilities --json` | Show a JSON capability manifest |
 | `nullclaw config show [--json]` | Print the full on-disk config |

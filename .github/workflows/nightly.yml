@@ -1,0 +1,33 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if this commit already has a successful nightly run.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nightly:
+    uses: nullclaw/nullbuilder/.github/workflows/zig-nightly.yml@v1
+    permissions:
+      actions: read
+      contents: write
+    with:
+      binary_name: nullclaw
+      artifact_prefix: nullclaw
+      publish_release: true
+      release_tag: nightly
+      release_title: NullClaw Nightly
+      force: ${{ inputs.force || false }}

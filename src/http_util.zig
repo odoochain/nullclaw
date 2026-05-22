@@ -13,6 +13,7 @@ const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_CURL_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CURL_STDERR_BYTES: usize = 16 * 1024;
 
 fn classifyCurlExitCode(code: u8) []const u8 {
     return switch (code) {
@@ -34,8 +35,63 @@ pub fn mapCurlExitCodeToError(code: u8) anyerror {
     };
 }
 
-fn logCurlExitFailure(op: []const u8, code: u8) void {
-    log.warn("curl {s} failed: exit_code={d} class={s}", .{ op, code, classifyCurlExitCode(code) });
+const StderrCapture = struct {
+    file: ?std_compat.fs.File = null,
+    buffer: [MAX_CURL_STDERR_BYTES]u8 = undefined,
+    len: usize = 0,
+
+    fn trimmed(self: *const StderrCapture) ?[]const u8 {
+        const bytes = std.mem.trim(u8, self.buffer[0..self.len], " \t\r\n");
+        if (bytes.len == 0) return null;
+        return bytes;
+    }
+};
+
+fn stderrCaptureMain(ctx: *StderrCapture) void {
+    const file = ctx.file orelse return;
+    while (ctx.len < ctx.buffer.len) {
+        const n = file.read(ctx.buffer[ctx.len..]) catch return;
+        if (n == 0) return;
+        ctx.len += n;
+    }
+
+    // Keep draining after the retained buffer is full so a noisy child cannot
+    // block forever on a full stderr pipe while the parent waits on stdout.
+    var discard: [1024]u8 = undefined;
+    while (true) {
+        const n = file.read(&discard) catch return;
+        if (n == 0) return;
+    }
+}
+
+fn startStderrCapture(child: *std_compat.process.Child, capture: *StderrCapture) ?std.Thread {
+    capture.* = .{ .file = child.stderr };
+    if (capture.file == null) return null;
+    return std.Thread.spawn(.{}, stderrCaptureMain, .{capture}) catch null;
+}
+
+fn finishStderrCapture(thread_opt: *?std.Thread, capture: *const StderrCapture) ?[]const u8 {
+    if (thread_opt.*) |thread| {
+        thread.join();
+        thread_opt.* = null;
+    }
+    return capture.trimmed();
+}
+
+fn logCurlExitFailure(op: []const u8, code: u8, stderr_msg: ?[]const u8) void {
+    if (stderr_msg) |msg| {
+        log.warn("curl {s} failed: exit_code={d} class={s} stderr={s}", .{ op, code, classifyCurlExitCode(code), msg });
+    } else {
+        log.warn("curl {s} failed: exit_code={d} class={s}", .{ op, code, classifyCurlExitCode(code) });
+    }
+}
+
+fn logCurlWaitFailure(op: []const u8, err: anyerror, stderr_msg: ?[]const u8) void {
+    if (stderr_msg) |msg| {
+        log.err("curl {s} child.wait failed: {} stderr={s}", .{ op, err, msg });
+    } else {
+        log.err("curl {s} child.wait failed: {}", .{ op, err });
+    }
 }
 
 pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
@@ -126,8 +182,8 @@ pub const ProxyHttpClient = struct {
 
 pub const SafeResolveEntryError = Allocator.Error || error{
     InvalidUrl,
-    LocalAddressBlocked,
     HostResolutionFailed,
+    LocalAddressBlocked,
 };
 
 fn defaultPortForScheme(uri: std.Uri) ?u16 {
@@ -164,6 +220,10 @@ fn buildCurlResolveEntry(
 /// Build an optional curl `--resolve` entry for remote provider requests.
 /// Remote hosts are pinned to a concrete globally-routable address; explicit
 /// local/private hosts are left untouched so intentional local providers still work.
+///
+/// DNS resolution failures are fail-closed. Falling back to curl's resolver would
+/// bypass the single resolved-address check and weaken SSRF protection against
+/// DNS answers that resolve to local/private networks.
 pub fn buildSafeResolveEntryForRemoteUrl(
     allocator: Allocator,
     url: []const u8,
@@ -174,11 +234,23 @@ pub fn buildSafeResolveEntryForRemoteUrl(
 
     if (net_security.isLocalHost(host)) return null;
 
-    const connect_host = try net_security.resolveConnectHost(allocator, host, port);
+    const connect_host = net_security.resolveConnectHost(allocator, host, port) catch |err|
+        return mapResolveConnectHostError(host, err);
     defer allocator.free(connect_host);
 
     if (!shouldUsePinnedResolve(host, connect_host)) return null;
     return try buildCurlResolveEntry(allocator, host, port, connect_host);
+}
+
+fn mapResolveConnectHostError(host: []const u8, err: net_security.ResolveConnectHostError) SafeResolveEntryError {
+    return switch (err) {
+        error.HostResolutionFailed => blk: {
+            log.debug("host resolution unavailable for {s}; failing closed", .{host});
+            break :blk error.HostResolutionFailed;
+        },
+        error.LocalAddressBlocked => error.LocalAddressBlocked,
+        error.OutOfMemory => error.OutOfMemory,
+    };
 }
 
 pub fn appendCurlResolveArgs(argv_buf: []([]const u8), argc: *usize, resolve_entry: ?[]const u8) void {
@@ -325,7 +397,7 @@ fn curlRequestWithProxy(
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -340,6 +412,9 @@ fn curlRequestWithProxy(
         cancel_done.store(true, .release);
         if (cancel_watcher) |t| t.join();
     }
+    var stderr_capture = StderrCapture{};
+    var stderr_thread = startStderrCapture(&child, &stderr_capture);
+    defer if (stderr_thread) |thread| thread.join();
 
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
@@ -364,13 +439,16 @@ fn curlRequestWithProxy(
     };
 
     const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
+        _ = child.kill() catch {};
+        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
+        logCurlWaitFailure(method, err, stderr_msg);
         allocator.free(stdout);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
+    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
     switch (term) {
         .exited => |code| if (code != 0) {
-            logCurlExitFailure(method, code);
+            logCurlExitFailure(method, code, stderr_msg);
             allocator.free(stdout);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
@@ -484,7 +562,7 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -499,6 +577,9 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
         cancel_done.store(true, .release);
         if (cancel_watcher) |t| t.join();
     }
+    var stderr_capture = StderrCapture{};
+    var stderr_thread = startStderrCapture(&child, &stderr_capture);
+    defer if (stderr_thread) |thread| thread.join();
 
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
@@ -524,12 +605,15 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
+        _ = child.kill() catch {};
+        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
+        logCurlWaitFailure("POST", err, stderr_msg);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
+    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
     switch (term) {
         .exited => |code| if (code != 0) {
-            logCurlExitFailure("POST", code);
+            logCurlExitFailure("POST", code, stderr_msg);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
@@ -624,7 +708,7 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -639,6 +723,9 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
         cancel_done.store(true, .release);
         if (cancel_watcher) |t| t.join();
     }
+    var stderr_capture = StderrCapture{};
+    var stderr_thread = startStderrCapture(&child, &stderr_capture);
+    defer if (stderr_thread) |thread| thread.join();
 
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
@@ -664,11 +751,17 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
+        _ = child.kill() catch {};
+        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
+        logCurlWaitFailure("POST", err, stderr_msg);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
+    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
     switch (term) {
-        .exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+        .exited => |code| if (code != 0) {
+            logCurlExitFailure("POST", code, stderr_msg);
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
+        },
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
     }
 
@@ -755,7 +848,7 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -770,6 +863,9 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
         cancel_done.store(true, .release);
         if (cancel_watcher) |t| t.join();
     }
+    var stderr_capture = StderrCapture{};
+    var stderr_thread = startStderrCapture(&child, &stderr_capture);
+    defer if (stderr_thread) |thread| thread.join();
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_GET_MAX_BYTES) catch {
         _ = child.kill() catch {};
@@ -779,12 +875,15 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
+        _ = child.kill() catch {};
+        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
+        logCurlWaitFailure("GET", err, stderr_msg);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
+    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
     switch (term) {
         .exited => |code| if (code != 0) {
-            logCurlExitFailure("GET", code);
+            logCurlExitFailure("GET", code, stderr_msg);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
@@ -871,7 +970,7 @@ fn curlGetWithProxyAndResolve(
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -886,6 +985,9 @@ fn curlGetWithProxyAndResolve(
         cancel_done.store(true, .release);
         if (cancel_watcher) |t| t.join();
     }
+    var stderr_capture = StderrCapture{};
+    var stderr_thread = startStderrCapture(&child, &stderr_capture);
+    defer if (stderr_thread) |thread| thread.join();
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, max_bytes) catch {
         _ = child.kill() catch {};
@@ -894,12 +996,15 @@ fn curlGetWithProxyAndResolve(
     };
 
     const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
+        _ = child.kill() catch {};
+        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
+        logCurlWaitFailure("GET", err, stderr_msg);
         return error.CurlWaitError;
     };
+    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
     switch (term) {
         .exited => |code| if (code != 0) {
-            logCurlExitFailure("GET", code);
+            logCurlExitFailure("GET", code, stderr_msg);
             allocator.free(stdout);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
@@ -1008,6 +1113,7 @@ fn putProxyEnvVarFromProcess(
     if (std_compat.process.getEnvVarOwned(allocator, key)) |raw_value| {
         defer allocator.free(raw_value);
         if (try normalizeProxyEnvValue(allocator, raw_value)) |proxy| {
+            defer allocator.free(proxy);
             try env_map.put(key, proxy);
         }
     } else |_| {}
@@ -1096,10 +1202,10 @@ pub fn curlGetSSE(
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     child.spawn() catch |err| {
-        std.debug.print("[curlGetSSE] spawn failed: {}\n", .{err});
+        log.err("curl GET-SSE spawn failed: {}", .{err});
         return error.CurlFailed;
     };
     const cancel_flag = thread_interrupt_flag;
@@ -1114,6 +1220,9 @@ pub fn curlGetSSE(
         cancel_done.store(true, .release);
         if (cancel_watcher) |t| t.join();
     }
+    var stderr_capture = StderrCapture{};
+    var stderr_thread = startStderrCapture(&child, &stderr_capture);
+    defer if (stderr_thread) |thread| thread.join();
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
         _ = child.kill() catch {};
@@ -1122,10 +1231,13 @@ pub fn curlGetSSE(
     };
 
     const term = child.wait() catch |err| {
-        log.err("curl child.wait failed: {}", .{err});
+        _ = child.kill() catch {};
+        const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
+        logCurlWaitFailure("GET-SSE", err, stderr_msg);
         allocator.free(stdout);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
+    const stderr_msg = finishStderrCapture(&stderr_thread, &stderr_capture);
     switch (term) {
         .exited => |code| {
             if (code != 0) {
@@ -1133,7 +1245,7 @@ pub fn curlGetSSE(
                 // but curl may have received some data before timing out - return it.
                 // For other exit codes, treat as error.
                 if (code != 28) {
-                    logCurlExitFailure("GET-SSE", code);
+                    logCurlExitFailure("GET-SSE", code, stderr_msg);
                     allocator.free(stdout);
                     return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
                 }
@@ -1204,6 +1316,12 @@ test "buildSafeResolveEntryForRemoteUrl rejects loopback integer alias" {
     try std.testing.expectError(error.LocalAddressBlocked, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "https://2130706433/v1"));
 }
 
+test "buildSafeResolveEntryForRemoteUrl maps resolution failure to fail closed" {
+    // Regression: do not silently fall back to curl DNS on resolver failure,
+    // because that bypasses private-address screening before --resolve pinning.
+    try std.testing.expect(mapResolveConnectHostError("example.com", error.HostResolutionFailed) == error.HostResolutionFailed);
+}
+
 test "buildSafeResolveEntryForRemoteUrl rejects malformed URL" {
     try std.testing.expectError(error.InvalidUrl, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "notaurl"));
 }
@@ -1242,6 +1360,24 @@ test "curl exit code mapping returns specific errors" {
     try std.testing.expect(mapCurlExitCodeToError(28) == error.CurlTimeout);
     try std.testing.expect(mapCurlExitCodeToError(60) == error.CurlTlsError);
     try std.testing.expect(mapCurlExitCodeToError(22) == error.CurlFailed);
+}
+
+test "StderrCapture returns trimmed stderr" {
+    var capture = StderrCapture{};
+    const raw = "\n curl: (6) Could not resolve host \n";
+    @memcpy(capture.buffer[0..raw.len], raw);
+    capture.len = raw.len;
+
+    try std.testing.expectEqualStrings("curl: (6) Could not resolve host", capture.trimmed().?);
+}
+
+test "StderrCapture ignores empty stderr" {
+    var capture = StderrCapture{};
+    const raw = " \n\t ";
+    @memcpy(capture.buffer[0..raw.len], raw);
+    capture.len = raw.len;
+
+    try std.testing.expect(capture.trimmed() == null);
 }
 
 test "normalizeProxyEnvValue trims surrounding whitespace" {

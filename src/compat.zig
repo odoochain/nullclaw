@@ -293,3 +293,7 @@ pub const sync = struct {
         }
     };
 };
+
+test {
+    std.testing.refAllDecls(@This());
+}

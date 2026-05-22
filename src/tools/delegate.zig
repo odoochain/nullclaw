@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -19,6 +20,7 @@ const TestCompleteFn = *const fn (
     user_agent: ?[]const u8,
     api_mode: ProviderEntry.ApiMode,
     chat_template_enable_thinking_param: bool,
+    max_streaming_prompt_bytes: ?usize,
     extra_body_params: ?[]const u8,
     model: []const u8,
     system_prompt: []const u8,
@@ -123,6 +125,7 @@ pub const DelegateTool = struct {
                 if (provider_entry) |entry| entry.user_agent else null,
                 if (provider_entry) |entry| entry.api_mode else .chat_completions,
                 if (provider_entry) |entry| entry.chat_template_enable_thinking_param else false,
+                if (provider_entry) |entry| entry.max_streaming_prompt_bytes else null,
                 if (provider_entry) |entry| entry.extra_body_params else null,
                 ac.model,
                 sys_prompt,
@@ -146,14 +149,35 @@ pub const DelegateTool = struct {
         };
         defer cfg.deinit();
 
-        const agent_prompt = std.fmt.allocPrint(
-            allocator,
-            "[System: You are agent '{s}'. Respond concisely and helpfully.]\n\n{s}",
-            .{ trimmed_agent, full_prompt },
-        ) catch return ToolResult.fail("Failed to build agent prompt");
-        defer allocator.free(agent_prompt);
+        const default_model = cfg.default_model orelse {
+            return ToolResult.fail("No default model configured for delegate fallback");
+        };
+        const resolved_default_api_key = try providers.resolveApiKeyFromConfig(allocator, cfg.default_provider, cfg.providers);
+        defer if (resolved_default_api_key) |key| allocator.free(key);
 
-        const response = providers.complete(allocator, &cfg, agent_prompt) catch |err| {
+        const fallback_system_prompt = std.fmt.allocPrint(
+            allocator,
+            "You are agent '{s}'. Respond concisely and helpfully.",
+            .{trimmed_agent},
+        ) catch return ToolResult.fail("Failed to build agent prompt");
+        defer allocator.free(fallback_system_prompt);
+
+        const response = completeAgentPrompt(
+            allocator,
+            cfg.default_provider,
+            resolved_default_api_key,
+            cfg.getProviderBaseUrl(cfg.default_provider),
+            cfg.getProviderNativeTools(cfg.default_provider),
+            cfg.getProviderUserAgent(cfg.default_provider),
+            cfg.getProviderApiMode(cfg.default_provider),
+            cfg.getProviderChatTemplateEnableThinkingParam(cfg.default_provider),
+            cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
+            cfg.getProviderExtraBodyParams(cfg.default_provider),
+            default_model,
+            fallback_system_prompt,
+            full_prompt,
+            cfg.temperature,
+        ) catch |err| {
             const msg = std.fmt.allocPrint(
                 allocator,
                 "Delegation to agent '{s}' failed: {s}",
@@ -188,6 +212,7 @@ pub const DelegateTool = struct {
         user_agent: ?[]const u8,
         api_mode: ProviderEntry.ApiMode,
         chat_template_enable_thinking_param: bool,
+        max_streaming_prompt_bytes: ?usize,
         extra_body_params: ?[]const u8,
         model: []const u8,
         system_prompt: []const u8,
@@ -205,6 +230,7 @@ pub const DelegateTool = struct {
                     user_agent,
                     api_mode,
                     chat_template_enable_thinking_param,
+                    max_streaming_prompt_bytes,
                     extra_body_params,
                     model,
                     system_prompt,
@@ -221,11 +247,7 @@ pub const DelegateTool = struct {
             native_tools,
             user_agent,
             api_mode,
-            // GAP-19: max_streaming_prompt_bytes is intentionally null here.
-            // The delegate tool performs short, single-turn completions where
-            // token volumes are small and streaming is not used.  Passing null
-            // means "no limit" (always stream), which is correct for this path.
-            null,
+            max_streaming_prompt_bytes,
             chat_template_enable_thinking_param,
             extra_body_params,
         );
@@ -248,6 +270,7 @@ var test_expected_native_tools: ?bool = null;
 var test_expected_user_agent: ?[]const u8 = null;
 var test_expected_api_mode: ?ProviderEntry.ApiMode = null;
 var test_expected_chat_template_enable_thinking_param: ?bool = null;
+var test_expected_max_streaming_prompt_bytes: ?usize = null;
 var test_expected_extra_body_params: ?[]const u8 = null;
 var test_expected_model_name: ?[]const u8 = null;
 var test_expected_system_prompt: ?[]const u8 = null;
@@ -262,6 +285,7 @@ fn testCompleteAgentPrompt(
     user_agent: ?[]const u8,
     api_mode: ProviderEntry.ApiMode,
     chat_template_enable_thinking_param: bool,
+    max_streaming_prompt_bytes: ?usize,
     extra_body_params: ?[]const u8,
     model: []const u8,
     system_prompt: []const u8,
@@ -292,6 +316,9 @@ fn testCompleteAgentPrompt(
     }
     if (test_expected_chat_template_enable_thinking_param) |expected| {
         try std.testing.expectEqual(expected, chat_template_enable_thinking_param);
+    }
+    if (test_expected_max_streaming_prompt_bytes) |expected| {
+        try std.testing.expectEqual(@as(?usize, expected), max_streaming_prompt_bytes);
     }
     if (test_expected_extra_body_params) |expected| {
         try std.testing.expect(extra_body_params != null);
@@ -609,6 +636,7 @@ test "delegate uses configured provider entry for key and base_url" {
     test_expected_user_agent = "nullclaw-test";
     test_expected_api_mode = .responses;
     test_expected_chat_template_enable_thinking_param = true;
+    test_expected_max_streaming_prompt_bytes = 4096;
     test_expected_extra_body_params = "{\"seed\":123}";
     test_expected_model_name = "qwen3.5:cloud";
     test_expected_system_prompt = "You are a coder.";
@@ -621,6 +649,7 @@ test "delegate uses configured provider entry for key and base_url" {
         test_expected_user_agent = null;
         test_expected_api_mode = null;
         test_expected_chat_template_enable_thinking_param = null;
+        test_expected_max_streaming_prompt_bytes = null;
         test_expected_extra_body_params = null;
         test_expected_model_name = null;
         test_expected_system_prompt = null;
@@ -644,6 +673,7 @@ test "delegate uses configured provider entry for key and base_url" {
             .user_agent = "nullclaw-test",
             .api_mode = .responses,
             .chat_template_enable_thinking_param = true,
+            .max_streaming_prompt_bytes = 4096,
             .extra_body_params = "{\"seed\":123}",
         },
     };
@@ -655,6 +685,109 @@ test "delegate uses configured provider entry for key and base_url" {
     };
     const tool = dt.tool();
     const parsed = try root.parseTestArgs("{\"agent\":\"coder\",\"prompt\":\"Fix it\"}");
+    defer parsed.deinit();
+
+    const result = try tool.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    defer if (result.error_msg) |e| if (e.len > 0) allocator.free(e);
+
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("delegate-ok", result.output);
+}
+
+test "delegate fallback uses configured default provider through vtable path" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const allocator = std.testing.allocator;
+
+    test_complete_agent_prompt_override = testCompleteAgentPrompt;
+    defer test_complete_agent_prompt_override = null;
+    test_expected_provider_name = "ollama";
+    test_expected_api_key = "ollama-key";
+    test_expected_base_url = "http://127.0.0.1:11434";
+    test_expected_native_tools = false;
+    test_expected_user_agent = "nullclaw-test";
+    test_expected_api_mode = .responses;
+    test_expected_chat_template_enable_thinking_param = true;
+    test_expected_max_streaming_prompt_bytes = 4096;
+    test_expected_extra_body_params = "{\"seed\":123}";
+    test_expected_model_name = "qwen3.5:cloud";
+    test_expected_system_prompt = "You are agent 'fallback'. Respond concisely and helpfully.";
+    test_expected_prompt = "Fix it";
+    defer {
+        test_expected_provider_name = null;
+        test_expected_api_key = null;
+        test_expected_base_url = null;
+        test_expected_native_tools = null;
+        test_expected_user_agent = null;
+        test_expected_api_mode = null;
+        test_expected_chat_template_enable_thinking_param = null;
+        test_expected_max_streaming_prompt_bytes = null;
+        test_expected_extra_body_params = null;
+        test_expected_model_name = null;
+        test_expected_system_prompt = null;
+        test_expected_prompt = null;
+    }
+
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const nullclaw_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(nullclaw_home);
+    try std_compat.fs.makeDirAbsolute(nullclaw_home);
+
+    const home_z = try allocator.dupeZ(u8, nullclaw_home);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, home_z.ptr, 1));
+
+    const config_path = try std_compat.fs.path.join(allocator, &.{ nullclaw_home, "config.json" });
+    defer allocator.free(config_path);
+    const config_json =
+        \\{
+        \\  "models": {
+        \\    "providers": {
+        \\      "ollama": {
+        \\        "api_key": "ollama-key",
+        \\        "base_url": "http://127.0.0.1:11434",
+        \\        "native_tools": false,
+        \\        "user_agent": "nullclaw-test",
+        \\        "api_mode": "responses",
+        \\        "chat_template_enable_thinking_param": true,
+        \\        "max_streaming_prompt_bytes": 4096,
+        \\        "extra_body_params": {"seed":123}
+        \\      }
+        \\    }
+        \\  },
+        \\  "agents": {"defaults": {"model": {"primary": "ollama/qwen3.5:cloud"}}}
+        \\}
+    ;
+    const config_file = try std_compat.fs.createFileAbsolute(config_path, .{});
+    defer config_file.close();
+    try config_file.writeAll(config_json);
+
+    var dt = DelegateTool{};
+    const tool = dt.tool();
+    const parsed = try root.parseTestArgs("{\"agent\":\"fallback\",\"prompt\":\"Fix it\"}");
     defer parsed.deinit();
 
     const result = try tool.execute(allocator, parsed.value.object);

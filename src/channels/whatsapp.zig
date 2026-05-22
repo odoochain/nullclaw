@@ -4,6 +4,21 @@ const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
 
+fn buildTextMessageRequestBody(allocator: std.mem.Allocator, to: []const u8, text: []const u8) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
+    errdefer body_writer.deinit();
+    const w = &body_writer.writer;
+    try w.writeAll("{\"messaging_product\":\"whatsapp\",\"recipient_type\":\"individual\",\"to\":");
+    try root.appendJsonStringW(w, to);
+    try w.writeAll(",\"type\":\"text\",\"text\":{\"preview_url\":false,\"body\":");
+    try root.appendJsonStringW(w, text);
+    try w.writeAll("}}");
+    body_list = body_writer.toArrayList();
+    return try body_list.toOwnedSlice(allocator);
+}
+
 /// WhatsApp channel — uses WhatsApp Business Cloud API.
 /// Operates in webhook mode (push-based); messages received via gateway endpoint.
 pub const WhatsAppChannel = struct {
@@ -268,18 +283,8 @@ pub const WhatsAppChannel = struct {
         // Strip leading '+' from recipient for the API
         const to = if (recipient.len > 0 and recipient[0] == '+') recipient[1..] else recipient;
 
-        // Build JSON body dynamically
-        var body_list: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_list.deinit(self.allocator);
-        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
-        defer body_list = body_writer.toArrayList();
-        const w = &body_writer.writer;
-        try w.writeAll("{\"messaging_product\":\"whatsapp\",\"recipient_type\":\"individual\",\"to\":\"");
-        try w.writeAll(to);
-        try w.writeAll("\",\"type\":\"text\",\"text\":{\"preview_url\":false,\"body\":");
-        try root.appendJsonStringW(w, text);
-        try w.writeAll("}}");
-        const body = body_list.items;
+        const body = try buildTextMessageRequestBody(self.allocator, to, text);
+        defer self.allocator.free(body);
 
         // Build auth header
         var auth_buf: [512]u8 = undefined;
@@ -366,6 +371,14 @@ test "whatsapp normalize phone" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("+1234567890", WhatsAppChannel.normalizePhone(&buf, "1234567890"));
     try std.testing.expectEqualStrings("+1234567890", WhatsAppChannel.normalizePhone(&buf, "+1234567890"));
+}
+
+test "whatsapp buildTextMessageRequestBody includes non-empty body" {
+    const alloc = std.testing.allocator;
+    // Regression: Writer.Allocating must be finalized before WhatsApp fetch payload is read.
+    const body = try buildTextMessageRequestBody(alloc, "1234567890", "hello whatsapp");
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"messaging_product\":\"whatsapp\",\"recipient_type\":\"individual\",\"to\":\"1234567890\",\"type\":\"text\",\"text\":{\"preview_url\":false,\"body\":\"hello whatsapp\"}}", body);
 }
 
 test "whatsapp parse empty payload" {
@@ -978,4 +991,17 @@ test "whatsapp normalize phone buffer too small" {
     var buf: [2]u8 = undefined;
     // Phone "123" needs 4 bytes ("+123"), but buf is only 2 bytes
     try std.testing.expectEqualStrings("123", WhatsAppChannel.normalizePhone(&buf, "123"));
+}
+
+test "WhatsAppChannel create + healthCheck + stop leaks zero bytes" {
+    // WhatsAppChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = WhatsAppChannel.initFromConfig(std.testing.allocator, .{
+        .access_token = "test-access-token",
+        .phone_number_id = "test-phone-id",
+        .verify_token = "test-verify-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
 }
